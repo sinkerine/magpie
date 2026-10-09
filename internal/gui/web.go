@@ -47,6 +47,8 @@ func (webHost) ChooseFolder(string) (string, error) {
 // browser in.
 type Web struct {
 	Addr, Link string
+	// Auth reports whether browser requests require the web key.
+	Auth       bool
 	key        string
 	srv        *http.Server
 	quit       chan struct{}
@@ -61,10 +63,9 @@ var webReexec atomic.Bool
 const webRunKey = "MAGPIE_WEB_RUNKEY"
 
 // StartWeb serves the page on addr (host:port), as the given version of
-// magpie, which keeps itself up to date as the app does. Every request needs the
-// key the link carries, taken once into a cookie other sites' pages can't
-// send with a POST (every change is one), so neither a page elsewhere nor
-// anyone else on the network reaches the settings and keys behind it.
+// magpie, which keeps itself up to date as the app does. Browser requests use
+// the key in the link by default; MAGPIE_WEB_NO_AUTH=1 removes that browser
+// guard for deployments that already control who can reach the address.
 func StartWeb(addr, version string) (*Web, error) {
 	Version = version
 	key, fixed, err := webKey()
@@ -79,22 +80,34 @@ func StartWeb(addr, version string) (*Web, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := &Web{Addr: ln.Addr().String(), key: key, quit: make(chan struct{})}
+	auth := key != ""
+	w := &Web{Addr: ln.Addr().String(), Link: "", Auth: auth, key: key, quit: make(chan struct{})}
 	host, port, _ := net.SplitHostPort(w.Addr)
 	if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
 		host = "127.0.0.1"
 	}
 	var once sync.Once
 	quit := func() { once.Do(func() { close(w.quit) }) }
-	w.Link = "http://" + net.JoinHostPort(host, port) + "/?k=" + url.QueryEscape(key)
+	w.Link = "http://" + net.JoinHostPort(host, port) + "/"
+	if auth {
+		w.Link += "?k=" + url.QueryEscape(key)
+	}
+	handler := webHandler(auth, "magpie_web_"+port, key, keep, Handler(webHost{quit}, startBackend()))
 	w.srv = &http.Server{
-		Handler:           webGuard("magpie_web_"+port, key, keep, Handler(webHost{quit}, startBackend())),
+		Handler:           handler,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	go w.srv.Serve(ln)
 	updates.start()
 	news.start()
 	return w, nil
+}
+
+func webHandler(auth bool, cookie, key string, keep time.Duration, next http.Handler) http.Handler {
+	if auth {
+		return webGuard(cookie, key, keep, next)
+	}
+	return next
 }
 
 // Wait returns once the page's Quit is used. After a restart to update it
@@ -111,7 +124,11 @@ func (w *Web) Wait() error {
 	if err != nil {
 		return err
 	}
-	return update.Reexec(exe, os.Args[1:], append(os.Environ(), webRunKey+"="+w.key))
+	env := os.Environ()
+	if w.Auth {
+		env = append(env, webRunKey+"="+w.key)
+	}
+	return update.Reexec(exe, os.Args[1:], env)
 }
 
 // webKeyMin is the shortest MAGPIE_WEB_KEY taken: it is all that stands
@@ -127,6 +144,9 @@ const webCookieAge = 400 * 24 * time.Hour
 // MAGPIE_WEB_KEY names one — for a page kept running as a service, which
 // browsers then stay signed in to across restarts. fixed says which.
 func webKey() (key string, fixed bool, err error) {
+	if os.Getenv("MAGPIE_WEB_NO_AUTH") == "1" {
+		return "", false, nil
+	}
 	if k := os.Getenv(webRunKey); k != "" {
 		os.Unsetenv(webRunKey) // the run's alone, not its children's
 		if len(k) == 32 && strings.Trim(k, "0123456789abcdef") == "" && os.Getenv("MAGPIE_WEB_KEY") == "" {
@@ -176,11 +196,15 @@ func webGuard(cookie, key string, keep time.Duration, next http.Handler) http.Ha
 }
 
 // NetworkLinks are the links to the page, served on port, that other
-// machines open; key is the link's "/?k=…". MAGPIE_PUBLIC_URL with a port
+// machines open; key is the link's "/?k=…" (or empty for no-auth links).
+// MAGPIE_PUBLIC_URL with a port
 // of its own names the host the container's ports are published on, so
 // the page is at that host on its own port; one without (a reverse proxy's
 // https://magpie.example.com, #372) is where the page is, path and all.
 func NetworkLinks(port, key string) []string {
+	if key == "" {
+		key = "/"
+	}
 	if u, err := url.Parse(gateway.PublicURL()); err == nil && u.Host != "" && u.Port() == "" {
 		return []string{strings.TrimRight(u.String(), "/") + key}
 	}

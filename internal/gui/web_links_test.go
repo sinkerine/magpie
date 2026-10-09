@@ -24,4 +24,8 @@ func TestNetworkLinksPublicURL(t *testing.T) {
 			t.Errorf("MAGPIE_PUBLIC_URL=%q: %v, want %s", c.env, got, c.want)
 		}
 	}
+	t.Setenv("MAGPIE_PUBLIC_URL", "https://magpie.example.com")
+	if got := NetworkLinks("3430", ""); !slices.Equal(got, []string{"https://magpie.example.com/"}) {
+		t.Fatalf("no-auth link: %v", got)
+	}
 }

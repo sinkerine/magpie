@@ -1425,7 +1425,11 @@ especially when the proxy reaches magpie over loopback.
 For the browser UI run the image with `magpie web --addr 0.0.0.0:3430 --no-open`
 in place of the default `serve`, and open
 `http://localhost:3430/?k=<key from docker logs magpie>` (set `MAGPIE_WEB_KEY`
-to keep one key across restarts). There you add providers, sign in to
+to keep one key across restarts). For a trusted LAN or Tailscale-only deployment,
+set `MAGPIE_WEB_NO_AUTH=1`; magpie prints clean links and accepts the browser UI
+without a key. Anyone who can reach that address can control Magpie and view its
+keys, so use this only on a network you trust. Gateway client/API keys remain
+required separately when gateway sharing is enabled. There you add providers, sign in to
 subscriptions and import sign-ins from a file. The vendor sends a sign-in's
 browser back to `localhost` (ChatGPT to `http://localhost:1455/auth/callback?code=…`),
 which is your own machine, not the container, so that page won't load: copy
@@ -1483,6 +1487,8 @@ services:
       MAGPIE_ADDR: 0.0.0.0:3425
       MAGPIE_PUBLIC_URL: http://<nas-address>:3425
       MAGPIE_WEB_KEY: <random-key>
+      # For trusted LAN or Tailscale only deployments, use this instead:
+      # MAGPIE_WEB_NO_AUTH: "1"
     volumes:
       - ./config:/config
     command: [web, --addr, 0.0.0.0:3430, --no-open]
@@ -1524,7 +1530,7 @@ magpie                          # open the app: a window plus the menu bar icon
 magpie tray                     # menu bar icon only (use this in your login items)
 magpie tui                      # the same thing, in the terminal; serves the gateway while open when no other magpie does
 magpie web                      # the app's window in a browser (WSL, a server over SSH); --lan, --addr, --no-open, --gateway
-                                # (a new key each run; MAGPIE_WEB_KEY keeps one, for a page run as a service)
+                                # (a new key each run; MAGPIE_WEB_KEY keeps one; MAGPIE_WEB_NO_AUTH=1 disables browser auth)
 magpie ls                       # list every agent and its current settings
 magpie claude opus              # set a model (agent names accept prefixes: cc, oc, gem …)
 magpie codex gpt-5.6-sol

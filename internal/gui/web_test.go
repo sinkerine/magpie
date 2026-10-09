@@ -41,6 +41,7 @@ func TestWebGuard(t *testing.T) {
 }
 
 func TestWebKey(t *testing.T) {
+	t.Setenv("MAGPIE_WEB_NO_AUTH", "")
 	t.Setenv("MAGPIE_WEB_KEY", "")
 	a, fixed, err := webKey()
 	if err != nil || fixed || len(a) != 32 {
@@ -61,6 +62,11 @@ func TestWebKey(t *testing.T) {
 	if k, fixed, err := webKey(); err != nil || !fixed || k != "0123456789abcdef-kept" {
 		t.Fatalf("MAGPIE_WEB_KEY: %q %v %v", k, fixed, err)
 	}
+	t.Setenv("MAGPIE_WEB_NO_AUTH", "1")
+	t.Setenv("MAGPIE_WEB_KEY", "bad")
+	if k, fixed, err := webKey(); err != nil || fixed || k != "" {
+		t.Fatalf("no-auth key: %q %v %v", k, fixed, err)
+	}
 
 	// a fixed key's cookie outlives the browser
 	h := webGuard("c", "0123456789abcdef-kept", webCookieAge, http.NotFoundHandler())
@@ -68,5 +74,23 @@ func TestWebKey(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/?k=0123456789abcdef-kept", nil))
 	if ck := rec.Result().Cookies(); len(ck) != 1 || time.Duration(ck[0].MaxAge)*time.Second != webCookieAge {
 		t.Fatalf("fixed key's cookie: %+v", ck)
+	}
+}
+
+func TestWebNoAuthGuardBypass(t *testing.T) {
+	t.Setenv("MAGPIE_WEB_NO_AUTH", "1")
+	if k, _, err := webKey(); err != nil || k != "" {
+		t.Fatalf("no-auth key: %q %v", k, err)
+	}
+	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) })
+	request := httptest.NewRequest("GET", "/api/state", nil)
+	rec := httptest.NewRecorder()
+	webHandler(false, "c", "", 0, next).ServeHTTP(rec, request)
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("no-auth request: %d", rec.Code)
+	}
+	t.Setenv("MAGPIE_PUBLIC_URL", "http://magpie.local:3430")
+	if got := NetworkLinks("3430", ""); len(got) != 1 || got[0] != "http://magpie.local:3430/" {
+		t.Fatalf("no-auth network link: %v", got)
 	}
 }

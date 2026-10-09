@@ -40,7 +40,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie tui                      the same thing, in the terminal (serves the gateway while open when no magpie does)
   magpie web [--addr host:port] [--lan] [--no-open] [--gateway]
                                   the app's window in a browser, with the gateway (no desktop needed: WSL, a server over SSH)
-                                  a new key each run; MAGPIE_WEB_KEY (16+ letters, digits, - . _ ~) keeps one, signed in for 400 days
+                                  a new key each run; MAGPIE_WEB_KEY (16+ letters, digits, - . _ ~) keeps one, signed in for 400 days; MAGPIE_WEB_NO_AUTH=1 disables browser auth
                                   --gateway: gateway mode, no Agents, Sessions or Library (on by itself with no agents here; Settings › General turns it off)
   magpie ls                       list detected agents and their settings
   magpie <agent>                  show one agent
