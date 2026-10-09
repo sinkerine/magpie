@@ -42,7 +42,7 @@ func webCmd(args []string) error {
 		case a == "--gateway":
 			gui.WebGateway.Store(true)
 		default:
-			return fmt.Errorf("magpie web: unknown %q · magpie web [--addr host:port] [--lan] [--no-open] [--gateway] [--tls-cert <file> --tls-key <file>], MAGPIE_WEB_KEY to keep one key", a)
+			return fmt.Errorf("magpie web: unknown %q · magpie web [--addr host:port] [--lan] [--no-open] [--gateway] [--tls-cert <file> --tls-key <file>], MAGPIE_WEB_KEY to keep one key, MAGPIE_WEB_NO_AUTH=1 to disable browser auth", a)
 		}
 	}
 	if lan && addr == webAddr {
@@ -92,7 +92,10 @@ func printWeb(w *gui.Web) {
 		fmt.Println(l)
 	}
 	host, port, _ := net.SplitHostPort(w.Addr)
-	key := w.Link[strings.Index(w.Link, "/?k="):]
+	key := ""
+	if w.Auth {
+		key = w.Link[strings.Index(w.Link, "/?k="):]
+	}
 	if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {
 		for _, l := range gui.NetworkLinks(port, key) {
 			fmt.Println(muted.Render("  on the network"), l)
@@ -100,13 +103,23 @@ func printWeb(w *gui.Web) {
 		if gateway.ContainerAddrs() {
 			fmt.Println(muted.Render("  " + containerNote))
 		}
-		fmt.Println(amber.Render("!"), lanWarning())
+		warning := lanWarning()
+		if !w.Auth {
+			warning = "anyone who can reach this address can control Magpie and view its keys"
+			if !gateway.TLSOn() {
+				warning += "; the network carries it unencrypted (--tls-cert and --tls-key serve it over https)"
+			}
+		}
+		fmt.Println(amber.Render("!"), warning)
 	} else if l := proxyLink(key); l != "" {
 		fmt.Println(muted.Render("  through your proxy"), l)
 	}
-	carries := "this run's key (MAGPIE_WEB_KEY keeps one across runs)"
-	if os.Getenv("MAGPIE_WEB_KEY") != "" {
-		carries = "MAGPIE_WEB_KEY"
+	carries := "no web key (MAGPIE_WEB_NO_AUTH=1)"
+	if w.Auth {
+		carries = "this run's key (MAGPIE_WEB_KEY keeps one across runs)"
+		if os.Getenv("MAGPIE_WEB_KEY") != "" {
+			carries = "MAGPIE_WEB_KEY"
+		}
 	}
 	fmt.Println(muted.Render("  the link carries " + carries + " · gateway " + advertisedURL() + " · Ctrl-C to stop"))
 }
@@ -124,6 +137,9 @@ func lanWarning() string {
 func webLink(addr, key string) string {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
+		if key == "" {
+			return "http://" + addr + "/"
+		}
 		return "http://" + addr + "/?k=" + url.QueryEscape(key)
 	}
 	if ip := net.ParseIP(host); host == "" || ip != nil && ip.IsUnspecified() {
@@ -135,7 +151,11 @@ func webLink(addr, key string) string {
 	if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
 		scheme = gateway.Scheme()
 	}
-	return scheme + "://" + net.JoinHostPort(host, port) + "/?k=" + url.QueryEscape(key)
+	link := scheme + "://" + net.JoinHostPort(host, port) + "/"
+	if key != "" {
+		link += "?k=" + url.QueryEscape(key)
+	}
+	return link
 }
 
 // proxyLink is the page's link through a reverse proxy in front of a page
@@ -145,6 +165,9 @@ func webLink(addr, key string) string {
 // port names a host whose ports are published, not a proxy. "" with
 // neither, or a MAGPIE_WEB_URL that isn't a plain http(s) address.
 func proxyLink(key string) string {
+	if key == "" {
+		key = "/"
+	}
 	if v := strings.TrimSpace(os.Getenv("MAGPIE_WEB_URL")); v != "" {
 		if !strings.Contains(v, "://") {
 			v = "https://" + v

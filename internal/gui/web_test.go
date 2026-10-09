@@ -43,6 +43,7 @@ func TestWebGuard(t *testing.T) {
 }
 
 func TestWebKey(t *testing.T) {
+	t.Setenv("MAGPIE_WEB_NO_AUTH", "")
 	t.Setenv("MAGPIE_WEB_KEY", "")
 	a, fixed, err := webKey()
 	if err != nil || fixed || len(a) != 32 {
@@ -64,6 +65,12 @@ func TestWebKey(t *testing.T) {
 		t.Fatalf("MAGPIE_WEB_KEY: %q %v %v", k, fixed, err)
 	}
 
+	t.Setenv("MAGPIE_WEB_NO_AUTH", "1")
+	t.Setenv("MAGPIE_WEB_KEY", "bad")
+	if k, fixed, err := webKey(); err != nil || fixed || k != "" {
+		t.Fatalf("no-auth key: %q %v %v", k, fixed, err)
+	}
+
 	// a fixed key's cookie outlives the browser
 	h := webGuard("c", "0123456789abcdef-kept", webCookieAge, http.NotFoundHandler())
 	rec := httptest.NewRecorder()
@@ -78,9 +85,22 @@ func TestWebKey(t *testing.T) {
 // holds two cookies of the page's name, a stale one sent first, still gets
 // in; one turned away is told why and can paste the key, not sent back to
 // the start-up log.
+func TestWebNoAuthGuardBypass(t *testing.T) {
+	t.Setenv("MAGPIE_WEB_NO_AUTH", "1")
+	if k, _, err := webKey(); err != nil || k != "" {
+		t.Fatalf("no-auth key: %q %v", k, err)
+	}
+	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) })
+	rec := httptest.NewRecorder()
+	webHandler(false, "3430", "", 0, next).ServeHTTP(rec, httptest.NewRequest("GET", "/api/state", nil))
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("no-auth request: %d", rec.Code)
+	}
+}
+
 func TestWebGuardBookmark(t *testing.T) {
 	const key = "0123456789abcdef-2033"
-	h := webHandler("3430", key, webCookieAge, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) }))
+	h := webHandler(true, "3430", key, webCookieAge, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) }))
 	do := func(r *http.Request) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)

@@ -107,6 +107,9 @@ func webOptions(w daemonWeb, prevAddr, prevKey, envKey string) (daemon.Options, 
 	if !w.on {
 		return daemon.Options{}, nil
 	}
+	if os.Getenv("MAGPIE_WEB_NO_AUTH") == "1" {
+		return daemon.Options{Web: w.addr}, nil
+	}
 	key := envKey
 	if key == "" {
 		key = prevKey
@@ -257,9 +260,15 @@ func daemonInstall(w daemonWeb) error {
 // printDaemonWeb prints the service's page: its link, and on the network
 // its links there and what that lets anyone with one do.
 func printDaemonWeb(addr, key string) {
+	if os.Getenv("MAGPIE_WEB_NO_AUTH") == "1" {
+		key = ""
+	}
 	fmt.Println(muted.Render("  page   "), webLink(addr, key))
 	host, port, _ := net.SplitHostPort(addr)
 	q := "/?k=" + key
+	if os.Getenv("MAGPIE_WEB_NO_AUTH") == "1" {
+		q = "/"
+	}
 	if ip := net.ParseIP(host); host == "" || ip != nil && !ip.IsLoopback() {
 		for _, l := range gui.NetworkLinks(port, q) {
 			fmt.Println(muted.Render("  on the network"), l)
