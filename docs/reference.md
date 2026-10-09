@@ -2175,7 +2175,10 @@ For the browser UI run the image with `magpie web --addr 0.0.0.0:3430 --no-open`
 in place of the default `serve`, and open
 `http://localhost:3430/?k=<key from docker logs magpie>` (set `MAGPIE_WEB_KEY`
 to keep one key across restarts; a browser then stays signed in for 400
-days). A browser keeps cookies per host, not per port, so another service on
+days). For a trusted LAN or Tailscale-only deployment, set
+`MAGPIE_WEB_NO_AUTH=1` to allow browser UI access without a key. Anyone who can
+reach that address can control Magpie and view its keys; gateway client/API keys
+remain separate. A browser keeps cookies per host, not per port, so another service on
 the same address can take the sign-in away: by clearing its site data, or by
 filling the host's cookie limit (the sign-in is the last Chrome drops). A page
 opened without it, such as a bookmark, says why it was turned away and takes
@@ -2238,6 +2241,8 @@ services:
       MAGPIE_ADDR: 0.0.0.0:3425
       MAGPIE_PUBLIC_URL: http://<nas-address>:3425
       MAGPIE_WEB_KEY: <random-key>
+      # For trusted LAN or Tailscale only deployments, use this instead:
+      # MAGPIE_WEB_NO_AUTH: "1"
     volumes:
       - ./config:/config
     command: [web, --addr, 0.0.0.0:3430, --no-open]
@@ -2279,7 +2284,7 @@ magpie                          # open the app: a window plus the menu bar icon
 magpie tray                     # menu bar icon only (use this in your login items)
 magpie tui                      # the same thing, in the terminal; serves the gateway while open when no other magpie does
 magpie web                      # the app's window in a browser (WSL, a server over SSH); --lan, --addr, --no-open, --gateway, --tls-cert/--tls-key
-                                # (a new key each run; MAGPIE_WEB_KEY keeps one, for a page run as a service)
+                                # (a new key each run; MAGPIE_WEB_KEY keeps one; MAGPIE_WEB_NO_AUTH=1 disables browser auth)
                                 # (behind a reverse proxy, MAGPIE_WEB_URL=https://<the page there> prints the link through it)
 magpie serve                    # the gateway alone, no window; --web[=host:port] serves the page too, from the same process
                                 # --tls-cert <file> --tls-key <file>: https:// for other computers (see HTTPS under sharing)

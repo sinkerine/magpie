@@ -47,10 +47,12 @@ func (webHost) ChooseFolder(string) (string, error) {
 	return "", errors.New("in the browser magpie can't show a folder picker: type the folder's path")
 }
 
-// Web is a started `magpie web`: its address and the link that signs a
-// browser in.
+// Web is a started `magpie web`: its address and link, and whether browser
+// authentication is enabled.
 type Web struct {
 	Addr, Link string
+	// Auth reports whether browser requests require the web key.
+	Auth       bool
 	key        string
 	srv        *http.Server
 	quit       chan struct{}
@@ -65,10 +67,9 @@ var webReexec atomic.Bool
 const webRunKey = "MAGPIE_WEB_RUNKEY"
 
 // StartWeb serves the page on addr (host:port), as the given version of
-// magpie, which keeps itself up to date as the app does. Every request needs the
-// key the link carries, taken once into a cookie other sites' pages can't
-// send with a POST (every change is one), so neither a page elsewhere nor
-// anyone else on the network reaches the settings and keys behind it.
+// magpie, which keeps itself up to date as the app does. Browser requests use
+// the key in the link by default; MAGPIE_WEB_NO_AUTH=1 removes that browser
+// guard for deployments that already control who can reach the address.
 func StartWeb(addr, version string) (*Web, error) {
 	Version = version
 	key, fixed, err := webKey()
@@ -88,7 +89,8 @@ func StartWeb(addr, version string) (*Web, error) {
 	if ln, err = gateway.ServeTLS(ln); err != nil {
 		return nil, err
 	}
-	w := &Web{Addr: ln.Addr().String(), key: key, quit: make(chan struct{})}
+	auth := key != ""
+	w := &Web{Addr: ln.Addr().String(), Auth: auth, key: key, quit: make(chan struct{})}
 	host, port, _ := net.SplitHostPort(w.Addr)
 	if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
 		host = "127.0.0.1"
@@ -101,9 +103,12 @@ func StartWeb(addr, version string) (*Web, error) {
 	if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {
 		scheme = gateway.Scheme()
 	}
-	w.Link = scheme + "://" + net.JoinHostPort(host, port) + "/?k=" + url.QueryEscape(key)
+	w.Link = scheme + "://" + net.JoinHostPort(host, port) + "/"
+	if auth {
+		w.Link += "?k=" + url.QueryEscape(key)
+	}
 	w.srv = &http.Server{
-		Handler:           gateway.AllowGuard(webHandler(port, key, keep, Handler(webHost{quit}, startBackend()))),
+		Handler:           gateway.AllowGuard(webHandler(auth, port, key, keep, Handler(webHost{quit}, startBackend()))),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	go w.srv.Serve(ln)
@@ -140,7 +145,11 @@ func (w *Web) Wait() error {
 	if err != nil {
 		return err
 	}
-	return update.Reexec(exe, os.Args[1:], append(os.Environ(), webRunKey+"="+w.key))
+	env := os.Environ()
+	if w.Auth {
+		env = append(env, webRunKey+"="+w.key)
+	}
+	return update.Reexec(exe, os.Args[1:], env)
 }
 
 // webKeyMin is the shortest MAGPIE_WEB_KEY taken: it is all that stands
@@ -156,6 +165,9 @@ const webCookieAge = 400 * 24 * time.Hour
 // MAGPIE_WEB_KEY names one — for a page kept running as a service, which
 // browsers then stay signed in to across restarts. fixed says which.
 func webKey() (key string, fixed bool, err error) {
+	if os.Getenv("MAGPIE_WEB_NO_AUTH") == "1" {
+		return "", false, nil
+	}
 	if k := os.Getenv(webRunKey); k != "" {
 		os.Unsetenv(webRunKey) // the run's alone, not its children's
 		if len(k) == 32 && strings.Trim(k, "0123456789abcdef") == "" && os.Getenv("MAGPIE_WEB_KEY") == "" {
@@ -285,6 +297,9 @@ func webTurnedAway(rw http.ResponseWriter, r *http.Request, back, why string) {
 // the page is at that host on its own port; one without (a reverse proxy's
 // https://magpie.example.com, #372) is where the page is, path and all.
 func NetworkLinks(port, key string) []string {
+	if key == "" {
+		key = "/"
+	}
 	if u, err := url.Parse(gateway.PublicURL()); err == nil && u.Host != "" && u.Port() == "" {
 		return []string{strings.TrimRight(u.String(), "/") + key}
 	}
@@ -316,8 +331,11 @@ func LANAddrs() []string {
 
 // webHandler is what `magpie web` on port serves: the page and its API
 // behind the key, compressed for the browser.
-func webHandler(port, key string, keep time.Duration, page http.Handler) http.Handler {
-	return webCompressed(webGuard("magpie_web_"+port, key, keep, page))
+func webHandler(auth bool, port, key string, keep time.Duration, page http.Handler) http.Handler {
+	if auth {
+		page = webGuard("magpie_web_"+port, key, keep, page)
+	}
+	return webCompressed(page)
 }
 
 // webCompressed gzips what `magpie web` sends a browser that takes it: the

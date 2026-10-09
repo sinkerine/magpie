@@ -21,6 +21,10 @@ func TestWebProxyLink(t *testing.T) {
 			t.Errorf("MAGPIE_PUBLIC_URL=%q: %q, want %q", c.env, got, c.want)
 		}
 	}
+	t.Setenv("MAGPIE_WEB_URL", "https://magpie.example.com")
+	if got := proxyLink("/"); got != "https://magpie.example.com/" {
+		t.Fatalf("no-auth proxy link: %q", got)
+	}
 	// the page's own proxy address, when the gateway's is elsewhere
 	t.Setenv("MAGPIE_PUBLIC_URL", "https://api.example.com")
 	for _, c := range []struct{ env, want string }{

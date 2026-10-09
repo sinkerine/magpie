@@ -100,6 +100,7 @@ func TestParseDaemon(t *testing.T) {
 // own, else a new one; installed again with nothing said, the service
 // keeps its page and key; turned off, neither is kept.
 func TestWebOptions(t *testing.T) {
+	t.Setenv("MAGPIE_WEB_NO_AUTH", "")
 	const prev = "0123456789abcdef0123456789abcdef"
 	on := daemonWeb{true, true, "127.0.0.1:3430"}
 	if o, err := webOptions(daemonWeb{}, "0.0.0.0:3430", prev, ""); err != nil || o.Web != "0.0.0.0:3430" || o.Key != prev {
@@ -123,6 +124,10 @@ func TestWebOptions(t *testing.T) {
 	}
 	if _, err := webOptions(on, "", "", "short"); err == nil {
 		t.Error("a MAGPIE_WEB_KEY too short to stand between the network and the keys was taken")
+	}
+	t.Setenv("MAGPIE_WEB_NO_AUTH", "1")
+	if o, err := webOptions(on, "", "", ""); err != nil || o.Web != on.addr || o.Key != "" {
+		t.Errorf("no-auth: %+v %v", o, err)
 	}
 }
 

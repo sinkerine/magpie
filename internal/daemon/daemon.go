@@ -95,7 +95,7 @@ func Install(o Options) error {
 	if autostartEnabled() {
 		return errors.New("magpie already opens at login and serves the gateway: run `magpie autostart off` first, or keep that instead")
 	}
-	if o.Web != "" && o.Key == "" {
+	if o.Web != "" && o.Key == "" && os.Getenv("MAGPIE_WEB_NO_AUTH") != "1" {
 		return errors.New("the page needs a key")
 	}
 	exe, err := self()
@@ -125,6 +125,9 @@ const webKeyVar = "MAGPIE_WEB_KEY"
 func withKey(env []string, o Options) []string {
 	if o.Web == "" {
 		return env
+	}
+	if os.Getenv("MAGPIE_WEB_NO_AUTH") == "1" {
+		return append(env, "MAGPIE_WEB_NO_AUTH=1")
 	}
 	return append(env, webKeyVar+"="+o.Key)
 }
