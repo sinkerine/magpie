@@ -122,7 +122,7 @@ func TestSmartRouting(t *testing.T) {
 	}
 
 	// the allowance renewing soonest goes first: what it has left is lost
-	// at its reset; one not known, or already renewed, after
+	// at its reset; an already renewed account is unused and goes first
 	now := time.Now()
 	share = map[string]provider.Allowance{
 		"a": one(5, now.Add(6*24*time.Hour)),
@@ -133,13 +133,13 @@ func TestSmartRouting(t *testing.T) {
 		"f": one(99, now.Add(-time.Hour)), // used up, but that has renewed since
 	}
 	cs = []candidate{acct("a"), acct("b"), acct("c"), acct("d"), acct("e"), acct("f")}
-	if got := restsOf(route(p, cs, "m", provider.Chat)); got != "s#b s#d s#a s#c s#f s#e " {
+	if got := restsOf(route(p, cs, "m", provider.Chat)); got != "s#f s#b s#d s#a s#c s#e " {
 		t.Fatalf("by reset: %s", got)
 	}
 	// minutes apart is the same hour: the order given stays
 	share["a"] = one(5, share["b"][0].Resets.Truncate(time.Hour).Add(time.Minute))
 	share["b"] = one(70, share["b"][0].Resets.Truncate(time.Hour).Add(2*time.Minute))
-	if got := restsOf(route(p, cs, "m", provider.Chat)[:2]); got != "s#a s#b " {
+	if got := restsOf(route(p, cs, "m", provider.Chat)[1:3]); got != "s#a s#b " {
 		t.Fatalf("same hour: %s", got)
 	}
 

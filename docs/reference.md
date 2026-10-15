@@ -1248,9 +1248,9 @@ magpie group rm opus-anywhere           # one magpie found is hidden; magpie gro
 magpie claude group/opus-anywhere       # use it
 ```
 
-`routing=` is `smart` (the default: of the subscriptions with quota to
-spare, the one whose allowance renews soonest first), `order` (the first
-model until it can't answer, then the next), `rotate` (each turn to the next
+`routing=` is `smart` (the default: known unused subscription accounts
+first, then those with quota to spare whose allowance renews soonest),
+`order` (the first model until it can't answer, then the next), `rotate` (each turn to the next
 member), `usage` (least used first) or `pace` (weekly pace: the account with
 the most of its week left per hour until it renews first, so less of a week
 is lost at its reset) or `weight` (each model takes its share of the
@@ -1389,9 +1389,15 @@ included. Smart and Weekly pace put an account behind the others once a
 window is at 90% or more, and behind those once one is at 98% or more,
 each of these groups ordered by the share used.
 
-- **Smart** (the default): of the accounts under 90%, the one whose
-  allowance renews soonest goes first, because what it has left is lost at
-  the reset. The biggest window decides: the week, then the 5 hours only
+- **Smart** (the default): subscription accounts with known windows for
+  the requested model all at 0% go first. Among these, the account magpie
+  sent the fewest tokens lately goes first (an hour's half-life), so usage
+  still rounded to 0% doesn't keep selecting one account. Unknown quotas,
+  readings with no window for this model, and API keys get no such preference.
+  Among unused accounts tied on recent tokens, and the other accounts under
+  90%, the one whose allowance renews soonest goes first, because what it
+  has left is lost at the reset. Conversation affinity still applies.
+  The biggest window decides: the week, then the 5 hours only
   when the weeks renew in the same hour. Reset times are compared to the
   hour, by the clock: 13:55 and 14:05 are different hours, 14:05 and
   14:55 the same. An account
