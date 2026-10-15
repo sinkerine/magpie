@@ -38,10 +38,7 @@ func fakeSkillRepo(t *testing.T, files map[string]string) (asked map[string]int,
 			}
 			sort.Strings(paths)
 			for _, p := range paths {
-				tree.Tree = append(tree.Tree, struct {
-					Path string `json:"path"`
-					Type string `json:"type"`
-				}{p, "blob"})
+				tree.Tree = append(tree.Tree, gitEntry{Path: p, Type: "blob"})
 			}
 			b, _ := json.Marshal(tree)
 			etag := `"` + hashOf(b) + `"`
@@ -209,10 +206,7 @@ func TestNewBase(t *testing.T) {
 	}
 	tree := &gitTree{}
 	for _, p := range []string{"SKILL.md.bak", "skills/a/SKILL.md", "skills/a/b/SKILL.md", "skills/node_modules/x/SKILL.md", "skills/.x/SKILL.md", "skills/c/d/e/f/SKILL.md", "skills/c/d/e/f/g/SKILL.md", "other/z/SKILL.md"} {
-		tree.Tree = append(tree.Tree, struct {
-			Path string `json:"path"`
-			Type string `json:"type"`
-		}{p, "blob"})
+		tree.Tree = append(tree.Tree, gitEntry{Path: p, Type: "blob"})
 	}
 	if got := skillDirsIn(tree, "skills"); !slices.Equal(got, []string{"skills/a", "skills/c/d/e/f"}) {
 		t.Errorf("skills in the tree: %v", got)
@@ -267,5 +261,64 @@ func TestNoAgentsIsEmptyNotNull(t *testing.T) {
 	b, _ = os.ReadFile(path())
 	if !strings.Contains(string(b), `"skill-usage-stats"`) || strings.Contains(string(b), `"agents": null`) {
 		t.Errorf("after adding the new one:\n%s", b)
+	}
+}
+
+// UFO404's report (#1964): the market lists ui-ux-pro-max from
+// nextlevelbuilder/ui-ux-pro-max-skill, whose SKILL.md is only in
+// .claude/skills; its other skills are both there and in cli/assets/skills.
+// The install found no ui-ux-pro-max ("has no skill ui-ux-pro-max any
+// more"). The paths are the repository's own.
+func TestMarketInstallsASkillKeptInClaudesFolder(t *testing.T) {
+	sandbox(t)
+	files := map[string]string{
+		".claude/skills/ui-ux-pro-max/SKILL.md":          "---\nname: ui-ux-pro-max\ndescription: \"UI/UX design intelligence for web, mobile, and desktop.\"\n---\n\n# UI/UX Pro Max - Design Intelligence\n",
+		".claude/skills/ui-ux-pro-max/scripts/search.py": "print('hi')\n",
+		".github/workflows/ci.yml":                       "on: push\n",
+		"skills/.hidden/SKILL.md":                        "---\nname: hidden\ndescription: not a skill folder\n---\n",
+		".claude-plugin/x/SKILL.md":                      "---\nname: plugin-x\ndescription: not in a skills folder\n---\n",
+	}
+	for _, n := range []string{"banner-design", "brand", "design-system", "design", "slides", "ui-styling"} {
+		md := "---\nname: " + n + "\ndescription: Brand voice, visual identity.\n---\n"
+		files[".claude/skills/"+n+"/SKILL.md"] = md
+		files["cli/assets/skills/"+n+"/SKILL.md"] = md
+	}
+	fakeSkillRepo(t, files)
+
+	p, err := ProbeSkills("nextlevelbuilder/ui-ux-pro-max-skill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, c := range p.Candidates {
+		paths = append(paths, c.Path)
+	}
+	want := []string{"cli/assets/skills/banner-design", "cli/assets/skills/brand", "cli/assets/skills/design", "cli/assets/skills/design-system", "cli/assets/skills/slides", "cli/assets/skills/ui-styling", ".claude/skills/ui-ux-pro-max"}
+	if !slices.Equal(paths, want) {
+		t.Errorf("candidates %v, want %v", paths, want)
+	}
+
+	r, err := InstallMarketSkill("nextlevelbuilder/ui-ux-pro-max-skill", "ui-ux-pro-max", []string{"claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(r.Installed, []string{"ui-ux-pro-max"}) {
+		t.Errorf("installed %v", r.Installed)
+	}
+	if _, err := os.Stat(skillDir("ui-ux-pro-max") + "/scripts/search.py"); err != nil {
+		t.Errorf("the skill's files weren't installed: %v", err)
+	}
+
+	// the check for new skills reads the tree the same way
+	tree := &gitTree{}
+	for p := range files {
+		tree.Tree = append(tree.Tree, gitEntry{Path: p, Type: "blob"})
+	}
+	sort.Slice(tree.Tree, func(i, j int) bool { return tree.Tree[i].Path < tree.Tree[j].Path })
+	got := skillDirsIn(tree, "")
+	sort.Strings(got)
+	sort.Strings(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("skills in the tree %v, want %v", got, want)
 	}
 }

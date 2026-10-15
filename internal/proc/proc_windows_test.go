@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHideWithoutConsole(t *testing.T) {
@@ -83,4 +85,35 @@ func TestEchoArgs(t *testing.T) {
 	b, _ := json.Marshal(append([]string{}, os.Args[i+1:]...))
 	fmt.Fprintf(os.Stdout, "%s\n", b)
 	os.Exit(0)
+}
+
+// a probe still asking when magpie exits is ended by EndProbes, and
+// EndProbes returns once its kill is over, not after its whole wait (#1278)
+func TestEndProbesWindows(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := ProbeContext(ctx, "ping", "-n", "60", "127.0.0.1")
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _ = io.Copy(io.Discard, out)
+		done <- cmd.Wait()
+	}()
+	time.Sleep(500 * time.Millisecond) // asking, not starting
+	start := time.Now()
+	EndProbes()
+	if d := time.Since(start); d > endWait {
+		t.Fatalf("EndProbes took %v over a probe it killed", d)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the probe went on after EndProbes")
+	}
 }

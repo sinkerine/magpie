@@ -20,8 +20,8 @@ func TestMlxServePreset(t *testing.T) {
 	if pr.Kind != KindLocal || !pr.NoKey || pr.KeysURL != "" {
 		t.Fatalf("kind/noKey/keysURL: %q %v %q", pr.Kind, pr.NoKey, pr.KeysURL)
 	}
-	if pr.Chat != "http://localhost:11234/v1" || pr.Responses != "http://localhost:11234/v1" || pr.Anthropic != "http://localhost:11234" {
-		t.Fatalf("endpoints: %q %q %q", pr.Chat, pr.Responses, pr.Anthropic)
+	if pr.Chat != "http://localhost:11234/v1" || pr.Responses != "http://localhost:11234/v1" || pr.Anthropic != "http://localhost:11234" || pr.Decide != "http://localhost:11234/v1" {
+		t.Fatalf("endpoints: %q %q %q %q", pr.Chat, pr.Responses, pr.Anthropic, pr.Decide)
 	}
 	p, err := FromPreset("mlx-serve")
 	if err != nil {
@@ -53,7 +53,7 @@ func TestMlxServeModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.Chat, p.Responses = srv.URL+"/v1", srv.URL+"/v1"
+	p.Chat, p.Responses, p.Decide = srv.URL+"/v1", srv.URL+"/v1", srv.URL+"/v1"
 	models, err := p.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)

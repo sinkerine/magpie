@@ -20,7 +20,7 @@ func TestTrayImagePlain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cells, _, _ := trayUsageView(trayCards(), time.Now(), false)
+	cells, _, _ := trayUsageView(trayCards(), time.Now(), false, false)
 	cells = cells[:2]
 	plain := trayPlain(cells)
 	for _, dark := range []bool{false, true} {

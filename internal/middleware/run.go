@@ -9,24 +9,33 @@ import (
 	"time"
 
 	"github.com/Calcium-Ion/moejs"
+
+	"github.com/yetone/magpie/internal/gwmw"
 )
 
 func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
 
 // Info is what a request's hooks are told of it, in ctx.
-type Info struct {
-	Protocol string `json:"protocol"` // the agent's API: anthropic, chat, responses, gemini
-	Model    string `json:"model"`
-	Stream   bool   `json:"stream"`
-	Path     string `json:"path"`
-	Agent    string `json:"agent,omitempty"`
-}
+type Info = gwmw.Info
 
 // Reject is a request a middleware turned away (ctx.reject).
-type Reject struct {
-	Status  int
-	Message string
+type Reject = gwmw.Reject
+
+// Chain is the JS middleware as one agent middleware of the gateway's
+// middleware point (gwmw.Use, by plugins/middleware): every middleware
+// plugins.json has on, in its order.
+type Chain struct{}
+
+// Begin is Begin, nil when there is no middleware.
+func (Chain) Begin(info gwmw.Info) gwmw.Run {
+	if r := Begin(info); r != nil {
+		return r
+	}
+	return nil
 }
+
+// On counts the middleware plugins.json has on, whether or not it loads.
+func On() int { return len(middlewares()) }
 
 // Run is the middleware of one request. Each middleware's hooks run in
 // one runtime for the whole request, so they share ctx.state.

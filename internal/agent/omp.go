@@ -10,6 +10,7 @@ package agent
 // like may name them as well (ompRefKeys); magpie stays while any does.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/dirent"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
@@ -162,7 +164,7 @@ func ompProfiles(home string) []*Agent {
 	var names []string
 	for _, e := range entries {
 		name := e.Name()
-		if !e.IsDir() || !ompProfileOK(name) {
+		if !dirent.IsFolder(filepath.Join(root, "profiles"), e) || !ompProfileOK(name) {
 			continue
 		}
 		if filepath.Join(root, "profiles", name, "agent") == cur {
@@ -197,7 +199,8 @@ func ompIn(at place) *Agent {
 // ompAt is omp with its agent folder at dir, magpie's entry in its
 // models.yml being entry's.
 func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
-	ompProvider := entry
+	// magpie's entry laid over the one in the models file at path (ompKept)
+	ompProvider := func(path string) any { return ompKept(path, entry()) }
 	// omp reads the .yml and falls back to the .yaml
 	pick := func(name string) string {
 		yml := filepath.Join(dir, name+".yml")
@@ -207,6 +210,8 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 		return yml
 	}
 	path := pick("config")
+	// the entries of enabledModels a sync took out (scope_gone.go)
+	gone := at.key("omp.scope.gone")
 	roleGet := func(name string) func() string {
 		return func() string {
 			k := "modelRoles." + name
@@ -237,20 +242,35 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 				return err
 			}
 		}
-		return edit.SetYAML(models, edit.KV{Path: "providers." + magpieID, Value: ompProvider()})
+		return edit.SetYAML(models, edit.KV{Path: "providers." + magpieID, Value: ompProvider(models)})
 	}
 	// dropMagpie takes magpie's provider out of models.yml once nothing in
 	// the config is on magpie; while something is (a fallback chain, another
 	// role), it writes it afresh instead, so a role set off magpie — applying
 	// again what Check found — mends the wiring that is left.
+	// The plain entries of enabledModels on magpie, which magpie adds there
+	// (omp_scope.go), don't count: once nothing else is on magpie they go
+	// with its provider (#1769). Those scoped to folders are the user's, and
+	// count.
 	dropMagpie := func() error {
-		used, err := onMagpie()
+		used := false
+		err := edit.EditYAMLStrings(path, slices.DeleteFunc(slices.Clone(ompRefKeys), func(k string) bool { return k == "enabledModels" }), func(v string) string {
+			ompRefs(v, func(m string) string { used = used || usesMagpie(m); return m })
+			return v
+		})
+		if err == nil && !used {
+			used, err = ompScopeFoldersOnMagpie(path)
+		}
 		switch {
 		case err != nil:
 			return err
 		case used:
 			return writeMagpie()
 		}
+		if err := ompScopeWithout(path); err != nil {
+			return err
+		}
+		forget(gone)
 		return edit.DelYAML(pick("models"), "providers."+magpieID)
 	}
 	// was are the stash's keys for the roles, one each
@@ -337,6 +357,97 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 			},
 		}
 	}
+	roles := []Field{
+		role("model", "model", "default", false),
+		// omp's own agents run on its roles (src/task/agents.ts,
+		// prompts/agents): task on @task; scout and sonic on @smol;
+		// reviewer on @slow, also the eval tool's "slow" tier. Unset,
+		// task gives its agent the parent session's model, and smol
+		// and slow take the default role's (model-resolver.ts,
+		// shouldInheritDefaultBeforePriority). The designer role went
+		// in omp 18.1.5. smol is labelled as omp names it: "small" is
+		// other agents' picker of its own
+		role("subagent", "subagents", "task", true),
+		role("small", "smol", "smol", true),
+		role("slow", "slow", "slow", true),
+		// plan mode's role (omp's "Architect"), images handed to a model
+		// that sees them, and the second opinion the advisor gives. Unset,
+		// omp picks for each from its own list; the advisor takes the slow
+		// role first (model-resolver.ts, ROLE_CONFIGURED_FALLBACK), never
+		// the default's (#1397)
+		role("plan", "plan", "plan", true),
+		role("vision", "vision", "vision", true),
+		role("advisor", "advisor", "advisor", true),
+		// the rest of omp's chat roles (CHAT_MODEL_ROLE_IDS in pi-tui's
+		// model-browser.ts, 18.6 to 18.8.8; #1397 named commit and tiny):
+		// commit writes commit messages and falls to smol when unset
+		// (commit/model-selection.ts), tiny names sessions and classifies
+		// and takes smol's model, memory takes tiny's, else smol's
+		// (ROLE_CONFIGURED_FALLBACK). omp's other roles (KIND_ROLE_IDS)
+		// are for kinds of model other than the chat models magpie writes
+		// for omp: image making, web search, speech, dictation, and the
+		// judge its find tool turns on for a TypeSafe jev model
+		role("commit", "commit", "commit", true),
+		role("tiny", "tiny", "tiny", true),
+		role("memory", "memory", "memory", true),
+	}
+	// the default role's model is what a new session starts on only while
+	// enabledModels takes it in, so a model picked for it joins the list
+	// there is (omp_scope.go, #1769); a reset puts back what the user had,
+	// which is theirs to have scoped or not
+	setDefault := roles[0].Set
+	roles[0].Set = func(v string) error {
+		if err := setDefault(v); err != nil || v == "" {
+			return err
+		}
+		if model, _, one := ompSplit(roleGet("default")()); one && model != "" {
+			return ompScopeWith(path, model)
+		}
+		return nil
+	}
+	// each role but the default one has a thinking level of its own, the
+	// ":level" omp reads off the end of the role's model
+	// (splitThinkingSuffix, resolveModelRoleValue): #1397, the slow role at
+	// high while sessions start at medium. It is the role's value written
+	// again, so it goes through the role's own Set (magpie's provider, the
+	// stash). Offered while the role is one model: a role that follows
+	// another, or a list omp falls back through, has no level here. Unset,
+	// the role runs at the session's level
+	fields := []Field{roles[0]}
+	for _, r := range roles[1:] {
+		fields = append(fields, r, Field{
+			Key: r.Key + "_thinking", Label: r.Label + " thinking", Quiet: true,
+			Get: func() string {
+				if _, level, one := ompSplit(r.Get()); one {
+					return strings.TrimPrefix(level, ":")
+				}
+				return ""
+			},
+			Set: func(v string) error {
+				cur := r.Get()
+				model, _, one := ompSplit(cur)
+				if cur == "" || !one {
+					if v == "" {
+						return nil
+					}
+					return fmt.Errorf("omp's %s role is not on one model: pick its model first", r.Label)
+				}
+				if v != "" && v != "off" && v != "auto" && !slices.Contains(ompEfforts, v) {
+					return fmt.Errorf("%q is not one of omp's thinking levels", v)
+				}
+				if v != "" {
+					model += ":" + v
+				}
+				return r.Set(model)
+			},
+			Options: func(cur map[string]string) []Option {
+				if _, _, one := ompSplit(cur[r.Key]); cur[r.Key] == "" || !one {
+					return nil
+				}
+				return static(append([]string{"auto", "off"}, ompEfforts...)...)
+			},
+		})
+	}
 	return &Agent{
 		ID: "omp", Name: "omp", Icon: "omp", Aliases: []string{"oh-my-pi"}, Spelled: prefixed,
 		UA:  []string{"oh-my-pi"},
@@ -345,7 +456,13 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 		// a list of models is the user's own
 		SplitSuffix: ompSplit,
 		Sync: func() error {
-			return syncYAML(pick("models"), "providers."+magpieID, func() any { return ompProvider() })
+			models := pick("models")
+			if err := syncYAML(models, "providers."+magpieID, func() any { return ompProvider(models) }); err != nil {
+				return err
+			}
+			// an entry on a model magpie no longer gives omp names nothing
+			// (#2055, scope_gone.go)
+			return ompScopeSynced(path, models, gone)
 		},
 		// a provider renamed takes its models' ids in models.yml with it; a
 		// name left on the old one omp would pass over, with a warning. So
@@ -369,6 +486,10 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 			}); err != nil {
 				return moved, err
 			}
+			if err := ompScopeOnce(path); err != nil {
+				return moved, err
+			}
+			scopeGoneRename(gone, from, to)
 			for _, w := range was {
 				s := stashLoad()[w]
 				ns := move(s)
@@ -387,7 +508,7 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 		},
 		Notice: func() string {
 			if Running(`(^|/)omp( |$)`, `@oh-my-pi/pi-coding-agent`) {
-				return "omp reads its settings at start-up — restart open omp sessions to use this."
+				return noticeOmp.String()
 			}
 			return ""
 		},
@@ -398,39 +519,35 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 				return ""
 			}
 			models := pick("models")
-			return wiringOff("omp", models, func(k string) (string, bool) { return edit.GetYAML(models, "providers."+magpieID+"."+k) },
-				"baseUrl", at.v1())
+			if d := wiringOff("omp", models, func(k string) (string, bool) { return edit.GetYAML(models, "providers."+magpieID+"."+k) },
+				"baseUrl", at.v1()); d != "" {
+				return d
+			}
+			// a default role on magpie that enabledModels leaves out never
+			// starts; setting it again adds it there (#1769)
+			if def := roleGet("default")(); ompOnMagpie(def) {
+				if m := ompScopeLeavesOut(path, def); m != "" {
+					return "omp's enabledModels (" + filepath.Base(path) + ") leaves out " + m + ", so new sessions start on another of its models"
+				}
+			}
+			return ""
 		},
-		Fields: []Field{
-			role("model", "model", "default", false),
-			// omp's own agents run on its roles (src/task/agents.ts,
-			// prompts/agents): task on @task; scout and sonic on @smol;
-			// reviewer on @slow, also the eval tool's "slow" tier. Unset,
-			// task gives its agent the parent session's model, and smol
-			// and slow take the default role's (model-resolver.ts,
-			// shouldInheritDefaultBeforePriority). The designer role went
-			// in omp 18.1.5. smol is labelled as omp names it: "small" is
-			// other agents' picker of its own
-			role("subagent", "subagents", "task", true),
-			role("small", "smol", "smol", true),
-			role("slow", "slow", "slow", true),
-			{
-				// the thinking level sessions start with, as omp's settings save
-				// it; unset omp takes high. auto has omp pick a level each turn:
-				// not a level a model lists, so it is offered here and kept out of
-				// ompEfforts, which a model's thinking levels are filtered by. First,
-				// as omp's own picker has it (16.3.5 and 18.4.4 alike)
-				Key: "effort", Label: "thinking",
-				Get: func() string { v, _ := edit.GetYAML(path, "defaultThinkingLevel"); return v },
-				Set: func(v string) error {
-					if v == "" {
-						return edit.DelYAML(path, "defaultThinkingLevel")
-					}
-					return edit.SetYAML(path, edit.KV{Path: "defaultThinkingLevel", Value: v})
-				},
-				Options: func(map[string]string) []Option { return static(append([]string{"auto"}, ompEfforts...)...) },
+		Fields: append(fields, Field{
+			// the thinking level sessions start with, as omp's settings save
+			// it; unset omp takes high. auto has omp pick a level each turn:
+			// not a level a model lists, so it is offered here and kept out of
+			// ompEfforts, which a model's thinking levels are filtered by. First,
+			// as omp's own picker has it (16.3.5 and 18.4.4 alike)
+			Key: "effort", Label: "thinking",
+			Get: func() string { v, _ := edit.GetYAML(path, "defaultThinkingLevel"); return v },
+			Set: func(v string) error {
+				if v == "" {
+					return edit.DelYAML(path, "defaultThinkingLevel")
+				}
+				return edit.SetYAML(path, edit.KV{Path: "defaultThinkingLevel", Value: v})
 			},
-		},
+			Options: func(map[string]string) []Option { return static(append([]string{"auto"}, ompEfforts...)...) },
+		}),
 	}
 }
 
@@ -463,8 +580,19 @@ type ompProviderEntry struct {
 	// and only a later one with its own (omp/18.4.4), so its requests went
 	// to "Bun" in usage and past omp's own rules and stand-ins
 	Headers map[string]string `yaml:"headers,omitempty"`
-	Models  []ompModel        `yaml:"models"`
+	// Compat names the header omp sends its session in. omp names the
+	// conversation on Anthropic's Messages API (X-Claude-Code-Session-Id),
+	// and on Chat and Responses only to OpenAI itself, so a turn of omp's on
+	// Chat or Responses reached the gateway with no session: its usage had
+	// none and "Record gateway conversations" kept none of it (akic404 on
+	// Discord). promptCacheSessionHeader has omp send its session id in it.
+	Compat map[string]string `yaml:"compat,omitempty"`
+	Models []ompModel        `yaml:"models"`
 }
+
+// ompSessionSince is the first omp whose compat takes
+// promptCacheSessionHeader (pi-catalog 16.0.6).
+const ompSessionSince = "16.0.6"
 
 // ompMaxSince is the first omp whose models.yml takes max as a thinking
 // effort (pi-ai 16.4.0); 16.3.5's schema stops at xhigh and turns the whole
@@ -545,12 +673,27 @@ func ompProviderAt(gw, version string) ompProviderEntry {
 	}
 	e := ompProviderEntry{BaseURL: gw + "/v1", API: "openai-completions", Auth: "none",
 		Headers: map[string]string{"User-Agent": "omp"}, Models: ms}
+	if version != "" && !Newer(ompSessionSince, version) {
+		e.Compat = map[string]string{"promptCacheSessionHeader": "x-session-affinity"}
+	}
 	// whqtian on Discord: a WSL omp under NAT asks Windows' address, where
 	// the gateway turns a request without a named key away
 	if key := keyAt(gw); key != gateway.Token {
 		e.Auth, e.APIKey = "", key
 	}
 	return e
+}
+
+// ompKept is magpie's entry e laid over the one in the models.yml at path.
+// omp keeps keys its schema doesn't name and never writes the file itself,
+// so what is there beside magpie's is the user's: modelOverrides (a model's
+// context or cost), discovery, disableStrictTools, remoteCompaction, a
+// header or compat flag of their own (models-config-schema-bundle.ts
+// ProviderConfigSchema). Each stays; the address, API, auth, key and model
+// list are magpie's, an auth or key it no longer writes gone with it, so a
+// loopback's auth: none never sits beside the key a WSL omp needs (#2030).
+func ompKept(path string, e ompProviderEntry) any {
+	return yamlKept(path, "providers."+magpieID, e, "baseUrl", "api", "auth", "apiKey", "models")
 }
 
 // ompOwnOptions lists the models of the providers the user added to omp's
@@ -620,3 +763,8 @@ func ompOwnOptions(modelsFile, cur string) []Option {
 	sort.SliceStable(out, func(i, j int) bool { return first[out[i].Group] < first[out[j].Group] })
 	return out
 }
+
+// what omp says after a change (notice.go)
+var (
+	noticeOmp = newNotice("omp reads its settings at start-up — restart open omp sessions to use this.")
+)

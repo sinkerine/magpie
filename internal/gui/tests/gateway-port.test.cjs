@@ -14,6 +14,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -98,7 +99,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, over, posts));
+      await watchSettingsReads(page);
       await page.goto("http://localhost:3430/?view=settings&tab=network");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       await page.locator("#portList .port-row").waitFor();
       return { page, errors, posts };
     };
@@ -119,18 +122,28 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           const border = await row.evaluate((r) => getComputedStyle(r).borderLeftWidth);
           assert(border === "0px" || border === "", "no left border accent: " + border);
 
-          // scrolled with the wheel, as a reader would, until the row is in view
+          // scrolled with the wheel, as a reader would, until the row is in
+          // view. Each step is looked at once its scroll has come to rest: on
+          // a busy machine wheel events still queued went on past the row,
+          // and the field was out of view above when it was typed in
           const scroll = () => page.locator("#view-settings").evaluate((v) => v.scrollTop);
+          const rest = async () => {
+            for (let last = -1, now = await scroll(); now !== last; last = now, now = await scroll()) await page.waitForTimeout(100);
+          };
+          const view = await page.locator("#view-settings").boundingBox();
+          const inView = async () => {
+            for (const b of [await field.boundingBox(), await apply.boundingBox()]) {
+              if (!b || b.y < view.y + 8 || b.y + b.height > view.y + view.height - 8) return false;
+            }
+            return (await scroll()) > 0;
+          };
           await page.locator("#view-settings").hover();
-          for (let i = 0; i < 40; i++) {
-            const box = await apply.boundingBox();
-            if (box && box.y > 80 && box.y + box.height < 340 && (await scroll()) > 0) break;
-            await page.mouse.wheel(0, 120);
-            await page.waitForTimeout(30);
+          for (let i = 0; i < 60 && !(await inView()); i++) {
+            await page.mouse.wheel(0, 40);
+            await rest();
           }
-          await page.waitForTimeout(500); // the wheel's scroll come to rest
           const before = await scroll();
-          assert(before > 0, "the settings must be scrolled to the row");
+          assert(await inView(), "the settings must be scrolled to the row");
 
           // out of range: said in the page, nothing sent
           await field.fill("80");

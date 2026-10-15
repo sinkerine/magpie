@@ -97,6 +97,8 @@ func TestUpdateBunHoldsBackSaysWhy(t *testing.T) {
 	sandbox(t)
 	const pkg = "@magpie-community/opencode-factory-auth"
 	heldRegistry(t, pkg, map[string]time.Time{"0.1.18": time.Now().Add(-72 * time.Hour), "0.1.21": time.Now().Add(-time.Hour)}, "0.1.21")
+	// the dist branch has 0.1.21 too: the user's hold is kept, not stepped round
+	fakeDist(t, map[string][]string{pkg: {"0.1.18", "0.1.21"}}, false)
 	home, _ := os.UserHomeDir()
 	bunfig := []byte("[install]\nminimumReleaseAge = 172800\n")
 	for _, p := range []string{filepath.Join(home, ".bunfig.toml"), filepath.Join(os.Getenv("XDG_CONFIG_HOME"), ".bunfig.toml")} {
@@ -161,5 +163,69 @@ func TestAgeText(t *testing.T) {
 		if got := ageText(in); got != want {
 			t.Errorf("ageText(%s) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// Update all (and magpie plugin update) brings a plugin pinned to an older
+// version to npm's newest, unpinned, as its row's Update does: the page
+// counts it among the updates, and before, Update all installed the pinned
+// version again, said "Plugins updated", and the row still said the newer
+// one was out (ARNO on Discord: 非官方插件…更新到最新版，magpie依然提示有更新).
+// A pinned one already at npm's newest stays pinned.
+func TestUpdateAllUpdatesAPinnedPlugin(t *testing.T) {
+	sandbox(t)
+	const pkg = "opencode-someones-auth"
+	heldRegistry(t, pkg, map[string]time.Time{"1.0.0": time.Now().Add(-72 * time.Hour), "2.0.0": time.Now().Add(-48 * time.Hour)}, "2.0.0")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	if _, err := Add(ctx, pkg+"@1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if !Pinned(Load().Plugins[0].Spec) || Installed(pkg) != "1.0.0" {
+		t.Fatalf("added %+v at %s, want it pinned at 1.0.0", Load().Plugins, Installed(pkg))
+	}
+	if err := Prefer(pkg, "someone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckUpdates(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w := PendingUpdates().Waiting; len(w) != 1 || w[0].Latest != "2.0.0" {
+		t.Fatalf("waiting before Update all = %+v, want 2.0.0", w)
+	}
+
+	if err := Update(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v := Installed(pkg); v != "2.0.0" {
+		t.Fatalf("Update all left %s at %s, want 2.0.0", pkg, v)
+	}
+	l := Load()
+	if len(l.Plugins) != 1 || l.Plugins[0].Spec != pkg+"@latest" {
+		t.Fatalf("plugins after Update all = %+v, want %s@latest", l.Plugins, pkg)
+	}
+	if l.Prefer["someone"] != pkg+"@latest" {
+		t.Fatalf("the provider picked for it = %q, want it kept on %s@latest", l.Prefer["someone"], pkg)
+	}
+	if w := PendingUpdates().Waiting; len(w) != 0 {
+		t.Fatalf("still waiting after Update all: %+v", w)
+	}
+	if _, err := CheckUpdates(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w := PendingUpdates().Waiting; len(w) != 0 {
+		t.Fatalf("the next look found an update again: %+v", w)
+	}
+
+	// pinned at the newest: Update all leaves its pin
+	if _, err := Add(ctx, pkg+"@2.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Update(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if l := Load().Plugins; len(l) != 1 || l[0].Spec != pkg+"@2.0.0" || Installed(pkg) != "2.0.0" {
+		t.Fatalf("plugins = %+v at %s, want %s@2.0.0 kept", l, Installed(pkg), pkg)
 	}
 }

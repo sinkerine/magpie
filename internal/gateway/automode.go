@@ -20,9 +20,14 @@ import (
 // (anthropicWholeEvents). Any other model neither sees them nor answers
 // them (serverReview), and Claude Code, finding no result, classifies
 // locally for the rest of the session, naming the gateway in a notice.
-// magpie says nothing on the API's behalf, and doesn't turn the review off
-// in Claude Code's settings: /model can take the same session to a Claude
-// model behind the gateway, which reviews it.
+// magpie says nothing on the API's behalf. Where no model Claude Code can
+// reach through magpie is reviewed (AutoModeReviewed), the agent's wiring
+// turns the review off in Claude Code's settings instead
+// (CLAUDE_CODE_AUTO_MODE_SERVER=0, as Anthropic's page on the notice says to
+// for a gateway that can't run the checks), so it classifies locally from
+// the start and says nothing about the gateway (1EFLOPS on X). Where one
+// is, it is left on: /model can take the same session to that model,
+// which reviews it.
 //
 // Locally, the classifier is a request of its own on the session's model:
 // the transcript in <transcript> blocks, a system prompt asking for
@@ -49,7 +54,7 @@ func isServerReviewBeta(b string) bool { return strings.HasPrefix(b, serverRevie
 // is Claude's.
 func (s *Server) serverReview(p provider.Provider, asked []string, body []byte) ([]string, []byte) {
 	model := gjson.GetBytes(body, "model").String()
-	claude := model == "" || anthropicModel.MatchString(model) || provider.HostOf(p.Base(provider.Anthropic)) == "api.anthropic.com"
+	claude := model == "" || AutoModeReviewed(p, model)
 	if !claude {
 		asked = slices.DeleteFunc(slices.Clone(asked), isServerReviewBeta)
 	}
@@ -60,6 +65,17 @@ func (s *Server) serverReview(p provider.Provider, asked []string, body []byte) 
 		}
 	}
 	return betas, body
+}
+
+// AutoModeReviewed reports whether a request for model on p can have its
+// actions reviewed by Anthropic for Claude Code's auto mode: the Claude
+// subscription (the bridge hands the review to Claude Code's own binary),
+// a Claude model (Anthropic's API, a relay in front of it, Bedrock's or
+// Vertex's names for it), or anything on Anthropic's own API. No other
+// vendor runs Anthropic's classifier, and magpie answers none on its
+// behalf.
+func AutoModeReviewed(p provider.Provider, model string) bool {
+	return p.Account != nil && p.Account.Agent == "claude" || anthropicModel.MatchString(model) || provider.HostOf(p.Base(provider.Anthropic)) == "api.anthropic.com"
 }
 
 // classifierRoom is what a model that reasons is given on top of the

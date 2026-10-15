@@ -14,6 +14,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // What the Agents page says beside an agent's 「接入」 switch (the owner's
@@ -25,16 +26,24 @@ import (
 // Source is what an agent not connected to magpie runs on now: "sub" (a
 // Claude subscription), "chatgpt" (a ChatGPT sign-in), "key" (an API key
 // of its own), "providers:N" (N providers of its own); "" when unknown.
+//
+// With account discovery off (#1535) no sign-in is read for it: Claude
+// Code's account in .claude.json, Codex's auth.json and OpenCode's are
+// left alone, and only what the agent's own settings say is told.
 func (a *Agent) Source() string {
 	if a.WSL != "" || a.Path == "" {
 		return ""
 	}
 	dir := filepath.Dir(a.Path)
+	signIns := !settings.AccountDiscoveryOff()
 	switch a.ID {
 	case "claude":
 		// signed in to claude.ai: ~/.claude.json (or the one in
 		// CLAUDE_CONFIG_DIR) has the account
 		for _, p := range []string{filepath.Join(dir, ".claude.json"), filepath.Join(filepath.Dir(dir), ".claude.json")} {
+			if !signIns {
+				break
+			}
 			if v, _ := edit.GetJSON(p, "oauthAccount.accountUuid"); v != "" {
 				return "sub"
 			}
@@ -46,13 +55,16 @@ func (a *Agent) Source() string {
 			return "key"
 		}
 	case "codex":
+		if !signIns {
+			break
+		}
 		if codexChatGPT(dir) {
 			return "chatgpt"
 		}
 		if v, _ := edit.GetJSON(filepath.Join(dir, "auth.json"), "OPENAI_API_KEY"); v != "" {
 			return "key"
 		}
-	case "opencode", "mimocode":
+	case "opencode", "mimocode", "deveco":
 		// the providers in its config, and those signed in through it
 		n := map[string]bool{}
 		var cfg map[string]json.RawMessage
@@ -63,7 +75,7 @@ func (a *Agent) Source() string {
 		}
 		home, _ := os.UserHomeDir()
 		var auth map[string]json.RawMessage
-		if b, err := os.ReadFile(filepath.Join(home, ".local", "share", a.ID, "auth.json")); err == nil && json.Unmarshal(b, &auth) == nil {
+		if b, err := readOwnAuth(filepath.Join(home, ".local", "share", a.ID, "auth.json")); err == nil && json.Unmarshal(b, &auth) == nil {
 			for k := range auth {
 				n[k] = true
 			}
@@ -85,7 +97,7 @@ func (a *Agent) FailoverSaid() string {
 	if a.FailingOver == nil || !a.FailingOver() {
 		return ""
 	}
-	return "not connected · goes through magpie only to fail over to your other ChatGPT accounts; switch them off under Providers › Codex to stop it"
+	return "not connected · goes through magpie only to fail over to your other ChatGPT accounts; tick Only switch Codex's sign-in under Providers › Codex (magpie accounts switch-only codex on), or switch them off, to stop it"
 }
 
 // startsWith is, for an agent that reads magpie's models only as it
@@ -177,7 +189,8 @@ func (a *Agent) changedAt(files []string, reads func() string) time.Time {
 
 // Stale is how many copies of the agent are running that started before
 // magpie last changed what it reads at start: they still have the list
-// they started with until reopened. Zero where it can't be told (Windows).
+// they started with until reopened. On Windows only the Codex daemon is
+// told.
 func (a *Agent) Stale() int { return len(a.StaleCopies()) }
 
 // StaleCopy is a copy of an agent still running on the list it started
@@ -186,9 +199,10 @@ func (a *Agent) Stale() int { return len(a.StaleCopies()) }
 type StaleCopy struct {
 	// Kind, for Codex: "app" (the ChatGPT or Codex desktop app, its
 	// app-server and helpers), "ide" (an editor extension's), "daemon"
-	// (the background app-server the CLI leaves running) or "cli"; ""
-	// for other agents; "embedded" is another app's own Codex, named by
-	// App
+	// (the background app-server the CLI leaves running), "helper" (a
+	// subcommand the daemon spawns beside itself, no copy to reopen) or
+	// "cli"; "" for other agents; "embedded" is another app's own Codex,
+	// named by App
 	Kind  string    `json:"kind,omitempty"`
 	App   string    `json:"app,omitempty"`
 	Since time.Time `json:"since"`
@@ -206,6 +220,11 @@ type StaleCopy struct {
 // files, and isn't counted.
 func (a *Agent) StaleCopies() []StaleCopy {
 	pats, files, reads := a.startsWith()
+	// Windows lists its processes slowly and without their start: only
+	// the Codex daemon, as KeepCodexDaemonCurrent last found it
+	if a.ID == "codex" && a.WSL == "" && runtime.GOOS == "windows" {
+		return codexDaemonBehind()
+	}
 	if len(pats) == 0 || a.WSL != "" || runtime.GOOS == "windows" {
 		return nil
 	}
@@ -230,6 +249,12 @@ func (a *Agent) StaleCopies() []StaleCopy {
 			if a.ID == "codex" {
 				var app string
 				c.Kind, app = codexCopyKind(p.cmd)
+				if c.Kind == "helper" {
+					// a daemon subcommand's helper reads no list, a
+					// restart of the daemon doesn't end it, and there
+					// is no Codex to quit (#1461)
+					continue
+				}
 				if c.Kind == "embedded" {
 					c.App = app
 				}
@@ -267,6 +292,11 @@ func codexCopyKind(cmd string) (kind, app string) {
 		// the outermost bundle: ChatGPT.app's codex runs from a
 		// CodexCLI.app inside it
 		return "app", exe[:strings.Index(exe, ".app/")+len(".app")]
+	case daemonHelper(cmd):
+		// a subcommand the managed daemon spawns beside itself (codex
+		// app-server daemon pid-update-loop): long-lived, reads no list,
+		// and outlives a daemon restart (#1461)
+		return "helper", ""
 	case slices.Contains(strings.Fields(cmd), "app-server"):
 		// an app that ships a Codex of its own and talks to its
 		// app-server (Agents Anywhere's connector, from its folder in
@@ -282,6 +312,19 @@ func codexCopyKind(cmd string) (kind, app string) {
 		}
 	}
 	return "cli", ""
+}
+
+// daemonHelper says the command line is a subcommand the managed daemon
+// spawns beside itself: app-server daemon <sub> (pid-update-loop, …). The
+// daemon itself carries --managed-daemon and is told apart above.
+func daemonHelper(cmd string) bool {
+	f := strings.Fields(cmd)
+	for i, s := range f {
+		if s == "app-server" && i+2 < len(f) && f[i+1] == "daemon" {
+			return true
+		}
+	}
+	return false
 }
 
 // elapsed reads ps's etime, [[dd-]hh:]mm:ss.

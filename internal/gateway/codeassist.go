@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
@@ -72,9 +74,32 @@ func antigravityTurnedAway(p provider.Provider, system, said string) bool {
 	return accountAgent(p) == "antigravity" && antigravityTurnsAway(system) && antigravityRefuses(said)
 }
 
+// agForeseeing is how long after Antigravity last turned that system prompt
+// away a group still skips it for one, without asking: long enough that a
+// conversation doesn't wait on the same refusal turn after turn, short
+// enough that a block Google lifts is noticed on the next request after it.
+const agForeseeing = 6 * time.Hour
+
+// antigravityForeseen says whether p is an Antigravity account that would
+// turn body away: it carries the system prompt Antigravity refuses, and
+// Antigravity has refused it within agForeseeing. It holds for exactly the
+// requests antigravityTurnedAway would tell as the refusal, and it changes
+// nothing about the account.
+func (s *Server) antigravityForeseen(p provider.Provider, from provider.Protocol, body []byte) bool {
+	if accountAgent(p) != "antigravity" {
+		return false
+	}
+	at := s.agTurnedAway.Load()
+	if at == 0 || time.Since(time.Unix(0, at)) > agForeseeing {
+		return false
+	}
+	req, err := parse(from, body)
+	return err == nil && antigravityTurnsAway(req.System)
+}
+
 // antigravityTurnedAwayHint is what magpie adds to Antigravity's words, after
 // " — ", for the agent and the Routing page, which says it apart from them in
-// its own language (routing.js AG_TURNED_AWAY).
+// its own language (routing/client.js AG_TURNED_AWAY).
 const antigravityTurnedAwayHint = "Antigravity answers this 429 to the system prompt of Claude Code and the Claude Agent SDK (Claude Desktop's chats) whatever quota is left, so it is not a quota and waiting won't help; use another provider for these chats, or put one after Antigravity in a routing group"
 
 // turnedAwayStatus is what the agent is told when nobody is left to answer
@@ -137,8 +162,10 @@ func buildCodeAssist(r *Request, model, agent string) []byte {
 // with that same id and would otherwise work it out a second time. There is
 // no model but that id in here: on Antigravity the two differ, and the one
 // the request goes out under is the one everything below is shaped from.
+// agent "vertex" is Vertex AI's request (buildVertex).
 func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 	ag := agent == "antigravity"
+	vx := agent == "vertex"
 	at := "" // the level the id says it thinks at
 	if ag {
 		if _, l, ok := antigravityBaseOf(sent); ok {
@@ -154,17 +181,31 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 	}
 	names := map[string]string{}
 	var contents []map[string]any
-	for _, m := range r.Messages {
+	for _, m := range dropSecondAnswers(r.Messages) {
 		role := "user"
 		if m.Role == "assistant" {
 			role = "model"
 		}
 		var parts, after []map[string]any // after: tools' images held back
+		toolImage := map[int]bool{}       // which of parts are a tool's images
+		// signed: a step Gemini signed, whose later calls go without, as
+		// Gemini signs the first (#1445, as chat's #687)
+		signed := false
+		for _, p := range m.Parts {
+			if p.Kind == ToolCall && p.Signature != "" {
+				signed = true
+			}
+		}
 		for _, p := range m.Parts {
 			switch p.Kind {
 			case Text:
-				if p.Text != "" {
-					parts = append(parts, map[string]any{"text": p.Text})
+				if p.Text != "" || (p.Signature != "" && !claude) {
+					part := map[string]any{"text": p.Text}
+					if p.Signature != "" && !claude {
+						// Gemini's signature on its text, back as it gave it
+						part["thoughtSignature"] = p.Signature
+					}
+					parts = append(parts, part)
 				}
 			case Image, File:
 				if p.Data != "" {
@@ -178,7 +219,17 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 				if id := toolID(p.ID); id != "" {
 					call["id"] = id
 				}
-				parts = append(parts, map[string]any{"functionCall": call, "thoughtSignature": skipSignature})
+				part := map[string]any{"functionCall": call}
+				switch {
+				case claude:
+					part["thoughtSignature"] = skipSignature
+				case p.Signature != "":
+					// Gemini's own signature, back as it gave it (#1445)
+					part["thoughtSignature"] = p.Signature
+				case !signed:
+					part["thoughtSignature"] = skipSignature
+				}
+				parts = append(parts, part)
 			case ToolResult:
 				name := names[p.CallID]
 				if name == "" {
@@ -219,7 +270,10 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 					after = append(after, map[string]any{"text": label})
 					after = append(after, ims...)
 				} else {
-					parts = append(parts, ims...)
+					for _, im := range ims {
+						toolImage[len(parts)] = true
+						parts = append(parts, im)
+					}
 				}
 			}
 			// thinking isn't sent back: its signatures belong to whoever
@@ -238,21 +292,49 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 			}
 			parts = append(append(lead, after...), rest...)
 		}
-		if len(parts) == 0 {
-			continue
+		// what the user said goes in a turn of its own after the tools'
+		// responses: Gemini answers a turn mixing a functionResponse with
+		// text "Requests ending with a model turn are not supported" (#1533,
+		// yycsyu: Codex's compaction prompt after a tool's output), and takes
+		// the two as separate turns. A Claude model on Antigravity keeps them
+		// in one, the tool_result turn Anthropic reads them as.
+		var said []map[string]any
+		if role == "user" && !(ag && claude) && hasResponse(parts) {
+			var tools []map[string]any
+			for i, part := range parts {
+				if part["functionResponse"] != nil || toolImage[i] {
+					tools = append(tools, part)
+				} else {
+					said = append(said, part)
+				}
+			}
+			parts = tools
 		}
-		if n := len(contents); n > 0 && contents[n-1]["role"] == role {
-			contents[n-1]["parts"] = append(contents[n-1]["parts"].([]map[string]any), parts...)
-			continue
+		for _, ps := range [][]map[string]any{parts, said} {
+			if len(ps) == 0 {
+				continue
+			}
+			if n := len(contents); n > 0 && contents[n-1]["role"] == role && (role != "user" || hasResponse(contents[n-1]["parts"].([]map[string]any)) == hasResponse(ps)) {
+				contents[n-1]["parts"] = append(contents[n-1]["parts"].([]map[string]any), ps...)
+				continue
+			}
+			contents = append(contents, map[string]any{"role": role, "parts": ps})
 		}
-		contents = append(contents, map[string]any{"role": role, "parts": parts})
 	}
+	contents = pairFunctionTurns(contents, ag, ag && claude)
 	if len(contents) > 0 && contents[0]["role"] == "model" {
 		// Gemini turns away a history that opens with the model's turn
 		// (what an agent's compaction can leave): "function call turn comes
 		// immediately after a user turn". Gemini CLI's hardenHistory puts
 		// this user turn before it, and so does this.
 		contents = append([]map[string]any{{"role": "user", "parts": []map[string]any{{"text": "[Continuing from previous AI thoughts...]"}}}}, contents...)
+	}
+	if n := len(contents); n > 0 && contents[n-1]["role"] == "model" {
+		// nor one that ends with it: "Requests ending with a model turn
+		// are not supported" on Vertex AI, Code Assist and Antigravity
+		// alike (yycsyu: Codex compacting on gemini-3.8-flash). A user
+		// turn goes after it, as Gemini CLI keeps its history ending
+		contents = append(contents, map[string]any{"role": "user", "parts": []map[string]any{{"text": modelLastAsk(r)}}})
 	}
 	req := map[string]any{"contents": contents}
 	if r.System != "" {
@@ -311,7 +393,11 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 	if len(r.Stop) > 0 {
 		gen["stopSequences"] = r.Stop
 	}
-	if tc := thinkingConfig(r, sent, claude, at); tc != nil {
+	tc := thinkingConfig(r, sent, claude, at)
+	if vx {
+		tc = vertexThinking(r, sent)
+	}
+	if tc != nil {
 		gen["thinkingConfig"] = tc
 		// Claude's answer has to have room past its thinking
 		if b, ok := tc["thinkingBudget"].(int); ok && claude && gen["maxOutputTokens"] == nil {
@@ -336,16 +422,153 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 	return b
 }
 
+// dropSecondAnswers leaves out a tool result whose call an earlier result
+// already answered, with the images it carried: the first answer stands, as
+// pairToolMessages and pairToolBlocks keep it for a Chat or Messages
+// upstream. Google turns a call turn away when its functionResponse count
+// differs from its functionCall count, so a client that answers one call
+// twice (#2262) had every later turn refused. A call made again under the
+// same id takes an answer of its own, and a result with no id is left as
+// it is. msgs is not changed: a fallback builds from the same request.
+func dropSecondAnswers(msgs []Message) []Message {
+	var out []Message
+	answered := map[string]bool{}
+	for i, m := range msgs {
+		var parts []Part
+		for j, p := range m.Parts {
+			switch {
+			case p.Kind == ToolCall && p.ID != "":
+				delete(answered, p.ID)
+			case p.Kind == ToolResult && p.CallID != "" && p.Standalone == nil:
+				if answered[p.CallID] {
+					if parts == nil {
+						parts = append(make([]Part, 0, len(m.Parts)), m.Parts[:j]...)
+					}
+					if out == nil {
+						out = append(make([]Message, 0, len(msgs)), msgs[:i]...)
+					}
+					continue
+				}
+				answered[p.CallID] = true
+			}
+			if parts != nil {
+				parts = append(parts, p)
+			}
+		}
+		if out == nil {
+			continue
+		}
+		if parts != nil {
+			if len(parts) == 0 {
+				continue
+			}
+			m.Parts = parts
+		}
+		out = append(out, m)
+	}
+	if out == nil {
+		return msgs
+	}
+	return out
+}
+
+// interruptedToolNote is the result a call left unanswered is answered
+// with, the words the chat build gives such a call (pairToolMessages).
+const interruptedToolNote = "[The result of this tool call is unavailable: the turn was interrupted.]"
+
+// pairFunctionTurns answers a model turn's function calls in the turn
+// right after it, as Google's API reads its histories ("Please ensure
+// that the number of function response parts is equal to the number of
+// function call parts of the function call turn"): a call the client
+// answers nowhere — an interrupted turn leaves its call pending, and
+// Google turns every later turn of the conversation away with 400 over
+// the one — is answered with the synthetic result the chat build gives
+// such a call (pairToolMessages, #1275). The answer goes in the turn that
+// follows the calls when that turn already holds answers, and otherwise
+// in a turn of its own before it: a user turn mixing a functionResponse
+// with text is turned away too (#1533). A Claude model on Antigravity
+// (agClaude) keeps the answer and what the user said in one turn, the
+// tool_result turn Anthropic reads them as. A call with no id counts as
+// answered by a response of its name with no id.
+func pairFunctionTurns(contents []map[string]any, ag, agClaude bool) []map[string]any {
+	if len(contents) == 0 {
+		return contents
+	}
+	partsOf := func(c map[string]any) []map[string]any {
+		ps, _ := c["parts"].([]map[string]any)
+		return ps
+	}
+	answered := map[string]bool{}
+	answeredName := map[string]bool{}
+	for _, c := range contents {
+		for _, p := range partsOf(c) {
+			if fr, ok := p["functionResponse"].(map[string]any); ok {
+				if id, _ := fr["id"].(string); id != "" {
+					answered[id] = true
+				} else {
+					name, _ := fr["name"].(string)
+					answeredName[name] = true
+				}
+			}
+		}
+	}
+	key := "output"
+	if ag {
+		key = "result"
+	}
+	out := make([]map[string]any, 0, len(contents)+1)
+	for i, c := range contents {
+		out = append(out, c)
+		if c["role"] != "model" {
+			continue
+		}
+		var synth []map[string]any
+		for _, p := range partsOf(c) {
+			fc, ok := p["functionCall"].(map[string]any)
+			if !ok {
+				continue
+			}
+			id, _ := fc["id"].(string)
+			name, _ := fc["name"].(string)
+			if id != "" && answered[id] || id == "" && answeredName[name] {
+				continue
+			}
+			res := map[string]any{"name": name, "response": map[string]any{key: interruptedToolNote}}
+			if id != "" {
+				res["id"] = id
+			}
+			synth = append(synth, map[string]any{"functionResponse": res})
+		}
+		if len(synth) == 0 {
+			continue
+		}
+		if i+1 < len(contents) && contents[i+1]["role"] == "user" && (agClaude || hasResponse(partsOf(contents[i+1]))) {
+			contents[i+1]["parts"] = append(synth, partsOf(contents[i+1])...)
+			continue
+		}
+		out = append(out, map[string]any{"role": "user", "parts": synth})
+	}
+	return out
+}
+
 // thinkingConfig says how hard the model should think: a level for
-// Gemini 3, a budget for the rest. A model that doesn't think gets none,
-// and one whose id already says its level, at (Antigravity's
-// gemini-3.7-flash-low), is told that level and no other — the effort
-// asked for picked that id. Told no level, Antigravity's variants all but
+// Gemini 3 and later (geminiGeneration), a budget for the rest. A model
+// that doesn't think gets none, and one whose id already says its level,
+// at (Antigravity's gemini-3.7-flash-low), is told that level and no
+// other — the effort asked for picked that id. Told no level, Antigravity's variants all but
 // stop thinking once the request has tools, and give none of it back
 // (#636); Antigravity's own tiered ids, sent a level, don't.
 //
-// Gemini 3's levels: Flash takes minimal, low, medium and high, so medium
-// goes as medium; Pro takes low and high only, so medium goes up to high.
+// Gemini 3's levels: medium goes as medium to Flash, and up to high to
+// Pro, which took low and high only (3 Pro). A later Gemini is sent the
+// medium it was asked, already fitted to its own levels (fitFor):
+// gemini-4-argon has low, medium and high (#2083). Minimal goes only to a
+// Flash variant at minimal: 3.7 and 3.8 Flash have none (AI Studio
+// answers 3.8's with a 400), and the id here doesn't say which Flash serves it (Gemini
+// CLI's 3.5 Flash goes out as 3.8 Flash where that is rolled out).
+// Reasoning off otherwise (the auto mode classifier's least level) goes at
+// low, which every Gemini 3 text model takes; an image model may have no
+// low (3.1 Flash Image: minimal and high), and goes at high.
 func thinkingConfig(r *Request, model string, claude bool, at string) map[string]any {
 	m := strings.ToLower(model)
 	if strings.HasPrefix(m, "gpt-oss") || claude && !strings.Contains(m, "thinking") {
@@ -358,7 +581,7 @@ func thinkingConfig(r *Request, model string, claude bool, at string) map[string
 		}
 	}
 	tc := map[string]any{"includeThoughts": true}
-	if strings.HasPrefix(m, "gemini-3") || strings.HasPrefix(m, "gemini-pro-agent") {
+	if gen := geminiGeneration(m); gen >= 3 || strings.HasPrefix(m, "gemini-pro-agent") {
 		effort := r.Effort
 		if at != "" {
 			effort = at
@@ -370,7 +593,9 @@ func thinkingConfig(r *Request, model string, claude bool, at string) map[string
 				level = "low"
 			case effort == "minimal" && at != "":
 				level = "minimal"
-			case effort == "medium" && strings.Contains(m, "flash"):
+			case offEffort(effort) && !catalog.DrawsID(m):
+				level = "low"
+			case effort == "medium" && (strings.Contains(m, "flash") || gen > 3):
 				level = "medium"
 			}
 			tc["thinkingLevel"] = level
@@ -386,6 +611,25 @@ func thinkingConfig(r *Request, model string, claude bool, at string) map[string
 	}
 	tc["thinkingBudget"] = budget
 	return tc
+}
+
+// geminiVersion is the major version in a Gemini model's id, as the id
+// names it: gemini-4-argon, models/gemini-3.8-flash, gemini-2.5-pro.
+var geminiVersion = regexp.MustCompile(`(?:^|/)gemini-(\d+)`)
+
+// geminiGeneration is the generation of Gemini model names, 0 for an id
+// that names none (a non-Gemini model, or an alias such as
+// gemini-flash-latest, which may still be a 2.5). From Gemini 3 a model is
+// told a thinking level; Gemini 4 turns a budget away with "Thinking
+// budget is not supported for this model. Use thinking level instead."
+// (#2083), so a new generation isn't sent one either.
+func geminiGeneration(model string) int {
+	m := geminiVersion.FindStringSubmatch(model)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
 }
 
 // plainSchema is a JSON schema cut down to what Antigravity's function
@@ -600,24 +844,35 @@ func (d *codeAssistDecoder) decode(data string, emit func(Event)) error {
 		geminiChunk
 	}
 	if err := json.Unmarshal([]byte(data), &ch); err != nil {
+		// an error in a shape of its own is still the reply's end (#1933)
+		if e, ok := carriedError(data); ok {
+			emit(e)
+		}
 		return nil
 	}
 	if ch.Error != nil {
-		emit(Event{Kind: KError, Text: ch.Error.Message})
+		emit(Event{Kind: KError, Text: cmp.Or(ch.Error.Message, streamErrorText(data))})
 		return nil
 	}
 	c := ch.geminiChunk
 	if ch.Response != nil {
 		c = *ch.Response
 	}
-	if !d.started {
-		d.started = true
-		emit(Event{Kind: KStart, MsgID: c.ResponseID, Model: c.ModelVersion})
-	}
 	if c.UsageMetadata != nil {
 		u := c.UsageMetadata
 		d.usage = &Usage{Input: max(u.Prompt-u.Cached, 0), CacheRead: u.Cached,
 			Output: u.Candidates + u.Thoughts, Reasoning: u.Thoughts}
+	}
+	if !d.started {
+		d.started = true
+		// the prompt's count rides on the first chunk: told at the start,
+		// as Anthropic's message_start tells it, which Claude Code's
+		// context meter reads before the turn ends (#1887)
+		var prompt Usage
+		if d.usage != nil {
+			prompt = Usage{Input: d.usage.Input, CacheRead: d.usage.CacheRead}
+		}
+		emit(Event{Kind: KStart, MsgID: c.ResponseID, Model: c.ModelVersion, Usage: prompt})
 	}
 	for _, cand := range c.Candidates {
 		for _, p := range cand.Content.Parts {
@@ -633,7 +888,9 @@ func (d *codeAssistDecoder) decode(data string, emit func(Event)) error {
 					args = json.RawMessage("{}")
 				}
 				d.tools = true
-				emit(Event{Kind: KToolStart, ID: id, Name: toolOfCall(p.FunctionCall.Name)})
+				// its signature rides in the id, and comes back off it
+				// (signedID, unsignCalls), as on chat (#687, #1445)
+				emit(Event{Kind: KToolStart, ID: signedID(id, p.Signature), Name: toolOfCall(p.FunctionCall.Name)})
 				emit(Event{Kind: KToolArgs, Text: string(args)})
 			case p.Thought:
 				d.flush(emit)
@@ -649,8 +906,13 @@ func (d *codeAssistDecoder) decode(data string, emit func(Event)) error {
 				// reasoning above (#620)
 				d.flush(emit)
 				emit(Event{Kind: KImage, Name: p.InlineData.MimeType, Text: p.InlineData.Data})
-			case p.Text != "":
+			case p.Text != "" || p.Signature != "":
 				d.text(p.Text, emit)
+				if p.Signature != "" {
+					// Gemini's signature on its text, after it (#1445)
+					d.flush(emit)
+					emit(Event{Kind: KTextSig, Text: p.Signature})
+				}
 			}
 		}
 		if g := cand.GroundingMetadata; g != nil && !d.searched {
@@ -948,4 +1210,14 @@ func stopFromGemini(s string) string {
 	}
 	// SAFETY, RECITATION, BLOCKLIST, PROHIBITED_CONTENT, SPII, ...
 	return "filter"
+}
+
+// hasResponse says whether a Gemini turn's parts hold a tool's response.
+func hasResponse(parts []map[string]any) bool {
+	for _, p := range parts {
+		if p["functionResponse"] != nil {
+			return true
+		}
+	}
+	return false
 }

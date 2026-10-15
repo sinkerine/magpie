@@ -193,7 +193,10 @@ func TestTranslatedSilenceStillTimesOut(t *testing.T) {
 	}
 	server := httptest.NewServer(New().Handler())
 	defer server.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	// The client's idle timeout is over the body: it starts once the
+	// headers are in, so that a loaded machine's slow first byte isn't
+	// taken for it (#2248). 400ms is 40 keepalive gaps.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "POST", server.URL+"/v1/responses", strings.NewReader(`{"model":"fake/m1","stream":true,"input":"hi"}`))
 	res, err := http.DefaultClient.Do(req)
@@ -201,6 +204,8 @@ func TestTranslatedSilenceStillTimesOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
+	idle := time.AfterFunc(400*time.Millisecond, cancel)
+	defer idle.Stop()
 	b, _ := io.ReadAll(res.Body)
 	if n := strings.Count(string(b), `"type":"response.in_progress"`); n > 1 {
 		t.Fatalf("a silent provider was covered for: %d in_progress events\n%s", n, b)

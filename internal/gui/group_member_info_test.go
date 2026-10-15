@@ -200,7 +200,7 @@ func TestGroupMemberThatIsAGroupCarriesWhatAgentsSee(t *testing.T) {
 	}
 
 	// and each member's row is readable: a member that carries any of these
-	// draws chips (routing.js reads memberInfo when the member is a group)
+	// draws chips (routing/client.js reads memberInfo when the member is a group)
 	for _, mi := range outer.Info {
 		if !mi.Group && mi.Context == 0 {
 			t.Errorf("member %s carries nothing to read", mi.ID)

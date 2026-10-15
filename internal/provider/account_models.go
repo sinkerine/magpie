@@ -17,10 +17,23 @@ import (
 
 // AccountServes says whether the account or key ref (a signed-in
 // account's name, a key's KeyID) is let serve model: true when it has no
-// list of its own.
+// list of its own, and for a model Codex calls by itself that no list can
+// hold (codexOwnHidden).
 func (p Provider) AccountServes(ref, model string) bool {
 	ms, ok := p.AccountModels[accountKey(ref)]
-	return !ok || len(ms) == 0 || slices.Contains(ms, model)
+	return !ok || len(ms) == 0 || slices.Contains(ms, model) || codexOwnHidden(p, model)
+}
+
+// codexOwnHidden says model is one a Codex account serves that its list
+// of models can't name: codex-auto-review, the model Codex's auto-review
+// of an approval (the guardian) asks for. It is hidden from the
+// provider's models, so an account's list, picked from those, never had
+// it, and a list kept for the big models turned every approval away as
+// "every account barred" once Codex's turns went through magpie's
+// account failover (#1959, parkavenue9639). ChatGPT serves it to every
+// plan, free since 2026-10-06 (#1593).
+func codexOwnHidden(p Provider, model string) bool {
+	return p.Account != nil && p.Account.Agent == "codex" && strings.EqualFold(strings.TrimSpace(model), "codex-auto-review")
 }
 
 // AccountRefs are the provider's accounts, or keys, as AccountModels
@@ -185,10 +198,10 @@ func SetModels(id string, models []string) error {
 		return err
 	}
 	ms := normalModels(models)
-	if slices.Equal(ms, normalModels(p.Models)) {
+	if slices.Equal(ms, normalModels(p.Models)) && !p.ServesNone() {
 		return nil
 	}
-	p.Models = ms
+	p.Models, p.NoModels = ms, false
 	return Save(*p)
 }
 

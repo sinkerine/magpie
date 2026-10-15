@@ -18,6 +18,8 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // keepAliveEvery is how long a saved sign-in goes before it is renewed.
@@ -38,6 +40,9 @@ type Renewal struct {
 // agent's hands that have gone every or longer without it; every 0 renews
 // all of them.
 func RenewLogins(ctx context.Context, every time.Duration) []Renewal {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	rememberLogins(false)
 	loginsMu.Lock()
 	active := map[string]string{}
@@ -50,7 +55,7 @@ func RenewLogins(ctx context.Context, every time.Duration) []Renewal {
 	loginsMu.Unlock()
 	out := []Renewal{}
 	for _, l := range ls {
-		if l.Agent != "codex" || strings.EqualFold(active[l.Agent], l.User) || accountRemoved(l.Agent) {
+		if l.Agent != "codex" || strings.EqualFold(active[l.Agent], l.User) || leftAlone(l.Agent) {
 			continue
 		}
 		r := Renewal{Agent: l.Agent, User: l.User}

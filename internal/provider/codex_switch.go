@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lastgood"
 )
 
 // loginSwitchEvery is how often the account each agent is on is looked at.
@@ -142,8 +143,8 @@ func usedPast(q SubscriptionQuota, share float64, now time.Time) bool {
 // accounts that are on in magpie, in the order they were saved, whose
 // allowance is known and not spent. ok is false when the agent should stay.
 func NextLogin(ctx context.Context, agent string) (from, to string, back, ok bool) {
-	if accountRemoved(agent) {
-		return "", "", false, false // magpie has no say in its sign-in
+	if leftAlone(agent) {
+		return "", "", false, false // magpie has no say in its sign-in, or was told to leave it be
 	}
 	var spares []Login
 	var first *Login
@@ -240,6 +241,11 @@ func SwitchWhenSpent(ctx context.Context, agent string) (string, error) {
 		share, _ := loginSwitching(agent)
 		log.Printf("%s: %s has used %g%% or more of its allowance; signed it in to %s", agent, from, share, to)
 	}
+	if agent == "codex" {
+		if was := CodexAppStale(); was != "" {
+			log.Printf("codex: the Codex app is still signed in to %s, and shows its limits, until it is quit and opened again", was)
+		}
+	}
 	// the models the agent is offered are the new account's plan's
 	catalog.Touched()
 	return to, nil
@@ -293,6 +299,11 @@ func setLoginReturn(agent string, r loginReturn) {
 	}
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err == nil {
+		// readLoginReturns reads a file that doesn't parse as none: it is
+		// kept aside before it is written over
+		err = lastgood.KeepUnparsed(loginReturnsPath(), lastgood.Into[map[string]loginReturn])
+	}
+	if err == nil {
 		err = writePrivate(loginReturnsPath(), append(b, '\n'))
 	}
 	if err != nil {
@@ -318,7 +329,8 @@ func noteCodexUsedUp(now bool) {
 
 // KeepOnAnAccountWithRoom runs SwitchWhenSpent for Codex and Claude Code a
 // minute after it starts and every loginSwitchEvery after that, until ctx
-// ends.
+// ends, and keeps Claude Code's proxy that of its account
+// (SyncClaudeProxyEnv).
 func KeepOnAnAccountWithRoom(ctx context.Context) {
 	t := time.NewTimer(time.Minute)
 	defer t.Stop()
@@ -335,6 +347,9 @@ func KeepOnAnAccountWithRoom(ctx context.Context) {
 			}
 			cancel()
 		}
+		// a sign-in made in Claude Code itself, or a proxy picked since,
+		// takes its account's proxy too (#1807)
+		syncClaudeProxyEnvNow()
 		c, cancel := context.WithTimeout(ctx, time.Minute)
 		noteCodexUsedUp(CodexUsedUp(c))
 		cancel()

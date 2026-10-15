@@ -4,6 +4,7 @@ const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 const { fixture, confirmKeyAction } = require("./fixtures/caller-keys.cjs");
+const { openPart } = require("./reader.cjs");
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const lang of ["en", "zh"]) {
@@ -61,7 +62,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.match(await page.locator("#usageKeys").textContent(), /Laptop/);
       assert.equal(await page.locator("#usageKeysHead").textContent(), lang === "zh" ? "网关密钥" : "Gateway keys");
       assert.equal(await page.locator("#usageCallerKeys").count(), 0, "there is only one API key section");
-      await page.locator("#usageTab").getByRole("button", { name: w.requests, exact: true }).click();
+      await page.locator(":is(#usageTab .opt, .nav-s):visible", { hasText: new RegExp("^" + w.requests + "(?!\\p{L})", "u") }).click();
       await page.locator("#ledKey").click();
       await page.locator(".sess-menu .pm-item", { hasText: "Laptop" }).click();
       await page.waitForFunction(() => document.querySelectorAll("#ledWrap tbody tr").length === 1);
@@ -71,7 +72,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert(events.some((e) => e.action === "export" && e.query.includes("callerKey=laptop") && !e.query.includes("key=") && !e.query.includes("user=")));
       await page.reload();
       await page.locator("#prefs").click();
-      await page.locator("#setTab-network").click();
+      await openPart(page, "network");
       const share = page.locator("#lanList").getByRole("button", { name: lang === "zh" ? "开启" : "On", exact: true });
       await share.waitFor();
       // Real wheel input lets the page remember the reader's scroll position.
@@ -110,7 +111,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await confirmKeyAction(page, lanRow, w.remove);
       await page.waitForFunction(() => document.querySelectorAll("#gatewayKeys .acc[data-key]").length === 4);
       await page.locator("#prefs").click();
-      await page.locator("#setTab-network").click();
+      // Settings comes back where the reader left it, its tabs under the
+      // header: a reader wheels up to them. A scroll that isn't the
+      // reader's, as Playwright's before a click, is put back (#1554), so
+      // WebKit's click waited on a tab the header covered.
+      await page.mouse.move(500, 400);
+      await page.mouse.wheel(0, -2000);
+      await page.waitForFunction(() => document.querySelector("#view-settings").scrollTop === 0);
+      await openPart(page, "network");
       await page.locator("#lanList .lan-address-row").waitFor();
       await page.locator("#lanList").getByRole("button", { name: lang === "zh" ? "关闭" : "Off", exact: true }).click();
       await page.locator("#lanList .lan-address-row").waitFor({ state: "detached" });

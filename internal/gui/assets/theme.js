@@ -4,9 +4,10 @@
 // and default size first, then change as the page loaded.
 (function () {
   var asked = new URLSearchParams(location.search).get("theme");
-  var saved = window.bootPrefs && window.bootPrefs.theme;
+  var prefs = window.bootPrefs;
+  var saved = prefs && prefs.theme;
   var theme = asked || (saved && saved !== "system" ? saved : "");
   if (theme) document.documentElement.dataset.theme = theme;
-  var prefs = window.bootPrefs;
+  if (prefs && prefs.colorblind) document.documentElement.dataset.colorblind = "1";
   if (prefs) document.documentElement.style.setProperty("--zoom", prefs.web ? 1 : (prefs.textSize || 100) / 100);
 })();

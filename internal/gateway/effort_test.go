@@ -24,6 +24,7 @@ func TestFitEffort(t *testing.T) {
 		{"medium", glm, "high"}, // a tie goes up
 		{"low", glm, "low"},
 		{"xhigh", glm, "max"},
+		{"xhigh", []string{"high", "max"}, "max"}, // DeepSeek V4: Ultracode's xhigh
 		{"max", []string{"low", "medium", "high"}, "high"},
 		{"low", []string{"none", "minimal", "medium"}, "medium"},
 		{"medium", nil, "medium"}, // levels not known: as asked
@@ -106,6 +107,73 @@ func TestSwitchModelSentNoMoreThanHigh(t *testing.T) {
 		json.Unmarshal(f.got, &got)
 		if got["reasoning_effort"] != c.sent {
 			t.Errorf("%s at %s: sent %s", c.model, c.effort, f.got)
+		}
+	}
+}
+
+func TestToggleOffOnlyReachesVerifiedProvider(t *testing.T) {
+	noRests()
+	t.Cleanup(noRests)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	body, err := os.ReadFile(filepath.Join("..", "catalog", "testdata", "models.dev-2026-10-09.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(catalog.CachePath(), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+
+	reply := sse(
+		`data: {"id":"c1","model":"deepseek-v4-pro","choices":[{"delta":{"role":"assistant","content":"ok"}}]}`,
+		`data: {"id":"c1","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+	)
+	deepseek := &fake{t: t, reply: reply}
+	deepseekUp := httptest.NewServer(deepseek)
+	t.Cleanup(deepseekUp.Close)
+	relay := &fake{t: t, reply: reply}
+	relayUp := httptest.NewServer(relay)
+	t.Cleanup(relayUp.Close)
+	for _, p := range []provider.Provider{
+		{ID: "deepseek", Name: "DeepSeek", Key: "kd", Chat: deepseekUp.URL + "/v1", Catalog: "deepseek", Models: []string{"deepseek-v4-pro"}},
+		{ID: "relay", Name: "Relay", Key: "kr", Chat: relayUp.URL + "/v1", Models: []string{"deepseek-v4-pro"}},
+	} {
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := catalog.SaveLive("relay", relayUp.URL+"/v1", []catalog.Model{{ID: "deepseek-v4-pro"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		model string
+		up    *fake
+		want  string
+	}{
+		{"deepseek/deepseek-v4-pro", deepseek, "none"},
+		{"relay/deepseek-v4-pro", relay, "low"},
+	} {
+		request := `{"model":"` + tc.model + `","stream":true,"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}`
+		code, response := post(t, "/v1/chat/completions", request)
+		if code != 200 {
+			t.Fatalf("%s: status %d: %s", tc.model, code, response)
+		}
+		var sent map[string]any
+		if err := json.Unmarshal(tc.up.got, &sent); err != nil {
+			t.Fatalf("%s: invalid upstream request %s: %v", tc.model, tc.up.got, err)
+		}
+		if sent["reasoning_effort"] != tc.want {
+			t.Errorf("%s sent reasoning_effort %v, want %q", tc.model, sent["reasoning_effort"], tc.want)
 		}
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/routes"
 )
 
 // keyed is a vendor that says which key each request came with, and
@@ -45,6 +46,9 @@ func fresh(t *testing.T) {
 	sticks.Lock()
 	sticks.m = map[string]stick{}
 	sticks.Unlock()
+	refusedSeals.Lock()
+	refusedSeals.m = map[string]sealsRefused{}
+	refusedSeals.Unlock()
 	turnRules.Lock()
 	turnRules.m = map[string]turnRule{}
 	turnRules.Unlock()
@@ -60,6 +64,7 @@ func fresh(t *testing.T) {
 	remoteRefreshes.Lock()
 	remoteRefreshes.at = map[string]time.Time{}
 	remoteRefreshes.Unlock()
+	resetAuthThrottle()
 	forgetRouting()
 }
 
@@ -69,11 +74,9 @@ func fresh(t *testing.T) {
 // rather than a turn on, or with a failure already counted.
 func forgetRouting() {
 	routed.Lock()
-	routed.turn, routed.used, routed.failures = map[string]int{}, map[string]tokenUse{}, map[string]int{}
+	routed.used, routed.failures = map[string]tokenUse{}, map[string]int{}
 	routed.Unlock()
-	wrr.Lock()
-	wrr.m = map[string]*wrrRound{}
-	wrr.Unlock()
+	routes.Forget()
 }
 
 // setHome makes dir the home, where Windows (USERPROFILE) finds it too.
@@ -320,9 +323,7 @@ func TestAffinity(t *testing.T) {
 		serveOn(t, "aff", "k1", []string{"m"}, v, "k2")
 		provider.SetRouting("aff", c.routing)
 		provider.SetAffinity("aff", c.affinity)
-		routed.Lock()
-		delete(routed.turn, "aff")
-		routed.Unlock()
+		routes.Forget("aff")
 		s := New()
 		postAs(t, s, "s1", first)
 		postAs(t, s, "s1", c.body)
@@ -466,9 +467,7 @@ func TestRotateSpreadsSessions(t *testing.T) {
 		if err := provider.SaveGroup(provider.Group{Name: "Pair", Members: []string{"ga/m1", "gb/m2"}, Routing: provider.Rotate, Affinity: provider.AffinitySession}); err != nil {
 			t.Fatal(err)
 		}
-		routed.Lock()
-		delete(routed.turn, provider.GroupPrefix+"pair")
-		routed.Unlock()
+		routes.Forget(provider.GroupPrefix + "pair")
 		return a, b, New()
 	}
 	// which of the two the request went to

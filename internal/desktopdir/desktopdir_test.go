@@ -29,11 +29,14 @@ func ran(tb testing.TB, dir string, t time.Time) {
 // Discord, Windows 10 LTSC 21H2) keeps its data in the package's
 // LocalCache, nothing in %APPDATA%\Claude: those are its folders, whatever
 // the package's publisher id.
+//
+// The Store's package is the AnthropicPBC.Claude family
+// (AnthropicPBC.Claude_fnn82j28hfe8t in Desktop 2.31226's own list).
 func TestFindMSIX(t *testing.T) {
-	for _, pub := range []string{"pzs8sxrjxfjjc", "q1w2e3r4t5y6z"} {
+	for _, pub := range []string{"Claude_pzs8sxrjxfjjc", "Claude_q1w2e3r4t5y6z", "AnthropicPBC.Claude_fnn82j28hfe8t"} {
 		home := t.TempDir()
 		local, roaming := filepath.Join(home, "AppData", "Local"), filepath.Join(home, "AppData", "Roaming")
-		pkg := filepath.Join(local, "Packages", "Claude_"+pub, "LocalCache")
+		pkg := filepath.Join(local, "Packages", pub, "LocalCache")
 		ran(t, filepath.Join(pkg, "Roaming", "Claude"), time.Now())
 		os.MkdirAll(filepath.Join(pkg, "Local", "Claude", "logs"), 0o755)
 		os.MkdirAll(filepath.Join(local, "Packages", "Microsoft.WindowsStore_8wekyb3d8bbwe"), 0o755)

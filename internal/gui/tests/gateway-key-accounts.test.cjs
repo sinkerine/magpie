@@ -20,8 +20,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.route("**/*", fixture(lang, "light", events, { lan: true, keyHolds: { server: { accounts: ["relay/me@example.com"] }, laptop: { models: ["relay/gone"], accounts: ["relay/nobody@example.com"] } } }));
       const zh = lang === "zh";
       const w = zh
-        ? { label: "此密钥可用的模型", all: "全部模型", gone: "当前未提供", off: "当前未登录" }
-        : { label: "Models this key may use", all: "All models", gone: "Not served now", off: "Not signed in now" };
+        ? { label: "此密钥可用的模型", all: "全部模型", gone: "当前未提供", off: "当前未登录", used: "会被使用：OpenAI 没有勾选任何账号", hint: "没勾选任何账号的供应商" }
+        : { label: "Models this key may use", all: "All models", gone: "Not served now", off: "Not signed in now", used: "Used: no OpenAI account is picked", hint: "A provider with no account picked is used on every account" };
       await page.goto("http://magpie.test/?view=gateway");
       await page.locator("#gatewayKeys .acc[data-key]").last().waitFor();
       const row = (id) => page.locator(`#gatewayKeys .acc[data-key="${id}"]`);
@@ -45,6 +45,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // OpenAI's, the key behind GPT-5 — an account by who is signed in
       // with their plan in the note, a key by its fingerprint
       const names = (await menu.locator(".pm-item").allTextContents()).map((s) => s.trim());
+      assert(!(await badge("work").getAttribute("title")).includes(w.hint), "a key held to no account names the rule");
+      assert.equal((await menu.locator(".pm-item", { hasText: "k-1a2b3c" }).locator(".pm-note").textContent()).trim(), "OpenAI");
       const at = (s) => names.findIndex((n) => n.includes(s));
       assert(at("me@example.com") > at("Model mini"), names.join(" | "));
       assert(at("me@example.com") < at("GPT-5"), names.join(" | "));
@@ -74,6 +76,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await badge("server").click();
       await menu.waitFor();
       assert.deepEqual((await menu.locator(".pm-item.on").allTextContents()).map((s) => s.trim()), ["me@example.comRelay · Pro"]);
+      // #2077: the list holds the key to the accounts of the providers it
+      // names only, so OpenAI's key, none of OpenAI's picked, is used, and
+      // says so; Relay's unpicked account is not, and says its provider
+      const noteOf = async (s) => (await menu.locator(".pm-item", { hasText: s }).locator(".pm-note").textContent()).trim();
+      assert.equal(await noteOf("k-1a2b3c"), w.used);
+      assert.equal(await noteOf("spare@example.com"), "Relay");
+      assert(String(await badge("server").getAttribute("title")).includes(w.hint), await badge("server").getAttribute("title"));
       await menu.locator(".pm-item", { hasText: "me@example.com" }).click();
       await menu.locator(".pm-item", { hasText: "k-1a2b3c" }).click();
       await page.keyboard.press("Escape");

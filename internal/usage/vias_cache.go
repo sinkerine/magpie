@@ -10,21 +10,20 @@ var viasCache struct {
 	sync.Mutex
 	version uint64
 	since   time.Time
+	clients string // the clients counted as agents (#1958)
 	value   map[string][]Via
 }
 
 func cachedVias(since time.Time) map[string][]Via {
-	snapshot := logSnapshotFor(true)
+	snapshot := readLogSnapshot()
+	clients := clientAgentsKey()
 	viasCache.Lock()
 	defer viasCache.Unlock()
 	value := viasCache.value
-	if value == nil || viasCache.version != snapshot.version || !viasCache.since.Equal(since) {
-		if snapshot.uncached && len(snapshot.blocks) == 0 {
-			snapshot = readLogSnapshot()
-		}
+	if value == nil || viasCache.version != snapshot.version || !viasCache.since.Equal(since) || viasCache.clients != clients {
 		value = buildVias(snapshot, since)
 		if snapshot.info != nil && snapshot.off == snapshot.info.Size() {
-			viasCache.version, viasCache.since, viasCache.value = snapshot.version, since, value
+			viasCache.version, viasCache.since, viasCache.value, viasCache.clients = snapshot.version, since, value, clients
 		}
 	}
 	out := make(map[string][]Via, len(value))

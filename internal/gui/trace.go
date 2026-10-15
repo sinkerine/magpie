@@ -161,11 +161,17 @@ func mainURL(view, query string) string { return "/?view=" + view + query }
 // restart to update) as ShowMain takes it: a name, never parameters.
 func argView(s string) string { return url.QueryEscape(s) }
 
-// quotaView opens the Usage overview at a provider/account card.
-// Invalid provider names fall back to the overview without a target.
+// quotaView opens the Usage overview at a provider/account card, or at
+// the period of one of magpie's own totals (trayTotal). Invalid provider
+// names fall back to the overview without a target.
 func quotaView(id string) string {
-	provider, _, hasAccount := strings.Cut(id, "|")
 	view := "usage&tab=usage"
+	if p, ok := trayTotalPeriod(id); ok {
+		// magpie's own total: the Requests tab at its period, which sums
+		// what the total does (trayTotalSum)
+		return "usage&tab=requests&period=" + string(p)
+	}
+	provider, _, hasAccount := strings.Cut(id, "|")
 	if mainName.MatchString(provider) {
 		view += "&provider=" + url.QueryEscape(provider)
 		if hasAccount {

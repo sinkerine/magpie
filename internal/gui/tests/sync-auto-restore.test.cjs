@@ -14,6 +14,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -90,7 +91,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       await page.goto("http://magpie.test/");
       await page.locator("#prefs").click();
-      await page.locator("#setTab-sync").click();
+      await openPart(page, "sync");
       const list = page.locator("#syncList");
       const rowNamed = (name) => list.locator(".row.pref").filter({ has: page.locator(".name", { hasText: name }) });
       const auto = rowNamed(w.auto);

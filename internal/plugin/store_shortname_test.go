@@ -32,6 +32,7 @@ func TestSetOptionsShortName(t *testing.T) {
 		"@magpie-community/opencode-cursor-auth":      "cursor",
 		"opencode-foo":                                "foo",
 		"/Users/me/plugins/think-tags":                "think-tags",
+		`C:\Users\me\plugins\middleware-zz-tags`:      "zz-tags",
 	} {
 		if got := ShortName(in); got != out {
 			t.Errorf("ShortName(%q) = %q, want %q", in, got, out)

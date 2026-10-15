@@ -12,6 +12,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const EN = "the file magpie/magpie.magpie-backup on the WebDAV server is empty (0 bytes): a write to it didn't finish.";
@@ -77,7 +78,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           page.setDefaultTimeout(5000);
           await page.goto("http://magpie.test/");
           await page.locator("#prefs").click();
-          await page.locator("#setTab-sync").click();
+          await openPart(page, "sync");
           const first = page.locator("#syncList .row.pref").first();
           await first.waitFor({ state: "visible" });
           const said = await first.locator(".who > .sub").first().textContent();

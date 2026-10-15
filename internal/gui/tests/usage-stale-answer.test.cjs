@@ -17,9 +17,12 @@ const vm = require("node:vm");
 const { test } = require("node:test");
 
 // Another revision of app.js can be selected with MAGPIE_APP_JS to check
-// the same behavior cases against the implementation before the fix.
+// the same behavior cases against the implementation before the fix. The
+// Usage page's code is the Usage plugin's page.js, beside app.js's
+// allowances (quotasOpened).
 const APP = process.env.MAGPIE_APP_JS || path.resolve(__dirname, "../assets/app.js");
-const source = fs.readFileSync(APP, "utf8").replace(/\r\n/g, "\n");
+const PAGE = path.resolve(__dirname, "../assets/plugins/usage/page.js");
+const source = [APP, PAGE].filter((f) => fs.existsSync(f)).map((f) => fs.readFileSync(f, "utf8")).join("\n").replace(/\r\n/g, "\n");
 
 // lift a top-level function out of app.js whole: from its `function` line to
 // the `}` at the left margin that closes it
@@ -31,6 +34,12 @@ function lift(header) {
   return source.slice(start, end + 2);
 }
 const loadUsageSource = lift("async function loadUsage(asked) {");
+// an asked read goes through quotasOpened (#1588), which asks only once in
+// QUOTAS_OPEN_GAP; both are lifted with loadUsage, so a page() without them
+// can't stop loadUsage before it reads (#1632)
+const gap = source.match(/^const QUOTAS_OPEN_GAP = [^;\n]+;$/m);
+assert.ok(gap, "app.js no longer has const QUOTAS_OPEN_GAP");
+const quotasOpenedSource = gap[0] + "\nlet quotasAskedAt = -Infinity;\n" + lift("function quotasOpened() {");
 
 // values cross the vm's realm boundary (its Array and Object are not the
 // test's), so what is handed to assert is copied into this one first
@@ -45,6 +54,7 @@ function page() {
     `
 let view = "usage", usageTab = "usage", period = "today", usage = null;
 let usageRead = 0;
+const performance = { now: () => 0 };
 const reads = [];        // api() paths, in the order they were asked for
 const drawn = [];        // renderUsage(): { period, usage }
 const quotaCalls = [];   // loadQuotas() arguments
@@ -56,10 +66,11 @@ function renderUsage() { drawn.push({ period, usage: usage && usage.tag }); }
 function renderUsageTab() {}
 function renderUsageEvery() {}
 function renderUsageLoading() {}
-function loadQuotas(asked) { quotaCalls.push(asked === true); }
+function loadQuotas(asked) { quotaCalls.push(asked === true); if (asked) quotasAskedAt = performance.now(); }
 function loadSessions() { return Promise.resolve("sessions"); }
 function loadLedger() { return Promise.resolve("requests"); }
 `,
+    quotasOpenedSource,
     loadUsageSource,
     `
 globalThis.page = {
@@ -191,10 +202,11 @@ function renderUsage() { loading = false; drawn.push({ period, usage: usage && u
 function renderUsageTab() {}
 function renderUsageEvery() {}
 function renderUsageLoading() { loading = true; }
-function loadQuotas(asked) { quotaCalls.push(asked === true); return Promise.resolve(); }
+function loadQuotas(asked) { quotaCalls.push(asked === true); if (asked) quotasAskedAt = performance.now(); return Promise.resolve(); }
 function loadSessions() { return Promise.resolve("sessions"); }
 function loadLedger() { return Promise.resolve("requests"); }
 `,
+    quotasOpenedSource,
     loadUsageSource,
     refreshSource,
     `

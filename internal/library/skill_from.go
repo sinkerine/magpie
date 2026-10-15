@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -29,7 +30,7 @@ func (tr *tracer) repoOf(s *Skill) string {
 		return o.Repo
 	}
 	if s.From != "" {
-		return s.From
+		return fromKey(s.From)
 	}
 	dir := skillDir(s.Name)
 	if !linked(dir) {
@@ -74,9 +75,10 @@ func readSkillLock(path string) map[string]string {
 	}
 	var f struct {
 		Skills map[string]struct {
-			Source     string `json:"source"`
-			SourceType string `json:"sourceType"`
-			SourceURL  string `json:"sourceUrl"`
+			Source        string `json:"source"`
+			SourceType    string `json:"sourceType"`
+			SourceURL     string `json:"sourceUrl"`
+			SourceBaseURL string `json:"sourceBaseUrl"`
 		} `json:"skills"`
 	}
 	if json.Unmarshal(b, &f) != nil {
@@ -87,6 +89,8 @@ func readSkillLock(path string) map[string]string {
 		r := ""
 		if e.SourceType == "github" && repoRe.MatchString(e.Source) {
 			r = strings.TrimSuffix(e.Source, ".git")
+		} else if e.SourceType == "well-known" {
+			r = wellKnownBase(e.SourceBaseURL, e.SourceURL)
 		} else if e.SourceURL != "" {
 			r = remoteRepo(e.SourceURL)
 		}
@@ -95,6 +99,60 @@ func readSkillLock(path string) map[string]string {
 		}
 	}
 	return out
+}
+
+// wellKnownBase is where a kit of skills a site serves at its
+// /.well-known/agent-skills/ came from (#1862, WardLu): the lock's
+// sourceBaseUrl, as host/path, so Feishu's lark-base, lark-doc and
+// lark-sheets are one group and Fish Audio's two another, while two kits
+// under one host with different base URLs stay apart. Each skill's
+// sourceUrl is its own file there, so it isn't the group. A lock written
+// before sourceBaseUrl has the base in the sourceUrl, before its
+// /.well-known/; one with neither is grouped by its sourceUrl as before.
+func wellKnownBase(base, src string) string {
+	if b := siteOf(base); b != "" {
+		return b
+	}
+	if i := strings.Index(src, "/.well-known/"); i > 0 {
+		if b := siteOf(src[:i]); b != "" {
+			return b
+		}
+	}
+	return remoteRepo(src)
+}
+
+// fromKey is the group a skill's From names. A skill brought in from
+// ~/.agents/skills keeps the lock's key as it was then (ImportSkills), and
+// before well-known kits were grouped by their base that was each skill's
+// own sourceUrl, "docs.fish.audio/.well-known/agent-skills/fish-audio-api/
+// skill.md": read as the base before /.well-known/, so a kit brought in
+// then is one group as the lock now says (#1862, WardLu on v0.1.1223).
+func fromKey(from string) string {
+	if before, _, ok := strings.Cut(from, "/.well-known/"); ok && before != "" {
+		return before
+	}
+	return from
+}
+
+// siteOf reads a web address as host/path, or the host alone, with no
+// user, query or trailing slash: "" when it isn't an http(s) address.
+func siteOf(s string) string {
+	u, err := url.Parse(strings.TrimSpace(s))
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
+		return ""
+	}
+	host := strings.TrimPrefix(strings.ToLower(u.Hostname()), "www.")
+	p := strings.Trim(u.Path, "/")
+	if before, _, ok := strings.Cut("/"+p+"/", "/.well-known/"); ok {
+		p = strings.Trim(before, "/")
+	}
+	if strings.Contains(p, "..") {
+		return ""
+	}
+	if p == "" {
+		return host
+	}
+	return host + "/" + p
 }
 
 // gitRepoOf is the repository of the git checkout a skill's folder is, or
@@ -199,34 +257,97 @@ func remoteRepo(s string) string {
 }
 
 // noteFrom writes down, for the skills the library has already that a
-// repository being installed from has too, that they came from there,
-// when the library's SKILL.md is that repository's very own: installing
-// from it again groups them with the rest of it. root is where the
-// repository was fetched to.
-func noteFrom(src Source, root string, cands []Candidate) {
+// repository being installed from has too, that they came from there:
+// one whose SKILL.md is that repository's very own, and one traced to
+// nowhere by the same name when the library has others from there. A
+// pack added a while ago is mostly older copies (White Immortal on
+// Discord: 20 of mattpocock/skills' 38 grouped, the rest edited there
+// since), and a name the repository has beside others the user took
+// from it is that skill. root is where the repository was fetched to. It
+// gives how many it noted.
+func noteFrom(src Source, root string, cands []Candidate) int {
 	if src.Kind != "github" {
-		return
+		return 0
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	l, err := load()
 	if err != nil {
-		return
+		return 0
 	}
-	changed := false
+	tr := &tracer{}
+	have := slices.ContainsFunc(l.Skills, func(s *Skill) bool { return strings.EqualFold(tr.repoOf(s), src.Repo) })
+	noted := 0
+	var same []*Skill
 	for _, c := range cands {
 		s := l.skill(c.Name)
-		if s == nil || (s.Source != nil && s.Source.Kind == "github") || s.From == src.Repo {
+		if s == nil || (s.Source != nil && s.Source.Kind == "github") || strings.EqualFold(s.From, src.Repo) {
 			continue
 		}
 		mine, err1 := os.ReadFile(filepath.Join(skillDir(s.Name), "SKILL.md"))
 		theirs, err2 := os.ReadFile(filepath.Join(root, filepath.FromSlash(c.Path), "SKILL.md"))
-		if err1 != nil || err2 != nil || !bytes.Equal(bytes.TrimSpace(mine), bytes.TrimSpace(theirs)) {
+		if err1 != nil || err2 != nil {
 			continue
 		}
-		s.From, changed = src.Repo, true
+		if bytes.Equal(bytes.TrimSpace(mine), bytes.TrimSpace(theirs)) {
+			s.From, have = src.Repo, true
+			noted++
+		} else if tr.repoOf(s) == "" {
+			same = append(same, s)
+		}
 	}
-	if changed {
+	if have {
+		for _, s := range same {
+			s.From = src.Repo
+			noted++
+		}
+	}
+	if noted > 0 {
 		l.save()
 	}
+	return noted
+}
+
+// RegroupSkills traces the library's skills again (the Library page's
+// Group again): each GitHub repository a skill is traced to is fetched,
+// and the skills it has that aren't grouped with it yet are noted as from
+// there, as installing from it again would. It gives how many were
+// grouped; an error only when no repository could be fetched.
+func RegroupSkills() (int, error) {
+	l, err := load()
+	if err != nil {
+		return 0, err
+	}
+	tr := &tracer{}
+	var repos []string
+	seen := map[string]bool{}
+	for _, s := range l.Skills {
+		r := tr.repoOf(s)
+		// a site's kit (docs.example.com/kit) reads like owner/repo, but
+		// a GitHub owner has no dot
+		if !repoRe.MatchString(r) || strings.Contains(strings.Split(r, "/")[0], ".") || seen[strings.ToLower(r)] {
+			continue
+		}
+		seen[strings.ToLower(r)] = true
+		repos = append(repos, r)
+	}
+	noted, fetched := 0, 0
+	var first error
+	for _, r := range repos {
+		src := Source{Kind: "github", Repo: r}
+		root, err := fetch(src)
+		if err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		fetched++
+		noted += noteFrom(src, root, candidates(root, ""))
+		os.RemoveAll(root)
+	}
+	if fetched == 0 && first != nil {
+		return 0, first
+	}
+	return noted, nil
 }

@@ -47,7 +47,8 @@ function server(lang, calls, count) {
   const profiles = [...Array.from({ length: count }, (_, i) => filler(i)), work, filler(99)];
   return async (route) => {
     const req = route.request(), url = new URL(req.url());
-    const state = () => ({ agents: [agent("codex", "Codex"), agent("claude", "Claude Code")], profiles, settings: { lang, theme: "light" } });
+    // Get started put away: the profiles strip is what is read, where it sits
+    const state = () => ({ agents: [agent("codex", "Codex"), agent("claude", "Claude Code")], profiles, settings: { lang, theme: "light", guideHidden: true } });
     if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:"${lang}",theme:"light",web:true};` });
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (url.pathname === "/api/state") return route.fulfill({ json: state() });
@@ -69,7 +70,7 @@ function server(lang, calls, count) {
 
 const words = {
   en: { model: "model", effort: "effort", high: "high", def: "agent default", follows: "follows the main model (magpie/a/main)", subagents: "subagents", servers: "MCP servers", skills: "Skills", instructions: "Instructions", on: "on", apply: "Apply", list: "Model list", all: "every model shown", hidden8: "8 hidden", picked3: "only the 3 picked" },
-  zh: { model: "模型", effort: "推理强度", high: "高", def: "Agent 默认值", follows: "跟随主模型（magpie/a/main）", subagents: "子 agent", servers: "MCP 服务器", skills: "技能", instructions: "指令", on: "开启", apply: "应用", list: "模型列表", all: "全部显示", hidden8: "已隐藏 8 个", picked3: "仅显示所选的 3 个" },
+  zh: { model: "模型", effort: "推理强度", high: "高", def: "Agent 默认值", follows: "跟随主模型（magpie/a/main）", subagents: "子代理", servers: "MCP 服务器", skills: "技能", instructions: "指令", on: "开启", apply: "应用", list: "模型列表", all: "全部显示", hidden8: "已隐藏 8 个", picked3: "仅显示所选的 3 个" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {

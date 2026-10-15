@@ -1,12 +1,18 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/yetone/magpie/internal/agentenv"
+	"github.com/yetone/magpie/internal/gwmw"
+	"github.com/yetone/magpie/internal/masking"
+	"github.com/yetone/magpie/internal/middleware"
+	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/routes"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
@@ -15,6 +21,9 @@ import (
 const standInsEnv = "MAGPIE_GATEWAY_TEST_STAND_INS"
 
 func TestMain(m *testing.M) {
+	serveRotation()
+	groupsServed = provider.ServeGroups()
+	serveMiddleware()
 	code, err := isolatedTests(m)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -44,11 +53,30 @@ func isolatedTests(m *testing.M) (int, error) {
 			return 1, err
 		}
 	}
+	// The package isolates itself rather than through testenv.Run, so it
+	// says so as testenv does: what reads the marker (a CLI identity kept
+	// on disk, provider.keepsIdentities; the machine's own folders,
+	// proc.SystemDirs) then acts as in any isolated test binary. Without it
+	// an ask still going when its test ended wrote cli-identity.json into
+	// the next test's folder as that was removed (#1524, again after
+	// 9c377231 dropped this package's own switch).
+	if err := os.Setenv(testenv.Marker, home); err != nil {
+		return 1, err
+	}
 	for _, name := range agentenv.Vars {
 		if err := os.Unsetenv(name); err != nil {
 			return 1, err
 		}
 	}
+	// The machine's proxy variables too: net/http freezes them into its
+	// first routed request, so a test that sets its own afterwards (search's
+	// Auto, by ALL_PROXY alone) reads the machine's instead, and its
+	// searcher goes out through a proxy that cannot reach the test's
+	// servers.
+	testenv.ClearProxy()
+	// The fakes of ChatGPT's backend read turns plain; codex_zstd_test's
+	// send them zstd, as the real one is sent.
+	provider.CodexZstdForTests(false)
 	// Finding an inert CLI also prevents discovery from falling back to
 	// one installed at an absolute system path. Tests can prepend their
 	// own fakes, as fakeClaude does, and still use ordinary shell tools.
@@ -80,5 +108,73 @@ func isolatedTests(m *testing.M) (int, error) {
 	// key would, in the background (a plan key's windows, #1016), and a
 	// plugin host's first start fetched models.dev
 	testenv.Offline()
+	// and no rest waits on a reading in the background: it would ask a
+	// test's fake upstream after the test ended (#2036, CodeAlex52)
+	awaitAllowance = func(context.Context, string, string) bool { return false }
 	return m.Run(), nil
+}
+
+// The package's tests run as an isolated test binary: nothing the marker
+// turns off (a CLI identity kept on disk, #1524) runs behind a test's back.
+func TestRunsAsAnIsolatedTestBinary(t *testing.T) {
+	if os.Getenv(testenv.Marker) == "" {
+		t.Fatalf("TestMain left %s unset", testenv.Marker)
+	}
+}
+
+// rotation is what serveRotation registered: the routings plugins/rotation
+// serves, which the gateway's tests route by as a user with it on does.
+var rotation []func()
+
+// masked and chained are the gateway's middleware point as
+// plugins/redact and plugins/middleware serve it, on in every test but
+// those of it off (withoutMasker, withoutMiddleware).
+var masked, chained func()
+
+func serveMiddleware() {
+	masked = gwmw.Mask(masking.Masker{})
+	chained = gwmw.Use(middleware.Chain{})
+}
+
+// withoutMasker takes the masker away for t, as plugins/redact off does.
+func withoutMasker(t *testing.T) {
+	masked()
+	t.Cleanup(func() { masked = gwmw.Mask(masking.Masker{}) })
+}
+
+// withoutMiddleware takes the JS middleware chain away for t, as
+// plugins/middleware off does.
+func withoutMiddleware(t *testing.T) {
+	chained()
+	t.Cleanup(func() { chained = gwmw.Use(middleware.Chain{}) })
+}
+
+func serveRotation() {
+	for name, s := range routes.Builtin {
+		rotation = append(rotation, routes.Register(name, s))
+	}
+}
+
+// withoutRotation takes them away for t, as plugins/rotation off does.
+func withoutRotation(t *testing.T) {
+	for _, remove := range rotation {
+		remove()
+	}
+	rotation = nil
+	t.Cleanup(serveRotation)
+}
+
+// groupsServed is plugins/groups on, as for a user with a group of their
+// own: the gateway's tests serve their groups.
+var groupsServed func()
+
+// withoutGroups is plugins/groups off for t, in a process serving the
+// gateway (provider.GateGroups): the user's own groups aren't served.
+func withoutGroups(t *testing.T) {
+	groupsServed()
+	stop := provider.GateGroups(nil)
+	t.Cleanup(func() {
+		stop()
+		groupsServed = provider.ServeGroups()
+	})
 }

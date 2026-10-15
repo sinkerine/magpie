@@ -70,9 +70,15 @@ func sse(lines ...string) string {
 }
 
 // setup points magpie's provider file at a temp dir and adds one provider
-// speaking only the given protocol, backed by the fake.
+// speaking only the given protocol, backed by the fake. Rests are kept
+// for the process, by provider id, and every test's provider is "fake":
+// one a test rested (out of its allowance, held without asking since
+// #1772) is lifted before and after it, or a later test's request would be
+// answered from it, its fake never asked (#1840).
 func setup(t *testing.T, proto provider.Protocol, f *fake) *httptest.Server {
 	t.Helper()
+	noRests()
+	t.Cleanup(noRests)
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	up := httptest.NewServer(f)
@@ -90,6 +96,14 @@ func setup(t *testing.T, proto provider.Protocol, f *fake) *httptest.Server {
 		t.Fatal(err)
 	}
 	return up
+}
+
+// noRests lifts every rest the package's tests have recorded.
+func noRests() {
+	restingUntil.Lock()
+	restingUntil.m = map[string]time.Time{}
+	restingUntil.note = map[string]Rest{}
+	restingUntil.Unlock()
 }
 
 func post(t *testing.T, path, body string) (int, string) {
@@ -655,6 +669,65 @@ func TestAnthropicPassthroughAlwaysThinksInChinese(t *testing.T) {
 	}
 }
 
+// #1141: MiniMax and Volcengine Ark refuse thinking turned off in their
+// own words, the reporters' literal messages. The request magpie turned it
+// off for (Claude Desktop's model_validation probe, its health probe and
+// titles send none) is asked again with thinking left to the model, once;
+// thinking the caller asked for goes as it came, and another 400 on the
+// same request, or a near wording, is the caller's to see.
+func TestAnthropicPassthroughMiniMaxArkThinkingOffRefused(t *testing.T) {
+	for _, c := range []struct{ vendor, refusal string }{
+		{"MiniMax", `{"type":"error","error":{"type":"invalid_request_error","message":"invalid params, model \"MiniMax-M3.1-Flash-Preview\" requires adaptive thinking; thinking.type=\"disabled\" (including reasoning.effort=none) is not allowed (2013)"}}`},
+		{"Ark", `{"type":"error","error":{"type":"invalid_request_error","message":"thinking.type ` + "`disabled`" + ` is not supported by this model Request id: 021760000000000000000000000000000000000000000000000000"}}`},
+	} {
+		t.Run(c.vendor, func(t *testing.T) {
+			f := &fake{t: t, ctype: "application/json", reply: `{"id":"msg","type":"message","content":[]}`}
+			f.refuse = func(b []byte) (int, string) {
+				if bytes.Contains(b, []byte(`"disabled"`)) {
+					return 400, c.refusal
+				}
+				return 0, ""
+			}
+			setup(t, provider.Anthropic, f)
+			code, body := post(t, "/v1/messages", `{"model":"m1","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"Hi","cache_control":{"type":"ephemeral"}}]}]}`)
+			if code != 200 || f.calls != 2 || bytes.Contains(f.got, []byte("thinking")) || !bytes.Contains(f.got, []byte(`"Hi"`)) {
+				t.Fatalf("omitted: %d %s after %d calls, last sent %s", code, body, f.calls, f.got)
+			}
+			f.calls = 0
+			if code, body := post(t, "/v1/messages", `{"model":"m1","max_tokens":1,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"."}]}`); code != 200 || f.calls != 1 || !bytes.Contains(f.got, []byte(`"thinking":{"type":"adaptive"}`)) {
+				t.Errorf("adaptive: %d %s after %d calls, sent %s", code, body, f.calls, f.got)
+			}
+			for _, other := range []string{
+				`{"type":"error","error":{"type":"invalid_request_error","message":"invalid params, max_tokens must be less than 8192 (2013)"}}`,
+				`{"type":"error","error":{"type":"invalid_request_error","message":"top_k is not supported by this model Request id: 0217"}}`,
+			} {
+				f.calls = 0
+				f.refuse = func([]byte) (int, string) { return 400, other }
+				if code, _ := post(t, "/v1/messages", `{"model":"m1","max_tokens":1,"messages":[{"role":"user","content":"."}]}`); code != 400 || f.calls != 1 {
+					t.Errorf("%s: %d after %d calls", other, code, f.calls)
+				}
+			}
+		})
+	}
+}
+
+// The same refusal, escaped as \uXXXX the way a relay whose encoder
+// escapes what isn't ASCII sends it (#1669): asked again all the same.
+func TestAnthropicPassthroughAlwaysThinksInEscapedChinese(t *testing.T) {
+	f := &fake{t: t, ctype: "application/json", reply: `{"id":"msg","type":"message","content":[]}`}
+	f.refuse = func(b []byte) (int, string) {
+		if bytes.Contains(b, []byte(`"disabled"`)) {
+			return 400, `{"type":"error","error":{"type":"invalid_request_error","message":"\u8be5\u6a21\u578b\u59cb\u7ec8\u652f\u6301\u601d\u8003\uff0c\u4e0d\u53ef\u5173\u95ed"}}`
+		}
+		return 0, ""
+	}
+	setup(t, provider.Anthropic, f)
+	code, body := post(t, "/v1/messages", `{"model":"m1","max_tokens":5,"messages":[{"role":"user","content":"title?"}],"thinking":{"type":"disabled"}}`)
+	if code != 200 || f.calls != 2 || bytes.Contains(f.got, []byte("thinking")) || !bytes.Contains(f.got, []byte(`"title?"`)) {
+		t.Fatalf("%d %s after %d calls, last sent %s", code, body, f.calls, f.got)
+	}
+}
+
 func TestOpenRouterMandatoryReasoningRetries(t *testing.T) {
 	const refusal = `{"error":{"message":"OpenRouter: Reasoning is mandatory for this endpoint and cannot be disabled.","type":"invalid_request_error"},"type":"error"}`
 	for _, tc := range []struct {
@@ -706,7 +779,8 @@ func TestOpenRouterMandatoryReasoningRetries(t *testing.T) {
 }
 
 // Qoder asks "none" for its permission checks, which Command Code turns
-// away with the levels it takes: asked again at the lowest, once
+// away with the levels it takes: asked again at the lowest, and at the
+// lowest from then on
 func TestPassthroughEffortNoneRefused(t *testing.T) {
 	f := &fake{t: t, ctype: "application/json", reply: `{"id":"c1","choices":[]}`}
 	f.refuse = func(b []byte) (int, string) {
@@ -716,15 +790,77 @@ func TestPassthroughEffortNoneRefused(t *testing.T) {
 		return 0, ""
 	}
 	setup(t, provider.Chat, f)
-	code, body := post(t, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"ok?"}],"reasoning_effort":"none"}`)
-	if code != 200 || f.calls != 2 || !bytes.Contains(f.got, []byte(`"reasoning_effort":"low"`)) || !bytes.Contains(f.got, []byte(`"ok?"`)) {
-		t.Fatalf("%d %s after %d calls, last sent %s", code, body, f.calls, f.got)
+	srv := New()
+	for turn, calls := range []int{2, 1} {
+		f.calls = 0
+		code, body := postTo(t, srv, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"ok?"}],"reasoning_effort":"none"}`)
+		if code != 200 || f.calls != calls || !bytes.Contains(f.got, []byte(`"reasoning_effort":"low"`)) || !bytes.Contains(f.got, []byte(`"ok?"`)) {
+			t.Fatalf("turn %d: %d %s after %d calls, last sent %s", turn+1, code, body, f.calls, f.got)
+		}
+	}
+	// the levels named mark reasoning off as a whole: minimal, never
+	// refused itself, goes at low too
+	f.calls = 0
+	if code, body := postTo(t, srv, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"ok?"}],"reasoning_effort":"minimal"}`); code != 200 || f.calls != 1 || !bytes.Contains(f.got, []byte(`"reasoning_effort":"low"`)) {
+		t.Fatalf("minimal: %d %s after %d calls, last sent %s", code, body, f.calls, f.got)
 	}
 	// another 400 is the agent's to see
 	f.calls = 0
 	f.refuse = func([]byte) (int, string) { return 400, `{"error":{"message":"bad request"}}` }
 	if code, _ := post(t, "/v1/chat/completions", `{"model":"m1","messages":[],"reasoning_effort":"none"}`); code != 400 || f.calls != 1 {
 		t.Errorf("%d after %d calls", code, f.calls)
+	}
+}
+
+// minimal refused with none among the levels taken, as OpenAI does for
+// gpt-5.1: minimal goes at low from then on, and none still goes as sent.
+// The error is OpenAI's wording as published for gpt-5.1, reconstructed,
+// not captured.
+func TestPassthroughMinimalRefusedNoneTaken(t *testing.T) {
+	for _, c := range []struct {
+		proto      provider.Protocol
+		path, body string
+	}{
+		{provider.Chat, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"ok?"}],"reasoning_effort":%q}`},
+		{provider.Responses, "/v1/responses", `{"model":"m1","input":"ok?","reasoning":{"effort":%q}}`},
+	} {
+		f := &fake{t: t, ctype: "application/json", reply: `{"id":"c1","choices":[]}`}
+		f.refuse = func(b []byte) (int, string) {
+			if bytes.Contains(b, []byte(`"minimal"`)) {
+				return 400, `{"error":{"message":"Unsupported value: 'minimal' is not supported with the 'gpt-5.1' model. Supported values are: 'none', 'low', 'medium', and 'high'.","type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}}`
+			}
+			return 0, ""
+		}
+		setup(t, c.proto, f)
+		srv := New()
+		for i, turn := range []struct {
+			effort, sent string
+			calls        int
+		}{{"minimal", "low", 2}, {"minimal", "low", 1}, {"none", "none", 1}} {
+			f.calls = 0
+			code, body := postTo(t, srv, c.path, fmt.Sprintf(c.body, turn.effort))
+			if code != 200 || f.calls != turn.calls || bodyEffort(c.proto, f.got) != turn.sent {
+				t.Fatalf("%s turn %d at %s: %d %s after %d calls, last sent %s", c.proto, i+1, turn.effort, code, body, f.calls, f.got)
+			}
+		}
+	}
+}
+
+// the other level of reasoning off counts as taken only where an error
+// lists it quoted, in JSON's escaped quotes too, not as a word in a sentence
+func TestOtherOffNamed(t *testing.T) {
+	for _, c := range []struct {
+		effort, body string
+		want         bool
+	}{
+		{"minimal", `{"error":{"message":"Unsupported value: 'minimal' is not supported with the 'gpt-5.1' model. Supported values are: 'none', 'low', 'medium', and 'high'."}}`, true},
+		{"none", `{"error":{"message":"Invalid option: expected one of \"minimal\"|\"low\"|\"high\""}}`, true},
+		{"minimal", `{"error":{"message":"Invalid option: expected one of \"none\"|\"low\"|\"high\""}}`, true},
+		{"minimal", `{"error":{"message":"Invalid option: expected one of \"low\"|\"medium\"|\"high\". None of these is minimal."}}`, false},
+	} {
+		if got := otherOffNamed[c.effort].MatchString(c.body); got != c.want {
+			t.Errorf("otherOffNamed[%s] on %s = %v", c.effort, c.body, got)
+		}
 	}
 }
 
@@ -833,12 +969,14 @@ func TestModelsListReasoning(t *testing.T) {
 	}
 	want := map[string]string{
 		"a/sol": "low,medium,high,max", "b/sol": "medium,high", "group/auto-sol": "medium,high",
-		"a/mixed": "low,high", "b/mixed": "", "group/auto-mixed": "", "a/plain": "",
+		"a/mixed": "low,high", "b/mixed": "", "group/auto-mixed": "low,high", "a/plain": "",
 	}
 	// a group reasons when any member does: b/mixed has no levels and a
 	// list that says nothing of reasoning, but a/mixed does, so the group
-	// is told to reason — Levelless, with no levels to pick from (#756's
-	// rule for images, applied to reasoning)
+	// is told to reason (#756's rule for images, applied to reasoning),
+	// at a/mixed's levels: b/mixed is sent no reasoning ask (quiet.go), so
+	// it doesn't take them away (#2127: Codex showed no effort control for
+	// a group with none, and ran it at medium)
 	reasoning := map[string]bool{"group/auto-mixed": true}
 	for _, m := range response.Data {
 		expected, ok := want[m.ID]

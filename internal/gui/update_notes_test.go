@@ -135,3 +135,42 @@ func TestUpdateNotesAskTheFeedAgain(t *testing.T) {
 		t.Fatalf("fresh: %+v, feed asked %d", j, feedAsked)
 	}
 }
+
+// A release found before the site had its notes (#649, Sun1090: v0.1.1224's
+// dialog said it had none) takes them from the next check that has them,
+// though the version is the one already downloaded; notes held are kept.
+func TestUpdateRecheckTakesNotesLate(t *testing.T) {
+	notes := "## Features\n- twenty-four"
+	feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(update.Release{Version: "0.1.1224", Notes: notes})
+	}))
+	defer feed.Close()
+	t.Setenv("MAGPIE_UPDATE_FEED", feed.URL)
+	updates.mu.Lock()
+	oldState, oldStaged, oldIn, oldLatest, oldAsked, oldLang, oldV := updates.state, updates.staged, updates.notesIn, updates.latest, updates.asked, updates.lang, Version
+	Version = "0.1.1223"
+	updates.lang = "en"
+	updates.mu.Unlock()
+	defer func() {
+		updates.mu.Lock()
+		updates.state, updates.staged, updates.notesIn, updates.latest, updates.asked, updates.lang, Version = oldState, oldStaged, oldIn, oldLatest, oldAsked, oldLang, oldV
+		updates.mu.Unlock()
+	}()
+	hold := func(held string) {
+		updates.mu.Lock()
+		updates.state, updates.staged, updates.notesIn = "ready", filepath.Join(t.TempDir(), "staged"), "en"
+		updates.latest = &update.Release{Version: "0.1.1224", Notes: held, URL: "https://example.invalid/v0.1.1224"}
+		updates.mu.Unlock()
+	}
+	hold("")
+	updates.recheck()
+	if j := updates.json(); j.State != "ready" || j.Latest != "0.1.1224" || !strings.Contains(j.Notes, "twenty-four") || j.URL == "" {
+		t.Fatalf("empty notes not taken from the recheck: %+v", j)
+	}
+
+	hold("- held")
+	updates.recheck()
+	if j := updates.json(); j.Notes != "- held" {
+		t.Fatalf("held notes replaced: %+v", j)
+	}
+}

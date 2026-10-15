@@ -1,7 +1,7 @@
 package provider
 
 // What is left on an API key, as the vendor's own balance endpoint tells
-// it: DeepSeek, Kimi, OpenRouter, SiliconFlow, StepFun, Command Code and AiHubMix are known by their hosts
+// it: DeepSeek, Kimi, OpenRouter, SiliconFlow, StepFun, Command Code, Ollama Cloud and AiHubMix are known by their hosts
 // (AiHubMix tells the whole account's to its access token, BalanceToken);
 // any other provider can name an endpoint and where the amount sits in its
 // reply (BalanceURL, BalancePath), the way a relay's own usage query does,
@@ -13,9 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -39,6 +41,7 @@ type balanceSource struct {
 // balanceSourceOf is the provider's own endpoint when it named one, else
 // the one its host is known to have.
 func balanceSourceOf(p Provider) (balanceSource, bool) {
+	p = keyQueryOf(p)
 	if p.BalanceURL != "" {
 		path := balancePathOf(p)
 		// a token saved beside it (a new-api relay's access token, its
@@ -67,6 +70,9 @@ func balanceSourceOf(p Provider) (balanceSource, bool) {
 			return balanceSource{"https://api.stepfun.ai/v1/accounts", readStepFun("$"), "", nil}, true
 		case "api.commandcode.ai":
 			return balanceSource{"https://api.commandcode.ai/alpha/billing/credits", readCommandCode, "", nil}, true
+		case "ollama.com":
+			// the credits bought past the plan's allowance (#1888)
+			return balanceSource{ollamaBalanceURL, readOllamaCredits, "", nil}, true
 		case "aihubmix.com":
 			if p.BalanceToken != "" {
 				return balanceSource{"https://aihubmix.com/api/user/self", readAiHubMixAccount, p.BalanceToken, nil}, true
@@ -80,6 +86,7 @@ func balanceSourceOf(p Provider) (balanceSource, bool) {
 // balancePathOf is the balance field of a provider that named its Balance
 // URL.
 func balancePathOf(p Provider) string {
+	p = keyQueryOf(p)
 	if strings.TrimSpace(p.BalancePath) != "" {
 		return p.BalancePath
 	}
@@ -127,6 +134,61 @@ const (
 	sub2APIKeyUsage = "/v1/usage"
 )
 
+// tokenQueries are the account queries that only a balance token can
+// ask, each with the same panel's query for a key and the field magpie
+// reads from the account's reply when none is given.
+var tokenQueries = []struct{ account, key, field string }{
+	{sub2APIProfile, sub2APIKeyUsage, "$data.balance"},
+	{newAPIUserSelf, newAPIKeyUsage, newAPIQuotaPath},
+}
+
+// keyQueryOf is p asking its panel's query for a key when its Balance URL
+// is an account query left without the token it needs: the token removed
+// after the editor's "Use …/api/v1/user/profile" (lx_78654 on Discord),
+// where the key could only be refused and the card said "Allowance
+// unavailable" for good. The same panel's key query is asked with the key
+// instead, its field read as that query's unless the user wrote one of
+// their own. The saved URL is left as the user set it; a token pasted
+// again asks the account query again. One with an Authorization or Cookie
+// header of the user's own still asks it as they set it.
+func keyQueryOf(p Provider) Provider {
+	p = keyNotToken(p)
+	if p.BalanceURL == "" || strings.TrimSpace(p.BalanceToken) != "" {
+		return p
+	}
+	for k, v := range p.Headers {
+		if strings.TrimSpace(v) != "" && (strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Cookie")) {
+			return p
+		}
+	}
+	u, err := url.Parse(strings.TrimSpace(p.BalanceURL))
+	if err != nil || u.Host == "" {
+		return p
+	}
+	path := strings.TrimRight(u.Path, "/")
+	for _, q := range tokenQueries {
+		base, ok := strings.CutSuffix(path, q.account)
+		if !ok {
+			continue
+		}
+		u.Path, u.RawPath, u.RawQuery, u.Fragment = base+q.key, "", "", ""
+		p.BalanceURL = u.String()
+		if f := strings.TrimSpace(p.BalancePath); f == q.field {
+			p.BalancePath = ""
+		}
+		return p
+	}
+	return p
+}
+
+// BalanceQuery is the Balance URL and field the provider's balance is
+// asked at, which differ from the saved ones for an account query left
+// without its token (keyQueryOf).
+func BalanceQuery(p Provider) (balanceURL, field string) {
+	p = keyQueryOf(p)
+	return p.BalanceURL, p.BalancePath
+}
+
 // balanceURLPath is a balance URL's path, without a slash at its end.
 func balanceURLPath(raw string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
@@ -144,7 +206,25 @@ func errKeyUsageWithToken(raw string) error {
 	if u, err := url.Parse(strings.TrimSpace(raw)); err == nil && u.Host != "" {
 		self = u.Scheme + "://" + u.Host + newAPIUserSelf
 	}
-	return fmt.Errorf("the Balance URL %s takes the API key, not the access token: set it to %s (Balance field %s) for the account's balance, or remove the token for the key's own", raw, self, newAPIQuotaPath)
+	return errKeyQueryWithToken(raw, self, newAPIQuotaPath, "access token")
+}
+
+// errSub2APIKeyUsageWithToken is a login token beside sub2api's query for a
+// key, which takes the key alone as new-api's does: the panel's query for
+// the account is named in its place.
+func errSub2APIKeyUsageWithToken(raw string) error {
+	profile := sub2APIProfile
+	if u, err := url.Parse(strings.TrimSpace(raw)); err == nil && u.Host != "" {
+		profile = u.Scheme + "://" + u.Host + sub2APIProfile
+	}
+	return errKeyQueryWithToken(raw, profile, "$data.balance", "login token")
+}
+
+// errKeyQueryWithToken is a balance token beside a panel's query for a key
+// (new-api's /api/usage/token, sub2api's /v1/usage), which never takes it:
+// what to name in its place is said.
+func errKeyQueryWithToken(raw, accountURL, accountField, token string) error {
+	return fmt.Errorf("the Balance URL %s takes the API key, not the %s: set it to %s (Balance field %s) for the account's balance, or remove the token for the key's own", raw, token, accountURL, accountField)
 }
 
 // balanceRefusal is what a reply of {"success":false,"message":…} says, a
@@ -433,10 +513,13 @@ func readAiHubMixAccount(b []byte) (string, error) {
 // telling what was used of a plan ("(1 - credits.monthlyCredits / 70) %").
 // A "$" or "¥" before it is put in front of the amount; a "%" after it
 // shows it as a percent of 1 (0.25 is 25%). A path alone that is not a
-// number is shown as it is. Several amounts, each with a label if wanted,
-// go apart by ";" and are shown together: "5h: windowLimits.fiveHour.used /
-// windowLimits.fiveHour.cap %; week: …; $credits.monthlyCredits" is
-// "5h 0% · week 3.4% · $70.00".
+// number is shown as it is. A path through a list's items ("a.*.used",
+// "a[status=active].used") is several values, which sum(), max(), min()
+// or count() make one (balanceExpr). Several amounts, each with a label if
+// wanted, go apart by ";" and are shown together: "5h: windowLimits.
+// fiveHour.used / windowLimits.fiveHour.cap %; week: …; $credits.
+// monthlyCredits" is "5h 0% · week 3.4% · $70.00"; one of them the reply
+// hasn't is "—" while the others show.
 func readBalancePath(b []byte, path string) (string, error) {
 	parts, err := readBalanceParts(b, path)
 	if err != nil {
@@ -453,6 +536,8 @@ type BalancePart struct {
 	Label   string   `json:"label,omitempty"`
 	Text    string   `json:"text"`
 	Percent *float64 `json:"percent,omitempty"`
+	// Error is why the amount couldn't be read, its Text then "—".
+	Error string `json:"error,omitempty"`
 }
 
 // joinBalanceParts is the amounts on one line, as Balance tells them:
@@ -479,6 +564,8 @@ func readBalanceParts(b []byte, path string) ([]BalancePart, error) {
 		return []BalancePart{{Text: v, Percent: pct}}, nil
 	}
 	var out []BalancePart
+	var first error
+	read := false
 	for part := range strings.SplitSeq(path, ";") {
 		if strings.TrimSpace(part) == "" {
 			continue
@@ -490,15 +577,26 @@ func readBalanceParts(b []byte, path string) ([]BalancePart, error) {
 		label = strings.TrimSpace(label)
 		v, pct, err := readBalanceOne(b, expr)
 		if err != nil {
+			// one amount the reply hasn't (an index past the list's end, a
+			// window whose cap is 0) is "—", and the others still show
+			// (#1993); the whole fails only when none can be read
 			if label != "" {
 				err = fmt.Errorf("%s: %w", label, err)
 			}
-			return nil, err
+			if first == nil {
+				first = err
+			}
+			out = append(out, BalancePart{Label: label, Text: "—", Error: err.Error()})
+			continue
 		}
+		read = true
 		out = append(out, BalancePart{Label: label, Text: v, Percent: pct})
 	}
 	if len(out) == 0 {
 		return nil, errors.New("no balance path: where in the reply the amount is, e.g. data.balance")
+	}
+	if !read {
+		return nil, first
 	}
 	return out, nil
 }
@@ -540,10 +638,7 @@ func readBalanceOne(b []byte, path string) (string, *float64, error) {
 		}
 		return "", nil, fmt.Errorf("%q in the reply is not an amount", path)
 	}
-	n, err := e.sum()
-	if err == nil && e.i < len(e.src) {
-		err = fmt.Errorf("the balance path has %q it can't read", e.src[e.i:])
-	}
+	n, err := e.number()
 	if err != nil {
 		return "", nil, err
 	}
@@ -571,11 +666,66 @@ func balanceAmount(sign string, n float64, percent bool) string {
 }
 
 // balanceExpr reads a balance path's sum: paths into the reply, numbers,
-// + - * / and brackets.
+// + - * / and brackets. A path can go through every item of a list ("*",
+// "data.subscriptions.*.used") or those of them that match ("[status=
+// active]", "[plan.kind!=free]"), and is then several values, which
+// sum(), max(), min() or count() make one (#1993): "sum(a.*.used) /
+// sum(a.*.cap)", "max(a.*.used / a.*.cap)". Several values left as they
+// are, outside those, are an error rather than a guess at which of them
+// was meant. Within them, an item without the path, or one divided by 0,
+// is left out.
 type balanceExpr struct {
 	src   string
 	i     int
 	reply any
+}
+
+// balanceVal is a number, or several (many) when a path went through a
+// list; NaN stands for an item that has none.
+type balanceVal struct {
+	n    float64
+	ns   []float64
+	many bool
+	// items are a path's own values, for count() to count those that are
+	// there, numbers or not
+	items []any
+}
+
+// balanceFuncs make a path's several values one.
+var balanceFuncs = map[string]func([]float64) (float64, error){
+	"sum": func(ns []float64) (float64, error) {
+		s := 0.0
+		for _, n := range ns {
+			if !math.IsNaN(n) {
+				s += n
+			}
+		}
+		return s, nil
+	},
+	"count": func(ns []float64) (float64, error) {
+		c := 0.0
+		for _, n := range ns {
+			if !math.IsNaN(n) {
+				c++
+			}
+		}
+		return c, nil
+	},
+	"max": func(ns []float64) (float64, error) { return balanceExtreme(ns, "max", 1) },
+	"min": func(ns []float64) (float64, error) { return balanceExtreme(ns, "min", -1) },
+}
+
+func balanceExtreme(ns []float64, name string, sign float64) (float64, error) {
+	best, found := 0.0, false
+	for _, n := range ns {
+		if !math.IsNaN(n) && (!found || (n-best)*sign > 0) {
+			best, found = n, true
+		}
+	}
+	if !found {
+		return 0, fmt.Errorf("%s() of the balance path has nothing to take it of", name)
+	}
+	return best, nil
 }
 
 func (e *balanceExpr) space() {
@@ -584,12 +734,24 @@ func (e *balanceExpr) space() {
 	}
 }
 
-// lone is whether the whole is one path.
+// lone is whether the whole is one path, to one value.
 func (e *balanceExpr) lone() bool {
-	return !strings.ContainsAny(e.src, "+-*/() ") && e.src != "" && !isDigit(e.src[0])
+	return !strings.ContainsAny(e.src, "+-*/() [") && e.src != "" && !isDigit(e.src[0])
 }
 
-func (e *balanceExpr) sum() (float64, error) {
+// number is the whole's one number.
+func (e *balanceExpr) number() (float64, error) {
+	v, err := e.sum()
+	if err == nil && e.i < len(e.src) {
+		err = fmt.Errorf("the balance path has %q it can't read", e.src[e.i:])
+	}
+	if err == nil && v.many {
+		err = errors.New("the balance path has several values where one is wanted: put them in sum(), max(), min() or count()")
+	}
+	return v.n, err
+}
+
+func (e *balanceExpr) sum() (balanceVal, error) {
 	v, err := e.product()
 	for err == nil {
 		e.space()
@@ -598,17 +760,15 @@ func (e *balanceExpr) sum() (float64, error) {
 		}
 		op := e.src[e.i]
 		e.i++
-		var w float64
-		if w, err = e.product(); op == '+' {
-			v += w
-		} else {
-			v -= w
+		var w balanceVal
+		if w, err = e.product(); err == nil {
+			v, err = balanceOp(v, w, op)
 		}
 	}
 	return v, err
 }
 
-func (e *balanceExpr) product() (float64, error) {
+func (e *balanceExpr) product() (balanceVal, error) {
 	v, err := e.unary()
 	for err == nil {
 		e.space()
@@ -617,43 +777,71 @@ func (e *balanceExpr) product() (float64, error) {
 		}
 		op := e.src[e.i]
 		e.i++
-		var w float64
-		if w, err = e.unary(); err != nil {
-			break
-		}
-		if op == '*' {
-			v *= w
-		} else if w == 0 {
-			return 0, errors.New("the balance path divides by 0")
-		} else {
-			v /= w
+		var w balanceVal
+		if w, err = e.unary(); err == nil {
+			v, err = balanceOp(v, w, op)
 		}
 	}
 	return v, err
 }
 
-func (e *balanceExpr) unary() (float64, error) {
+// balanceOp is v op w, item by item when either is several values: two
+// lists by the same path go together, a number with each of a list's.
+func balanceOp(v, w balanceVal, op byte) (balanceVal, error) {
+	one := func(a, b float64) float64 {
+		switch op {
+		case '+':
+			return a + b
+		case '-':
+			return a - b
+		case '*':
+			return a * b
+		}
+		if b == 0 {
+			return math.NaN()
+		}
+		return a / b
+	}
+	if !v.many && !w.many {
+		if op == '/' && w.n == 0 {
+			return v, errors.New("the balance path divides by 0")
+		}
+		return balanceVal{n: one(v.n, w.n)}, nil
+	}
+	if v.many && w.many && len(v.ns) != len(w.ns) {
+		return v, fmt.Errorf("the balance path puts %d values with %d", len(v.ns), len(w.ns))
+	}
+	size := max(len(v.ns), len(w.ns))
+	out := make([]float64, size)
+	for i := range out {
+		a, b := v.n, w.n
+		if v.many {
+			a = v.ns[i]
+		}
+		if w.many {
+			b = w.ns[i]
+		}
+		out[i] = one(a, b)
+	}
+	return balanceVal{ns: out, many: true}, nil
+}
+
+func (e *balanceExpr) unary() (balanceVal, error) {
 	e.space()
 	if e.i >= len(e.src) {
-		return 0, errors.New("the balance path ends where a number or a path should be")
+		return balanceVal{}, errors.New("the balance path ends where a number or a path should be")
 	}
 	switch c := e.src[e.i]; {
 	case c == '-':
 		e.i++
 		v, err := e.unary()
-		return -v, err
+		if err != nil {
+			return v, err
+		}
+		return balanceOp(balanceVal{n: 0}, v, '-')
 	case c == '(':
 		e.i++
-		v, err := e.sum()
-		if err != nil {
-			return 0, err
-		}
-		e.space()
-		if e.i >= len(e.src) || e.src[e.i] != ')' {
-			return 0, errors.New("the balance path has a ( without its )")
-		}
-		e.i++
-		return v, nil
+		return e.closed(e.sum())
 	case isDigit(c) || c == '.':
 		j := e.i
 		for j < len(e.src) && (isDigit(e.src[j]) || e.src[j] == '.') {
@@ -661,52 +849,279 @@ func (e *balanceExpr) unary() (float64, error) {
 		}
 		n, err := strconv.ParseFloat(e.src[e.i:j], 64)
 		if err != nil {
-			return 0, fmt.Errorf("the balance path has %q, not a number", e.src[e.i:j])
+			return balanceVal{}, fmt.Errorf("the balance path has %q, not a number", e.src[e.i:j])
 		}
 		e.i = j
-		return n, nil
+		return balanceVal{n: n}, nil
 	}
 	j := e.i
-	for j < len(e.src) && !strings.ContainsRune("+-*/() ", rune(e.src[j])) {
+	for j < len(e.src) {
+		c := e.src[j]
+		if c == '[' {
+			k := strings.IndexByte(e.src[j:], ']')
+			if k < 0 {
+				return balanceVal{}, errors.New("the balance path has a [ without its ]")
+			}
+			j += k + 1
+			continue
+		}
+		// "*" right after a dot, or at the start, is every item of a list
+		if c == '*' && (j == e.i || e.src[j-1] == '.') {
+			j++
+			continue
+		}
+		if strings.IndexByte("+-*/() ", c) >= 0 {
+			break
+		}
 		j++
 	}
 	if j == e.i {
-		return 0, fmt.Errorf("the balance path has %q where a number or a path should be", e.src[e.i:])
+		return balanceVal{}, fmt.Errorf("the balance path has %q where a number or a path should be", e.src[e.i:])
 	}
 	path := e.src[e.i:j]
 	e.i = j
-	v, err := e.at(path)
+	if f, ok := balanceFuncs[path]; ok && e.i < len(e.src) && e.src[e.i] == '(' {
+		e.i++
+		v, err := e.closed(e.sum())
+		if err != nil {
+			return v, err
+		}
+		ns := v.ns
+		if !v.many {
+			ns = []float64{v.n}
+		}
+		if path == "count" && v.items != nil {
+			ns = make([]float64, 0, len(v.items))
+			for _, x := range v.items {
+				if x != nil {
+					ns = append(ns, 1)
+				}
+			}
+		}
+		n, err := f(ns)
+		return balanceVal{n: n}, err
+	}
+	vs, many, err := e.all(path)
 	if err != nil {
-		return 0, err
+		return balanceVal{}, err
 	}
-	n, ok := number(v)
-	if !ok {
-		return 0, fmt.Errorf("%q in the reply is not a number", path)
+	if !many {
+		n, ok := number(vs[0])
+		if !ok {
+			return balanceVal{}, fmt.Errorf("%q in the reply is not a number", path)
+		}
+		return balanceVal{n: n}, nil
 	}
-	return n, nil
+	ns := make([]float64, len(vs))
+	for i, x := range vs {
+		ns[i] = math.NaN()
+		if n, ok := number(x); ok {
+			ns[i] = n
+		}
+	}
+	return balanceVal{ns: ns, many: true, items: vs}, nil
 }
 
-// at is what is at a dotted path in the reply.
+// closed is a bracket's inside, with the ) after it.
+func (e *balanceExpr) closed(v balanceVal, err error) (balanceVal, error) {
+	if err != nil {
+		return v, err
+	}
+	e.space()
+	if e.i >= len(e.src) || e.src[e.i] != ')' {
+		return v, errors.New("the balance path has a ( without its )")
+	}
+	e.i++
+	return v, nil
+}
+
+// at is what is at a dotted path in the reply, the path to one value.
 func (e *balanceExpr) at(path string) (any, error) {
-	v := e.reply
-	for _, k := range strings.Split(path, ".") {
-		switch x := v.(type) {
-		case map[string]any:
-			v = x[k]
-		case []any:
-			i, err := strconv.Atoi(k)
-			if err != nil || i < 0 || i >= len(x) {
-				return nil, fmt.Errorf("nothing at %q in the reply", path)
+	vs, many, err := e.all(path)
+	if err != nil {
+		return nil, err
+	}
+	if many {
+		return nil, fmt.Errorf("%q is several values: put it in sum(), max(), min() or count()", path)
+	}
+	return vs[0], nil
+}
+
+// all is what is at a dotted path in the reply: one value, or, when the
+// path goes through a list by "*" or "[…]", every item's (many), nil for
+// an item without the rest of the path.
+func (e *balanceExpr) all(path string) ([]any, bool, error) {
+	segs, err := balanceSegments(path)
+	if err != nil {
+		return nil, false, err
+	}
+	vs, many := []any{e.reply}, false
+	for _, s := range segs {
+		var next []any
+		for _, v := range vs {
+			if v == nil {
+				next = append(next, nil)
+				continue
 			}
-			v = x[i]
-		default:
-			v = nil
+			next = append(next, s.step(v)...)
 		}
-		if v == nil {
-			return nil, fmt.Errorf("nothing at %q in the reply", path)
+		many = many || s.spreads()
+		vs = next
+		if !many && (len(vs) != 1 || vs[0] == nil) {
+			return nil, false, fmt.Errorf("nothing at %q in the reply", path)
 		}
 	}
-	return v, nil
+	return vs, many, nil
+}
+
+// balanceSegment is one step of a path: a key, an index or "*", and the
+// tests an item must pass, "[status=active]": a list's items that pass,
+// or an object when it does.
+type balanceSegment struct {
+	key   string
+	tests []balanceTest
+}
+
+type balanceTest struct {
+	path []string
+	not  bool
+	want string
+}
+
+func (s balanceSegment) spreads() bool { return s.key == "*" || len(s.tests) > 0 }
+
+// step is what one value leads to: one value, or a list's items.
+func (s balanceSegment) step(v any) []any {
+	if s.key == "*" {
+		v = balanceItems(v)
+	} else if s.key != "" {
+		v = balanceChild(v, s.key)
+	}
+	if len(s.tests) == 0 {
+		if s.key == "*" {
+			return v.([]any)
+		}
+		return []any{v}
+	}
+	// a list's items that pass, or an object itself when it does
+	items, ok := v.([]any)
+	if !ok {
+		items = []any{v}
+	}
+	var out []any
+	for _, x := range items {
+		if x != nil && s.passes(x) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func (s balanceSegment) passes(x any) bool {
+	for _, t := range s.tests {
+		v := x
+		for _, k := range t.path {
+			if v = balanceChild(v, k); v == nil {
+				break
+			}
+		}
+		got := ""
+		switch y := v.(type) {
+		case string:
+			got = y
+		case float64:
+			got = strconv.FormatFloat(y, 'f', -1, 64)
+		case bool:
+			got = strconv.FormatBool(y)
+		}
+		if (v != nil && got == t.want) == t.not {
+			return false
+		}
+	}
+	return true
+}
+
+// balanceChild is a key of an object, or an index of a list.
+func balanceChild(v any, k string) any {
+	switch x := v.(type) {
+	case map[string]any:
+		return x[k]
+	case []any:
+		if i, err := strconv.Atoi(k); err == nil && i >= 0 && i < len(x) {
+			return x[i]
+		}
+	}
+	return nil
+}
+
+// balanceItems is a list's items, or an object's values by key.
+func balanceItems(v any) []any {
+	switch x := v.(type) {
+	case []any:
+		return x
+	case map[string]any:
+		keys := slices.Sorted(maps.Keys(x))
+		out := make([]any, len(keys))
+		for i, k := range keys {
+			out[i] = x[k]
+		}
+		return out
+	}
+	return []any{}
+}
+
+// balanceSegments splits a path at its dots, a "[…]" test kept whole.
+func balanceSegments(path string) ([]balanceSegment, error) {
+	var out []balanceSegment
+	for rest := path; ; {
+		end := 0
+		for end < len(rest) && rest[end] != '.' {
+			if rest[end] == '[' {
+				k := strings.IndexByte(rest[end:], ']')
+				if k < 0 {
+					return nil, errors.New("the balance path has a [ without its ]")
+				}
+				end += k
+			}
+			end++
+		}
+		seg, err := balanceSegmentOf(rest[:end], path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, seg)
+		if end == len(rest) {
+			return out, nil
+		}
+		rest = rest[end+1:]
+	}
+}
+
+func balanceSegmentOf(raw, path string) (balanceSegment, error) {
+	key, tests, _ := strings.Cut(raw, "[")
+	s := balanceSegment{key: key}
+	if key == "" && tests == "" {
+		return s, fmt.Errorf("nothing at %q in the reply", path)
+	}
+	for tests != "" {
+		body, after, ok := strings.Cut(tests, "]")
+		if !ok {
+			return s, errors.New("the balance path has a [ without its ]")
+		}
+		t := balanceTest{}
+		left, want, ok := strings.Cut(body, "=")
+		if !ok || strings.TrimSpace(left) == "" {
+			return s, fmt.Errorf("the balance path has [%s], not a test like [status=active]", body)
+		}
+		if l, isNot := strings.CutSuffix(left, "!"); isNot {
+			t.not, left = true, l
+		}
+		t.path = strings.Split(strings.TrimSpace(left), ".")
+		t.want = strings.Trim(strings.TrimSpace(want), `'"`)
+		s.tests = append(s.tests, t)
+		tests = strings.TrimPrefix(after, "[")
+	}
+	return s, nil
 }
 
 // Balance asks the vendor what is left on the provider's key in use. ok is
@@ -730,12 +1145,18 @@ func Balance(ctx context.Context, p Provider) (amount string, ok bool, err error
 // limits, readSub2APIKeyLimits).
 func balanceRead(ctx context.Context, p Provider) (amount string, parts []BalancePart, ws []QuotaWindow, ok bool, err error) {
 	ctx = p.Via(ctx)
+	p = keyQueryOf(p)
 	src, ok := balanceSourceOf(p)
 	if !ok || p.Account != nil || p.Key == "" {
 		return "", nil, nil, false, nil
 	}
-	if src.token != "" && p.BalanceURL != "" && balanceURLPath(p.BalanceURL) == newAPIKeyUsage {
-		return "", nil, nil, true, errKeyUsageWithToken(p.BalanceURL)
+	if src.token != "" && p.BalanceURL != "" {
+		switch balanceURLPath(p.BalanceURL) {
+		case newAPIKeyUsage:
+			return "", nil, nil, true, errKeyUsageWithToken(p.BalanceURL)
+		case sub2APIKeyUsage:
+			return "", nil, nil, true, errSub2APIKeyUsageWithToken(p.BalanceURL)
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, withBalanceKey(src.url, p.Key, true), nil)
 	if err != nil {
@@ -817,14 +1238,20 @@ func balanceRead(ctx context.Context, p Provider) (amount string, parts []Balanc
 // query for a key, whose reply tells the key's own limits when it has
 // some.
 func sub2APIKeyLimits(p Provider) bool {
+	p = keyQueryOf(p)
 	return p.BalanceURL != "" && balanceURLPath(p.BalanceURL) == sub2APIKeyUsage
 }
 
 // balanceKeyNames are what a Balance URL or a header's value names the
 // key by, for a vendor that wants it somewhere of its own, in the query
-// most often (…/balance?key={key}): each key the provider has on is put in
-// its own ask, so each card tells that key's balance.
-var balanceKeyNames = []string{"{key}", "{apiKey}", "{api_key}"}
+// most often (…/balance?key={key}) or a header (Authorization: Bearer
+// {token}): each key the provider has on is put in its own ask, so each
+// card tells that key's balance. Any case, in one or two braces or as
+// ${…}: {key}, {apiKey}, {api_key}, {API_KEY}, {token}, {{key}}, ${API_KEY}.
+// {token} is the key too: it is what a vendor's own error names the value
+// in "Authorization: Bearer {token}" (lx_78654 on Discord, whose header
+// went with "{token}" in it as written, and the vendor refused it).
+var balanceKeyNames = regexp.MustCompile(`(?i)\$?\{\{?\s*(?:key|api[_-]?key|token)\s*\}?\}`)
 
 // withBalanceKey is s with the key in place of its names, escaped for a
 // URL's query when inURL.
@@ -832,10 +1259,23 @@ func withBalanceKey(s, key string, inURL bool) string {
 	if inURL {
 		key = url.QueryEscape(key)
 	}
-	for _, n := range balanceKeyNames {
-		s = strings.ReplaceAll(s, n, key)
+	return balanceKeyNames.ReplaceAllLiteralString(s, key)
+}
+
+// keyNotToken is p without a balance token that is only its own key
+// pasted there: the query is asked as with no token, the key as a Bearer
+// the way a chat request sends it, not the key bare in Authorization as
+// a new-api access token goes, which a vendor that wants "Bearer <key>"
+// refuses (lx_78654 on Discord).
+func keyNotToken(p Provider) Provider {
+	t := strings.TrimSpace(p.BalanceToken)
+	if len(t) > 7 && strings.EqualFold(t[:7], "bearer ") {
+		t = strings.TrimSpace(t[7:])
 	}
-	return s
+	if t != "" && t == strings.TrimSpace(p.Key) {
+		p.BalanceToken = ""
+	}
+	return p
 }
 
 var keyBalanceCache struct {
@@ -863,7 +1303,9 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 	c := &keyBalanceCache
 	_, again := refreshing(ctx) // one card read again (RefreshUsage)
 	c.Lock()
-	if !again && c.data != nil && time.Since(c.at) < time.Minute {
+	// with allowances read only when asked, the cards stand as they were
+	// last read till the user asks (#1518)
+	if !again && c.data != nil && (time.Since(c.at) < time.Minute || heldRead(ctx)) {
 		defer c.Unlock()
 		return c.data
 	}
@@ -926,7 +1368,8 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 			if clineKeyCard(j.p) {
 				// ClinePass's limits beside the credits (cline_usage.go)
 				if ws, amount, err := clineKeyUsage(ctx, j.p); err != nil {
-					q.Error = err.Error()
+					// a balance read beside limits that weren't is kept
+					q.Error, q.Balance = err.Error(), amount
 				} else {
 					q.Windows = append(q.Windows, ws...)
 					q.Balance = amount
@@ -937,6 +1380,9 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 				return
 			}
 			amount, parts, ws, _, err := balanceRead(ctx, j.p)
+			if errors.Is(err, errNoBalance) {
+				return // a reply with no balance for this key: no card
+			}
 			if err != nil {
 				q.Error = err.Error()
 			} else {
@@ -953,6 +1399,7 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 		}()
 	}
 	wg.Wait()
+	out = slices.DeleteFunc(out, func(q SubscriptionQuota) bool { return q.Provider == "" })
 	if ctx.Err() == nil {
 		// each balance kept, and drawn over time with its runs-out
 		noteBalanceHistory(out, time.Now())

@@ -15,11 +15,21 @@
 //	%LOCALAPPDATA%\Packages\Claude_<publisher>\LocalCache\Roaming\Claude
 //	%LOCALAPPDATA%\Packages\Claude_<publisher>\LocalCache\Local\Claude(-3p)
 //
+// (AnthropicPBC.Claude_<publisher> for the Store's package.)
+//
 // The packaged app reads its own copy before the real folder's, so a file
 // another program writes into %APPDATA%\Claude is not seen once the app has
 // one there. Such an install's folders are the package's: those are found,
 // read and written in place of the usual ones, unless Desktop runs in the
 // usual ones (it has run there, and not later in the package's).
+//
+// From 2.31226 on the package no longer keeps %LOCALAPPDATA% to itself:
+// Desktop's 3p mode reads the real %LOCALAPPDATA%\Claude-3p (its Ou() is
+// path.join(LOCALAPPDATA, "Claude-3p"), the same as before, now outside
+// the package's LocalCache), and a gateway written only into the
+// package's Claude-3p is never seen (bg5eau on X). Which build is
+// installed can't be told from its folders, so Sets gives both: what
+// Desktop must find goes into each.
 package desktopdir
 
 import (
@@ -74,6 +84,13 @@ func Here() Dirs {
 // Find are Desktop's folders on goos for home, with getenv reading the
 // environment (a folder in it that isn't absolute is passed over).
 func Find(goos, home string, getenv func(string) string) Dirs {
+	return Sets(goos, home, getenv)[0]
+}
+
+// Sets are every set of Desktop's folders on goos for home: Find's first,
+// then, for an MSIX install, the other of the package's and the usual
+// ones, which one build or another of the packaged app reads.
+func Sets(goos, home string, getenv func(string) string) []Dirs {
 	env := func(k, def string) string {
 		if v := getenv(k); v != "" && filepath.IsAbs(v) {
 			return v
@@ -83,14 +100,14 @@ func Find(goos, home string, getenv func(string) string) Dirs {
 	switch goos {
 	case "darwin":
 		d := filepath.Join(home, "Library", "Application Support")
-		return Dirs{Data: filepath.Join(d, "Claude"), Mode: filepath.Join(d, "Claude"), ThreeP: filepath.Join(d, "Claude-3p")}
+		return []Dirs{{Data: filepath.Join(d, "Claude"), Mode: filepath.Join(d, "Claude"), ThreeP: filepath.Join(d, "Claude-3p")}}
 	case "windows":
 		local := env("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
 		roaming := env("APPDATA", filepath.Join(home, "AppData", "Roaming"))
 		classic := Dirs{Data: filepath.Join(roaming, "Claude"), Mode: windowsDir(local, false), ThreeP: windowsDir(local, true)}
 		pkg := packageDir(local)
 		if pkg == "" {
-			return classic
+			return []Dirs{classic}
 		}
 		packaged := Dirs{
 			Data:    filepath.Join(pkg, "Roaming", "Claude"),
@@ -103,13 +120,51 @@ func Find(goos, home string, getenv func(string) string) Dirs {
 		// from the usual install onto the package leaves its old data)
 		c, p := lastRun(classic.Data, classic.ThreeP), lastRun(packaged.Data, packaged.ThreeP)
 		if !c.IsZero() && !p.After(c) {
-			return classic
+			return []Dirs{classic, packaged}
 		}
-		return packaged
+		return []Dirs{packaged, classic}
 	}
 	d := env("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	return Dirs{Data: filepath.Join(d, "Claude"), Mode: filepath.Join(d, "Claude"), ThreeP: filepath.Join(d, "Claude-3p")}
+	return []Dirs{{Data: filepath.Join(d, "Claude"), Mode: filepath.Join(d, "Claude"), ThreeP: filepath.Join(d, "Claude-3p")}}
 }
+
+// Installed says whether Desktop's program is installed on goos, whatever
+// it has written: on Windows, Squirrel's setup puts it in
+// %LOCALAPPDATA%\AnthropicClaude\claude.exe, and the MSIX's has its
+// package folder (Sets' Package). Installed and not yet opened, Desktop has
+// none of its folders (#1482); it still reads at its first start what
+// magpie writes into them. False elsewhere, where the folders tell.
+func Installed(goos, home string, getenv func(string) string) bool {
+	if goos != "windows" {
+		return false
+	}
+	local := getenv("LOCALAPPDATA")
+	if local == "" || !filepath.IsAbs(local) {
+		local = filepath.Join(home, "AppData", "Local")
+	}
+	if fi, err := os.Stat(filepath.Join(local, "AnthropicClaude", "claude.exe")); err == nil && fi.Mode().IsRegular() {
+		return true
+	}
+	return packageDir(local) != ""
+}
+
+// Everywhere are the folders of every set on this computer (Sets), each
+// once: where the readers look for Desktop's sessions and skills.
+func Everywhere() []string {
+	home, _ := os.UserHomeDir()
+	var out []string
+	for _, d := range Sets(OS, home, appdir.Getenv) {
+		for _, p := range d.All() {
+			if !slices.Contains(out, p) {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+// LastRun is when Desktop last ran in any of dirs (lastRun).
+func LastRun(dirs ...string) time.Time { return lastRun(dirs...) }
 
 // lastRun is when Desktop last ran in any of dirs, its userData folders:
 // the time Chromium's "Local State" there was written, zero for none. A
@@ -126,11 +181,17 @@ func lastRun(dirs ...string) time.Time {
 }
 
 // packageDir is the LocalCache folder of Desktop's MSIX package under
-// local (%LOCALAPPDATA%): Packages\Claude_<publisher id>, the one Desktop
-// has run in first, else the first there is. The publisher id is not
-// assumed: it is the one of whoever signed the package.
+// local (%LOCALAPPDATA%): Packages\Claude_<publisher id>, or the Store's
+// Packages\AnthropicPBC.Claude_<publisher id> (Desktop 2.31226 knows both
+// families, Claude_pzs8sxrjxfjjc and AnthropicPBC.Claude_fnn82j28hfe8t),
+// the one Desktop has run in first, else the first there is. The publisher
+// id is not assumed: it is the one of whoever signed the package.
 func packageDir(local string) string {
-	found, _ := filepath.Glob(filepath.Join(local, "Packages", "Claude_*"))
+	var found []string
+	for _, family := range []string{"Claude_*", "AnthropicPBC.Claude_*"} {
+		m, _ := filepath.Glob(filepath.Join(local, "Packages", family))
+		found = append(found, m...)
+	}
 	var dirs []string
 	for _, p := range found {
 		if fi, err := os.Stat(p); err == nil && fi.IsDir() {

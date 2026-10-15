@@ -2,7 +2,7 @@
 // Settings' "Codex memories model" (#985, Hu9956: the model Codex writes its
 // memories with was only the notebook square on Codex's card, beside the
 // subagent squares, and wasn't found). The row sits under "Codex auto-review
-// model" with a title and a line that says what happens; unset it is
+// model" with its name alone (1ooogle on X); unset it is
 // Codex's own pick. It opens the app's model picker (no native select), and
 // a pick posts Codex's memories field as the card's square does: the square
 // lights with it, and Default picked on the square puts the row back. No
@@ -14,6 +14,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const models = [{ value: "gpt-5.5", label: "GPT-5.5", ref: "openai/gpt-5.5" }, { value: "gpt-5.4-mini", label: "GPT-5.4 mini", ref: "openai/gpt-5.4-mini" }];
@@ -71,10 +72,10 @@ function server(lang, sets, codex) {
 
 // the words as i18n.js has them
 const W = {
-  en: { name: "Codex memories model", own: "Codex’s own pick", subOwn: /gpt-5\.6-luna and gpt-5\.6-terra/, subSet: /with this model/, square: "Codex memories model: GPT-5.4 mini", def: "Default" },
-  zh: { name: "Codex 记忆整理模型", own: "由 Codex 决定", subOwn: /gpt-5\.6-luna 和 gpt-5\.6-terra/, subSet: /用这个模型/, square: "Codex 记忆整理模型：GPT-5.4 mini", def: "默认" },
-  ja: { name: "Codex メモリ整理のモデル", own: null, subOwn: /gpt-5\.6-luna と gpt-5\.6-terra/, subSet: /このモデルで/, square: null, def: null },
-  de: { name: "Codex-Modell für Erinnerungen", own: null, subOwn: /gpt-5\.6-luna und gpt-5\.6-terra/, subSet: /mit diesem Modell/, square: null, def: null },
+  en: { name: "Codex memories model", own: "Codex’s own pick", square: "Codex memories model: GPT-5.4 mini", def: "Default" },
+  zh: { name: "Codex 记忆整理模型", own: "由 Codex 决定", square: "Codex 记忆整理模型：GPT-5.4 mini", def: "默认" },
+  ja: { name: "Codex メモリ整理のモデル", own: null, square: null, def: null },
+  de: { name: "Codex-Modell für Erinnerungen", own: null, square: null, def: null },
 };
 const view = (page) => page.locator("#view-settings").evaluate((v) => v.scrollTop);
 
@@ -97,7 +98,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           }
           await browser.close();
         });
+        await watchSettingsReads(page);
         await page.goto("http://magpie.test/?view=settings");
+        await settingsDrawn(page); // rows found are the ones that stay (#1659)
         const row = page.locator("#codexMemoriesRow");
         const pick = page.locator("#codexMemoriesPick button");
         await pick.waitFor();
@@ -106,7 +109,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await row.locator("select").count(), 0, "no native select");
         assert.equal((await row.locator(".name").textContent()).trim(), w.name);
         if (w.own) assert.equal((await pick.textContent()).trim(), w.own, "Codex's own pick by default");
-        assert.match(await row.locator(".sub").textContent(), w.subOwn);
+        assert.equal(await row.locator(".sub").count(), 0, "the row says its name alone, its button the choice (1ooogle on X)");
         // the title, its line and the button fit the row
         const fit = await row.evaluate((r) => {
           const box = r.getBoundingClientRect();
@@ -135,7 +138,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#pop #list li", { hasText: "GPT-5.4 mini" }).first().click();
         await page.locator("#codexMemoriesPick button", { hasText: "GPT-5.4 mini" }).waitFor();
         assert.deepEqual(sets, [{ agent: "codex", field: "memories", value: "gpt-5.4-mini" }]);
-        assert.match(await row.locator(".sub").textContent(), w.subSet);
+        assert.equal(await row.locator(".sub").count(), 0);
         await page.waitForTimeout(300);
         assert.equal(await view(page), before, "picking a model scrolled the page");
 
@@ -157,7 +160,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // and Settings shows Codex's own again
         await page.evaluate(() => show("settings"));
         if (w.own) await page.locator("#codexMemoriesPick button", { hasText: w.own }).waitFor();
-        assert.match(await row.locator(".sub").textContent(), w.subOwn);
+        assert.equal(await row.locator(".sub").count(), 0);
         assert.deepEqual(errors, []);
       });
     }
@@ -171,7 +174,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     page.on("pageerror", (e) => errors.push(e.message));
     await page.route("**/*", server("en", [], false));
     t.after(() => browser.close());
+    await watchSettingsReads(page);
     await page.goto("http://magpie.test/?view=settings");
+    await settingsDrawn(page); // rows found are the ones that stay (#1659)
     await page.locator("#codexAutoReviewPick button").waitFor();
     await page.waitForTimeout(300);
     assert.equal(await page.locator("#codexMemoriesRow").isHidden(), true);

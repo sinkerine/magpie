@@ -8,6 +8,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"regexp"
 	"strings"
@@ -151,25 +152,67 @@ func quotaOfPlugin(q SubscriptionQuota, u plugin.Usage) SubscriptionQuota {
 		if t, err := time.Parse(time.RFC3339, x.ResetsAt); err == nil {
 			w.ResetsAt = &t
 		}
-		if set := lowerSet(x.Models); set != nil {
-			w.matches = func(model string) bool { return set[strings.ToLower(model)] }
-		} else if set := lowerSet(x.NotModels); set != nil {
-			w.matches = func(model string) bool { return !set[strings.ToLower(model)] }
+		if t, err := time.Parse(time.RFC3339, x.RunsOutAt); err == nil {
+			w.RunsOutAt, w.RunsOut = &t, x.RunsOut
+		}
+		if set := idSetOf(x.Models); set != nil {
+			w.matches = set.has
+		} else if set := idSetOf(x.NotModels); set != nil {
+			w.matches = func(model string) bool { return !set.has(model) }
 		}
 		q.Windows = append(q.Windows, w)
 	}
 	return q
 }
 
-func lowerSet(ids []string) map[string]bool {
-	if len(ids) == 0 {
+// idSet is the models a plugin's window lists (models or notModels), in
+// lower case. A plugin that offers a model at its context sizes lists it by
+// those (Cursor's grok-4.7@256k, grok-4.7@500k), while the model is still
+// asked for by its bare id (grok-4.7, picked before the list had sizes,
+// which the plugin runs at its default size): that is the same model, on
+// the same allowance. So a bare id is in the set when one of its @sizes
+// is, and an @size when its bare id is (Will on Discord). Any other suffix
+// (ZCode's -Trial) names a model of its own, and one @size doesn't stand
+// for another.
+type idSet struct {
+	ids  map[string]bool
+	bare map[string]bool // the bare id of each listed id@size
+}
+
+func idSetOf(list []string) *idSet {
+	if len(list) == 0 {
 		return nil
 	}
-	m := map[string]bool{}
-	for _, id := range ids {
-		m[strings.ToLower(id)] = true
+	s := &idSet{ids: map[string]bool{}, bare: map[string]bool{}}
+	for _, id := range list {
+		id = strings.ToLower(id)
+		s.ids[id] = true
+		if b, ok := bareID(id); ok {
+			s.bare[b] = true
+		}
 	}
-	return m
+	return s
+}
+
+func (s *idSet) has(model string) bool {
+	model = strings.ToLower(model)
+	if s.ids[model] {
+		return true
+	}
+	if b, ok := bareID(model); ok {
+		return s.ids[b]
+	}
+	return s.bare[model]
+}
+
+// bareID is id without the @size a plugin names a context size with
+// (grok-4.7@256k → grok-4.7), and whether it had one.
+func bareID(id string) (string, bool) {
+	i := strings.LastIndexByte(id, '@')
+	if i <= 0 {
+		return id, false
+	}
+	return id[:i], true
 }
 
 // pluginUsageFetches are a card's fetch for each plugin account that
@@ -208,4 +251,14 @@ func (a *Account) UsageAgent() string {
 		return "plugin:" + a.plugin.ID
 	}
 	return a.Agent
+}
+
+// PluginAllowanceForTest is the allowance a plugin's usage answer gives
+// routing, for the gateway's tests.
+func PluginAllowanceForTest(usage []byte, now time.Time) Allowance {
+	var u plugin.Usage
+	if json.Unmarshal(usage, &u) != nil {
+		return nil
+	}
+	return allowanceOf(quotaOfPlugin(SubscriptionQuota{}, u).Windows, now)
 }

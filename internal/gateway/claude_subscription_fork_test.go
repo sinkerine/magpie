@@ -53,11 +53,13 @@ func TestClaudeForksAnsweringTheLeadsCallsEachGetAnAnswer(t *testing.T) {
 	// Claude Code: a turn it is told from the start calls Agent three
 	// times, then makes the calls through its MCP server one after another,
 	// as Claude Code does, and says what their results said; a turn told
-	// with results in it says what those said.
+	// with results in it says what those said. A user message it is
+	// written while its calls are out it says it queued and takes into the
+	// turn, as Claude Code 2.1.296 does (#1878): a fork's directive.
 	dir := t.TempDir()
 	testenv.Program(t, filepath.Join(dir, "claude"), `#!/bin/sh
 if [ "$1" = auth ]; then echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"lead@example.com","subscriptionType":"max"}'; exit 0; fi
-cb=$(printf '%s\n' "$@" | grep -o 'http://[^"]*/_magpie/claude-mcp/[A-Za-z0-9_-]*' | head -1)
+cb=$(cat "$(printf '%s\n' "$@" | grep -o '"claude-mcp-helper","[^"]*"' | head -1 | sed 's/.*","//; s/"$//')")
 say() {
   echo '{"type":"stream_event","event":{"type":"message_start","message":{"id":"m","model":"claude-opus-5-5","usage":{"input_tokens":1}}}}'
   echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"heard:'"$1"'"}}}'
@@ -66,9 +68,17 @@ say() {
   echo '{"type":"result","subtype":"success","is_error":false,"result":""}'
 }
 marks() { grep -o 'directive [0-9]*\|agent launched' | sort -u | tr '\n' ','; }
+out=$(mktemp -d "$HOME/queued.XXXXXX")
 while read -r line; do
   case "$line" in
     *control_request*) continue ;;
+  esac
+  if [ -e "$out/calls" ]; then
+    printf '%s\n' "$line" >> "$out/queued"
+    echo '{"type":"command_lifecycle","command_uuid":"'"$(printf '%s' "$line" | sed 's/.*"uuid":"\([^"]*\)".*/\1/')"'","state":"queued"}'
+    continue
+  fi
+  case "$line" in
     *"agent launched"*|*"Fork started"*) say "$(printf '%s' "$line" | marks)"; continue ;;
   esac
   echo '{"type":"stream_event","event":{"type":"message_start","message":{"id":"m","model":"claude-opus-5-5","usage":{"input_tokens":1}}}}'
@@ -79,13 +89,19 @@ while read -r line; do
   done
   echo '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}}'
   echo '{"type":"stream_event","event":{"type":"message_stop"}}'
-  got=
-  for k in 1 2 3; do
-    call='{"tool_call_id":"toolu_L'$$'_'$k'","name":"Agent","arguments":{"part":'$k'}}'
-    got="$got $(curl -s -X POST -H 'Content-Type: application/json' --data "$call" "$cb")"
-  done
-  say "$(printf '%s' "$got" | marks)"
+  : > "$out/calls"
+  (
+    got=
+    for k in 1 2 3; do
+      call='{"tool_call_id":"toolu_L'$$'_'$k'","name":"Agent","arguments":{"part":'$k'}}'
+      got="$got $(curl -s -X POST -H 'Content-Type: application/json' --data "$call" "$cb")"
+    done
+    rm -f "$out/calls"
+    say "$(printf '%s %s' "$got" "$(cat "$out/queued" 2>/dev/null)" | marks)"
+    rm -f "$out/queued"
+  ) &
 done
+wait
 `)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	provider.ForgetAccounts()

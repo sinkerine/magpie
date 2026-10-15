@@ -18,6 +18,7 @@ type slowThinker struct {
 	events []string
 	gap    time.Duration
 	done   chan time.Time
+	sent   []time.Time // when each event was written; read after done
 }
 
 func (s *slowThinker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -28,6 +29,7 @@ func (s *slowThinker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, ev := range s.events {
 		io.WriteString(w, ev+"\n\n")
 		f.Flush()
+		s.sent = append(s.sent, time.Now())
 		time.Sleep(s.gap)
 	}
 	s.done <- time.Now()

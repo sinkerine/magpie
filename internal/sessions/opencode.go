@@ -161,7 +161,8 @@ func ocRoots(out []file, parent map[string]string) []file {
 			root = parent[root]
 		}
 		out[i].key = out[i].agent + ":" + root
-		out[i].main = parent[out[i].sid] == ""
+		out[i].parent = parent[out[i].sid]
+		out[i].main = out[i].parent == ""
 	}
 	return out
 }
@@ -171,6 +172,9 @@ func ocRoots(out []file, parent map[string]string) []file {
 // dbs are the databases open while List or Stats reads them, closed when
 // they are done (closeDBs).
 var dbs = map[string]*sql.DB{}
+
+// Snapshot readers also remove their temporary database when a scan ends.
+var dbCleanup = map[string]func(){}
 
 func openDB(path string) *sql.DB {
 	if db := dbs[path]; db != nil {
@@ -187,7 +191,12 @@ func openDB(path string) *sql.DB {
 
 func closeDBs() {
 	for p, db := range dbs {
-		db.Close()
+		if done := dbCleanup[p]; done != nil {
+			done()
+			delete(dbCleanup, p)
+		} else {
+			db.Close()
+		}
 		delete(dbs, p)
 	}
 }

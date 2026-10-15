@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -128,6 +129,10 @@ func TestRestartFinishesTheReply(t *testing.T) {
 		io.WriteString(w, "data: last\n\n")
 	}))
 	defer srv.Close()
+	// deferred after srv.Close, so it runs first: Close waits for the
+	// slow reply's handler, which a failed check would leave held (#1808)
+	let := sync.OnceFunc(func() { close(release) })
+	defer let()
 	t.Setenv("FAKE_BASE", srv.URL+"/v1")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -160,7 +165,7 @@ func TestRestartFinishesTheReply(t *testing.T) {
 	if generation.Load() == before || !strings.Contains(string(b), "last") {
 		t.Fatalf("after the restart: a new host %v, %q", generation.Load() != before, b)
 	}
-	close(release)
+	let()
 	b, err = io.ReadAll(res.Body)
 	if err != nil || !strings.Contains(string(b), "data: last") {
 		t.Fatalf("the reply streaming through the restart: %q, %v", b, err)

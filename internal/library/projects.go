@@ -46,20 +46,34 @@ type Project struct {
 // own from — only an agent that does: Claude Code its .claude/skills, and
 // those that read the shared .agents/skills (Codex from where it runs to
 // the repository's root, Gemini CLI, OpenCode, Pi, Cursor, Copilot, Antigravity,
-// Kimi Code, Goose and Grok Build) that one, so that one folder serves them all. MiMo Code, Crush, ZCode,
-// DeepSeek Harness and oh-my-pi say of no project folder magpie can rely on.
+// Kimi Code, Goose and Grok Build, Droid — docs.factory.com/cli/configuration/
+// skills — and Cline's CLI, which reads .clinerules, .cline and .agents
+// skills folders in the workspace, @cline/shared 3.0.70) that one, so that
+// one folder serves them all. Qoder (and Qoder CN) read .qoder/skills
+// (getProjectSkillsDir, @qoder-ai/qodercli 1.1.69, whose .agents/skills
+// a setting can turn off), CodeBuddy Code .codebuddy/skills
+// (getProjectSkillsDir, @tencent-ai/codebuddy-code 2.164.0) and Command
+// Code .commandcode/skills (commandcode.ai/docs/skills). MiMo Code, Crush,
+// ZCode, DeepSeek Harness and oh-my-pi say of no project folder magpie can
+// rely on.
 var projectSkillsDirs = map[string]string{
-	"claude":   ".claude/skills",
-	"codex":    ".agents/skills",
-	"gemini":   ".agents/skills",
-	"opencode": ".agents/skills",
-	"pi":       ".agents/skills",
-	"cursor":   ".agents/skills",
-	"copilot":  ".agents/skills",
-	"agy":      ".agents/skills",
-	"kimi":     ".agents/skills",
-	"goose":    ".agents/skills",
-	"grok":     ".agents/skills",
+	"claude":      ".claude/skills",
+	"codex":       ".agents/skills",
+	"gemini":      ".agents/skills",
+	"opencode":    ".agents/skills",
+	"pi":          ".agents/skills",
+	"cursor":      ".agents/skills",
+	"copilot":     ".agents/skills",
+	"agy":         ".agents/skills",
+	"kimi":        ".agents/skills",
+	"goose":       ".agents/skills",
+	"grok":        ".agents/skills",
+	"droid":       ".agents/skills",
+	"cline":       ".agents/skills",
+	"qoder":       ".qoder/skills",
+	"qoder-cn":    ".qoder/skills",
+	"codebuddy":   ".codebuddy/skills",
+	"commandcode": ".commandcode/skills",
 }
 
 // ProjectSkillsDir is the folder, in a project, an agent reads its skills
@@ -167,8 +181,17 @@ func (p *Project) place(e, name string) error {
 		}
 		link := linkEntry(fi)
 		// a copy stands for a link on Windows without the right to make one
-		if !p.Copy && link || !link && (p.Copy || runtime.GOOS == "windows") && fresh(abs, name) {
+		if !p.Copy && link {
 			return nil
+		}
+		if !link {
+			current, err := copyIsFresh(abs, hashDir(realDir(skillDir(name))), false)
+			if err != nil {
+				return err
+			}
+			if (p.Copy || runtime.GOOS == "windows") && current {
+				return nil
+			}
 		}
 	}
 	if err := p.mkdirs(filepath.Dir(abs)); err != nil {
@@ -327,7 +350,7 @@ func notGlobal(dir string) error {
 	if realDir(dir) == realDir(home()) {
 		return fmt.Errorf("the home folder's skills are every project's: give skills to the agents themselves instead")
 	}
-	for _, t := range Targets() {
+	for _, t := range everyTarget() {
 		if t.Skills == "" {
 			continue
 		}
@@ -337,7 +360,7 @@ func notGlobal(dir string) error {
 			}
 		}
 	}
-	for _, t := range Targets() {
+	for _, t := range everyTarget() {
 		if t.MCP == nil {
 			continue
 		}

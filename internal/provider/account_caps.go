@@ -41,9 +41,9 @@ const (
 )
 
 // AccountCap is the share (1–99) of its windows the account user of p is
-// used to at most, 0 when it has no cap. An account made afresh beside the
-// agent's own (AlsoOn) carries none of the provider's settings: they are
-// read from providers.json then.
+// used to at most, 0 when it has no cap. An account not had from All or
+// AlsoOn (made afresh by its sign-in) carries none of the provider's
+// settings: they are read from providers.json then.
 func (p Provider) AccountCap(user string) int {
 	caps := p.AccountCaps
 	if caps == nil {

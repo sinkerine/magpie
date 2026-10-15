@@ -11,6 +11,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"time"
+
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // firstMost is the most of a stream read for its first tokens: a reply
@@ -20,13 +22,15 @@ const firstMost = 8 << 20
 // firstToken times a stream's first content and first text from start,
 // and when the rest of its content came (flowMs).
 type firstToken struct {
-	start time.Time
-	first time.Duration // to the first content; 0 until it comes
-	text  time.Duration // to the first text
-	off   bool          // not a stream, or read as far as it is
-	began bool
-	read  int
-	pend  []byte
+	start                    time.Time
+	first                    time.Duration // to the first content; 0 until it comes
+	text                     time.Duration // to the first text
+	reasoning, lastReasoning time.Duration
+	hidden                   bool // redacted thinking cannot be timed by its visible portion
+	off                      bool // not a stream, or read as far as it is
+	began                    bool
+	read                     int
+	pend                     []byte
 	// flow: how many bytes of content events had come by each time, one
 	// mark a millisecond, from the first content on
 	flow []flowMark
@@ -75,7 +79,14 @@ func (f *firstToken) see(b []byte) {
 			}
 			continue
 		}
-		content, text := firstKind(ev)
+		content, text, reasoning, hidden := timingKind(ev)
+		f.hidden = f.hidden || hidden
+		if reasoning {
+			if f.reasoning == 0 {
+				f.reasoning = d
+			}
+			f.lastReasoning = d
+		}
 		if !content && !text {
 			continue
 		}
@@ -162,6 +173,11 @@ func (f *firstToken) ms() (first, text int64) {
 // agent speaks, carries content — text, reasoning or a tool call — and
 // whether that is text the reader sees.
 func firstKind(ev []byte) (content, text bool) {
+	content, text, _, _ = timingKind(ev)
+	return
+}
+
+func timingKind(ev []byte) (content, text, reasoning, hidden bool) {
 	var name string
 	var data []byte
 	for _, ln := range bytes.Split(ev, []byte("\n")) {
@@ -176,8 +192,8 @@ func firstKind(ev []byte) (content, text bool) {
 	// only deltas, a tool call's start and Gemini's parts carry any: the
 	// rest go by unread
 	if len(data) == 0 || !(bytes.Contains(data, []byte("delta")) || bytes.Contains(data, []byte(`"parts"`)) ||
-		bytes.Contains(data, []byte("content_block_start")) || bytes.Contains(data, []byte("output_item.added"))) {
-		return false, false
+		bytes.Contains(data, []byte("content_block_start")) || bytes.Contains(data, []byte("output_item.added")) || bytes.Contains(data, []byte("encrypted_content"))) {
+		return false, false, false, hidden
 	}
 	var v struct {
 		Type         string          `json:"type"`
@@ -186,7 +202,8 @@ func firstKind(ev []byte) (content, text bool) {
 			Type string `json:"type"`
 		} `json:"content_block"`
 		Item *struct {
-			Type string `json:"type"`
+			Type             string `json:"type"`
+			EncryptedContent string `json:"encrypted_content"`
 		} `json:"item"`
 		Choices []struct {
 			Delta struct {
@@ -209,11 +226,17 @@ func firstKind(ev []byte) (content, text bool) {
 		} `json:"candidates"`
 	}
 	if json.Unmarshal(data, &v) != nil {
-		return false, false
+		return false, false, false, hidden
 	}
 	typ := v.Type
 	if typ == "" {
 		typ = name
+	}
+	if v.Item != nil && v.Item.EncryptedContent != "" {
+		hidden = true
+	}
+	if v.ContentBlock != nil && v.ContentBlock.Type == "redacted_thinking" {
+		hidden = true
 	}
 	switch typ {
 	case "content_block_delta": // Anthropic
@@ -226,31 +249,34 @@ func firstKind(ev []byte) (content, text bool) {
 		json.Unmarshal(v.Delta, &d)
 		switch {
 		case d.Text != "":
-			return true, true
-		case d.Thinking != "", d.PartialJSON != "":
-			return true, false
+			return true, true, reasoning, hidden
+		case d.Thinking != "":
+			return true, false, true, false
+		case d.PartialJSON != "":
+			return true, false, reasoning, hidden
 		}
-		return false, false
+		return false, false, false, hidden
 	case "content_block_start":
 		if b := v.ContentBlock; b != nil && (b.Type == "tool_use" || b.Type == "server_tool_use") {
-			return true, false
+			return true, false, reasoning, hidden
 		}
-		return false, false
+		return false, false, false, hidden
 	case "response.output_text.delta", "response.refusal.delta": // Responses
-		return filled(v.Delta), filled(v.Delta)
+		return filled(v.Delta), filled(v.Delta), false, false
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta",
 		"response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
-		return filled(v.Delta), false
+		return filled(v.Delta), false, (typ == "response.reasoning_text.delta" || typ == "response.reasoning_summary_text.delta") && filled(v.Delta), false
 	case "response.output_item.added":
 		if it := v.Item; it != nil && (it.Type == "function_call" || it.Type == "custom_tool_call") {
-			return true, false
+			return true, false, reasoning, hidden
 		}
-		return false, false
+		return false, false, false, hidden
 	}
 	for _, c := range v.Choices { // Chat
 		d := c.Delta
+		reasoning = reasoning || filled(d.ReasoningContent) || filled(d.Reasoning)
 		if filled(d.Content) || filled(d.Refusal) {
-			return true, true
+			return true, true, reasoning, hidden
 		}
 		if filled(d.ReasoningContent) || filled(d.Reasoning) || filled(d.ToolCalls) || filled(d.FunctionCall) {
 			content = true
@@ -260,13 +286,14 @@ func firstKind(ev []byte) (content, text bool) {
 		for _, p := range c.Content.Parts {
 			switch {
 			case p.Text != "" && !p.Thought:
-				return true, true
+				return true, true, reasoning, hidden
 			case p.Text != "", filled(p.FunctionCall):
 				content = true
+				reasoning = reasoning || p.Thought && p.Text != ""
 			}
 		}
 	}
-	return content, false
+	return content, false, reasoning, hidden
 }
 
 // filled is a JSON value with something in it.
@@ -282,8 +309,24 @@ func filled(raw json.RawMessage) bool {
 // usage.DecodeOf counts it: its first text when it reasoned, else its
 // first content.
 func (f *firstToken) flowFor(reasoning int) int64 {
-	if reasoning > 0 {
+	if reasoning > 0 && f.text > 0 {
 		return f.flowMs(f.text.Milliseconds())
 	}
 	return f.flowMs(f.first.Milliseconds())
+}
+
+// hidesReasoning excludes sealed thinking and Responses summaries even when
+// the upstream omits a separate reasoning-token count.
+func (f *firstToken) hidesReasoning(proto provider.Protocol) bool {
+	return f.hidden || (proto == provider.Responses || proto == provider.Gemini || proto == provider.CodeAssist) && f.reasoning > 0
+}
+
+// reasoningMs requires a paced visible channel. Responses and Gemini summaries
+// do not measure their full reasoning count; translation keeps that restriction.
+func (f *firstToken) reasoningMs(proto provider.Protocol) int64 {
+	if proto != provider.Chat && proto != provider.Anthropic || f.hidden || f.off ||
+		f.reasoning == 0 || f.reasoning != f.first || f.lastReasoning-f.reasoning < 100*time.Millisecond {
+		return 0
+	}
+	return f.reasoning.Milliseconds()
 }

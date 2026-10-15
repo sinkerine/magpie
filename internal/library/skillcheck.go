@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yetone/magpie/internal/ghtoken"
 	"github.com/yetone/magpie/internal/source"
 )
 
@@ -53,10 +54,10 @@ type Limited struct {
 	Token bool   `json:"token,omitempty"`
 }
 
-func (e errLimited) view() *Limited {
-	l := &Limited{Token: e.token}
-	if !e.until.IsZero() {
-		l.Until = e.until.UTC().Format(time.RFC3339)
+func limitedView(e errLimited) *Limited {
+	l := &Limited{Token: e.Token}
+	if !e.Until.IsZero() {
+		l.Until = e.Until.UTC().Format(time.RFC3339)
 	}
 	return l
 }
@@ -82,6 +83,25 @@ func forgetCheck(name string) {
 	checks.Lock()
 	delete(checks.m, name)
 	checks.Unlock()
+}
+
+// checkedAt is when the skills were last checked for updates (unix
+// nanoseconds), 0 before the first check since magpie started.
+var checkedAt atomic.Int64
+
+// checkEvery is how long the Library page goes before it checks for
+// updates by itself, as it opens the skills (#1449).
+const checkEvery = 12 * time.Hour
+
+// checkDue is whether the page should check the library's skills from
+// GitHub for updates: none checked since magpie started, or not for
+// checkEvery.
+func checkDue(l *Library) bool {
+	if !slices.ContainsFunc(l.Skills, func(s *Skill) bool { return s.Source != nil && s.Source.Kind == "github" }) {
+		return false
+	}
+	at := checkedAt.Load()
+	return at == 0 || time.Since(time.Unix(0, at)) >= checkEvery
 }
 
 // commit is one commit as GitHub's API lists it.
@@ -114,12 +134,7 @@ func lastCommit(src Source) (*commit, error) {
 	}
 	switch {
 	case code == 401 && token:
-		_, from := GitHubToken()
-		where := "the GitHub token in Settings → Network and sharing"
-		if from != "settings" {
-			where = from + " (no GitHub token is set in Settings → Network and sharing)"
-		}
-		return nil, fmt.Errorf("GitHub refused %s: it may have expired or been revoked", where)
+		return nil, ghtoken.Refused()
 	case code == 404, code == 422:
 		if src.Ref != "" {
 			return nil, fmt.Errorf("GitHub has no %s at %s any more", src.Repo, src.Ref)
@@ -177,8 +192,21 @@ func apiGet(u string) ([]byte, int, bool, error) {
 
 // hashDir is a hash of a skill's files, their names and what's in them,
 // as copyDir copies them.
-func hashDir(dir string) string {
+func hashDir(dir string) string { return hashFiles(dir, false) }
+
+// hashFiles is hashDir, leaving aside the .DS_Store files Finder leaves in
+// a folder it shows when noFinder is set. A folder unchanged since it was
+// last hashed isn't read again (treememo.go).
+func hashFiles(dir string, noFinder bool) string {
+	return rememberedHash(dir, noFinder)
+}
+
+// hashWalk walks dir as hashFiles reads it, stamping each file and link
+// it would hash (treememo.go); with read, it also hashes their bytes. ok
+// is false when it can't be walked, or a file can't be read.
+func hashWalk(dir string, noFinder, read bool) (hash, stamp string, settled, ok bool) {
 	h := sha256.New()
+	st := newStamper()
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -191,15 +219,30 @@ func hashDir(dir string) string {
 				return filepath.SkipDir
 			}
 		case d.Type()&fs.ModeSymlink != 0:
-			t, _ := os.Readlink(p)
-			fmt.Fprintf(h, "link %s %s\n", rel, filepath.ToSlash(t))
-		case d.Type().IsRegular() && rel != marker:
+			fi, err := d.Info()
+			if err != nil {
+				return err
+			}
+			st.add(rel, fi)
+			if read {
+				t, _ := os.Readlink(p)
+				fmt.Fprintf(h, "link %s %s\n", rel, filepath.ToSlash(t))
+			}
+		case d.Type().IsRegular() && rel != marker && !(noFinder && d.Name() == ".DS_Store"):
+			fi, err := d.Info()
+			if err != nil {
+				return err
+			}
+			st.add(rel, fi)
+			if !read {
+				return nil
+			}
 			f, err := os.Open(p)
 			if err != nil {
 				return err
 			}
 			defer f.Close()
-			fi, _ := f.Stat()
+			fi, _ = f.Stat()
 			fmt.Fprintf(h, "file %s %d\n", rel, fi.Size())
 			if _, err := io.Copy(h, f); err != nil {
 				return err
@@ -208,9 +251,13 @@ func hashDir(dir string) string {
 		return nil
 	})
 	if err != nil {
-		return ""
+		return "", "", false, false
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	stamp, settled = st.done()
+	if read {
+		hash = hex.EncodeToString(h.Sum(nil))
+	}
+	return hash, stamp, settled, true
 }
 
 func firstLine(s string) string {
@@ -304,6 +351,7 @@ func CheckSkills() ([]SkillCheck, error) {
 		checks.m[c.Name] = c
 	}
 	checks.Unlock()
+	checkedAt.Store(time.Now().UnixNano())
 	if out == nil {
 		out = []SkillCheck{}
 	}
@@ -320,7 +368,7 @@ func checkSkill(s *Skill, f *fetcher, asked map[string]*commit, limited *atomic.
 	last := asked[key]
 	if last == nil {
 		if e := limited.Load(); e != nil {
-			c.Error, c.Limited = e.Error(), e.view()
+			c.Error, c.Limited = e.Error(), limitedView(*e)
 			return c, "", ""
 		}
 		var err error
@@ -329,7 +377,7 @@ func checkSkill(s *Skill, f *fetcher, asked map[string]*commit, limited *atomic.
 			var e errLimited
 			if errors.As(err, &e) {
 				limited.Store(&e)
-				c.Limited = e.view()
+				c.Limited = limitedView(e)
 			}
 			c.Error = err.Error()
 			return c, "", ""

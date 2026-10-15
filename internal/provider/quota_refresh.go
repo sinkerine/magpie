@@ -23,7 +23,10 @@ var quotaReadSequence atomic.Uint64
 
 // quotaReading orders reads when they start, not when the vendor answers.
 // A card refresh shares its order across the three kinds of usage.
+// A read the user didn't ask for, while they have allowances read only
+// when asked, sends nothing (holdUnasked).
 func quotaReading(ctx context.Context) (context.Context, uint64) {
+	ctx = holdUnasked(ctx)
 	if seq, ok := ctx.Value(quotaReadKey{}).(uint64); ok {
 		return ctx, seq
 	}
@@ -91,22 +94,58 @@ func forgetLoginReading(l Login) {
 // balance, and keeps it with the others, which aren't asked. The next
 // Quotas has it.
 func RefreshUsage(ctx context.Context, provider, user string) {
+	refreshCards(ctx, provider, user)
+}
+
+// RefreshReport is RefreshUsage answering the cards it read, as
+// QuotaReport tells them: magpie quota refresh (#2104), which reads the
+// card the Usage page's refresh button does and shows only it. A process
+// that has read no other card yet (the CLI) has nothing to merge it into,
+// so the cards come from the read itself, not from the caches.
+func RefreshReport(ctx context.Context, provider, user string, now time.Time) []Quota {
+	subs, plans, balances := refreshCards(ctx, provider, user)
+	plans, subs = seatCards(plans, subs)
+	subs = withAccountNames(subs)
+	return withServed(quotaReport(subs, plans, balances, now), LastServed())
+}
+
+// refreshCards is RefreshUsage, with the cards it read: only the asked
+// card's provider (and account), each kind apart.
+func refreshCards(ctx context.Context, provider, user string) (subs, plans, balances []SubscriptionQuota) {
 	// a remote magpie's card is read again there (remote_quotas.go)
 	if p, card, ok := remoteOf(provider); ok {
 		refreshRemote(ctx, p, card, user)
-		return
+		for _, q := range append(remoteCards(ctx, p, false), remoteKeyCards(ctx, p, false, "")...) {
+			if card != "" && !strings.EqualFold(q.Provider, provider) || user != "" && !strings.EqualFold(q.User, user) {
+				continue
+			}
+			switch q.Kind {
+			case "plan":
+				plans = append(plans, q)
+			case "balance":
+				balances = append(balances, q)
+			default:
+				subs = append(subs, q)
+			}
+		}
+		return subs, plans, balances
 	}
 	r := cardRefresh{provider, user}
-	ctx = context.WithValue(ctx, cardRefreshKey{}, r)
+	ctx = context.WithValue(Asked(ctx), cardRefreshKey{}, r) // a card's refresh is the user asking
 	ctx, seq := quotaReading(ctx)
 	if provider == "claude" {
 		// Claude Code's /usage, run when the user asks (claudeWindows)
-		claudeAsked.Store(time.Now().UnixNano())
+		markClaudeUsageAsked()
+	}
+	// what PlanQuotas and KeyBalances answer of a card read again is
+	// that read's cards alone; kept to the card asked all the same
+	asked := func(qs []SubscriptionQuota) []SubscriptionQuota {
+		return slices.DeleteFunc(slices.Clone(qs), func(q SubscriptionQuota) bool { return !r.wants(q.Provider, q.User) })
 	}
 	var wg sync.WaitGroup
 	wg.Add(3)
-	go func() { defer wg.Done(); PlanQuotas(ctx) }()
-	go func() { defer wg.Done(); KeyBalances(ctx) }()
+	go func() { defer wg.Done(); plans = asked(PlanQuotas(ctx)) }()
+	go func() { defer wg.Done(); balances = asked(KeyBalances(ctx)) }()
 	go func() {
 		defer wg.Done()
 		out := fetchSubscriptionUsage(ctx)
@@ -117,8 +156,10 @@ func RefreshUsage(ctx context.Context, provider, user string) {
 		c.Lock()
 		c.data = cacheCards(c.data, out, seq, true)
 		c.Unlock()
+		subs = out
 	}()
 	wg.Wait()
+	return subs, plans, balances
 }
 
 // cacheCards commits a batch without overwriting cards read by a newer

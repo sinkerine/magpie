@@ -651,3 +651,84 @@ func TestAntigravityModelsAsItListsThem(t *testing.T) {
 		t.Errorf("offered %v\nwant %s", offered, w)
 	}
 }
+
+// Antigravity lists gemini-2.5-flash and gemini-2.5-flash-lite under the
+// name of the model it moved their users to, tagged with that model's id,
+// beside that model itself (kchen0x's fetchAvailableModels, #1918); each id
+// is still answered by its own model. Each is named for its own id, in the
+// list and in Usage's windows, so no two read the same; a level tagged
+// with its own family keeps the name it was given.
+func TestAntigravityRetiredModelNamedForItself(t *testing.T) {
+	f := &fakeGoogle{
+		load:    `{"allowedTiers":[{"id":"free-tier","name":"Antigravity","isDefault":true}]}`,
+		onboard: `{"done":true,"response":{"cloudaicompanionProject":"ag-proj"}}`,
+		models: `{"models":{
+  "gemini-2.5-flash": {
+    "displayName": "Gemini 3.5 Flash Lite",
+    "tagDescription": "gemini-3.5-flash-lite",
+    "model": "MODEL_GOOGLE_GEMINI_2_5_FLASH",
+    "maxTokens": 1048576,
+    "maxOutputTokens": 65535,
+    "supportsImages": true
+  },
+  "gemini-2.5-flash-lite": {
+    "displayName": "Gemini 3.5 Flash Lite",
+    "tagDescription": "gemini-3.5-flash-lite",
+    "model": "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE",
+    "maxTokens": 1048576,
+    "maxOutputTokens": 65535,
+    "supportsImages": true
+  },
+  "gemini-2.5-flash-thinking": {
+    "displayName": "Gemini 3.5 Flash Lite",
+    "tagDescription": "gemini-3.5-flash-lite",
+    "model": "MODEL_GOOGLE_GEMINI_2_5_FLASH_THINKING"
+  },
+  "gemini-3.5-flash-lite": {
+    "displayName": "Gemini 3.5 Flash Lite",
+    "tagDescription": "gemini-3.5-flash-lite",
+    "model": "MODEL_PLACEHOLDER_M198",
+    "maxTokens": 1048576,
+    "maxOutputTokens": 65535,
+    "supportsImages": true
+  },
+  "gemini-3.7-flash": {"displayName": "Gemini 3.7 Flash", "tagDescription": "gemini-3.7-flash", "quotaInfo": {"remainingFraction": 1}},
+  "gemini-3.7-flash-low": {"displayName": "Gemini 3.7 Flash", "tagDescription": "gemini-3.7-flash", "quotaInfo": {"remainingFraction": 1}}
+}}`,
+	}
+	googleSandbox(t, f)
+	auth := googleAuth{AccessToken: "tok", RefreshToken: "rt-ag", Expiry: time.Now().Add(time.Hour).UnixMilli()}
+	if err := addGoogleLogin("antigravity", "ag@example.com", "", auth); err != nil {
+		t.Fatal(err)
+	}
+	acct := googleLogins("antigravity")[0].acct
+	ms, err := acct.models(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	for _, m := range collapseAntigravityModels(catalog.Decorate(ms, nil)) {
+		names[m.ID] = m.Name
+	}
+	if names["gemini-3.5-flash-lite"] != "Gemini 3.5 Flash Lite" {
+		t.Errorf("gemini-3.5-flash-lite is named %q", names["gemini-3.5-flash-lite"])
+	}
+	for _, id := range []string{"gemini-2.5-flash", "gemini-2.5-flash-lite"} {
+		if n := names[id]; n == "" || strings.Contains(n, "3.5") {
+			t.Errorf("%s is named %q, not for itself", id, n)
+		}
+	}
+	if names["gemini-2.5-flash"] == names["gemini-2.5-flash-lite"] {
+		t.Errorf("two models read the same: %v", names)
+	}
+	for _, m := range ms {
+		if strings.HasPrefix(m.ID, "gemini-3.7-flash") && m.Name != "Gemini 3.7 Flash" {
+			t.Errorf("%s, a level of the model its tag names, is named %q", m.ID, m.Name)
+		}
+	}
+	for _, w := range acct.quota(context.Background(), "").Windows {
+		if strings.HasPrefix(w.Model, "gemini-2.5") && strings.Contains(w.Name, "3.5") {
+			t.Errorf("Usage's window for %s is named %q", w.Model, w.Name)
+		}
+	}
+}

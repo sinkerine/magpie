@@ -24,6 +24,10 @@ const REQUEST_KINDS = {
     "purpose": "kind:compact",
     "name": "Compaction"
   },
+  "composer_predictions": {
+    "purpose": "kind:composer_predictions",
+    "name": "Prediction"
+  },
   "guardian": {
     "purpose": "kind:guardian",
     "name": "Approval check"
@@ -51,6 +55,14 @@ const REQUEST_KINDS = {
   "review": {
     "purpose": "kind:review",
     "name": "Review"
+  },
+  "routing": {
+    "purpose": "kind:routing",
+    "name": "Routing classifier"
+  },
+  "thread_description": {
+    "purpose": "kind:thread_description",
+    "name": "Description"
   },
   "thread_spawn": {
     "purpose": "kind:collab_spawn",

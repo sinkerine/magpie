@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -553,6 +554,17 @@ var (
 	onChangeMu sync.Mutex
 )
 
+// telling counts the hooks told of a change or of a sign-in (OnChange,
+// OnSignIn) that are still running, for Told. It is a count, not a WaitGroup: a host can tell a change while
+// Told waits.
+var telling struct {
+	sync.Mutex
+	*sync.Cond
+	n int
+}
+
+func init() { telling.Cond = sync.NewCond(&telling.Mutex) }
+
 // OnChange registers f to be told when a plugin sign-in or the plugins
 // change (a sign-in saved or refreshed, a plugin added).
 func OnChange(f func()) {
@@ -581,8 +593,25 @@ func changed() {
 	fs := append([]func(){}, onChange...)
 	onChangeMu.Unlock()
 	for _, f := range fs {
-		go f()
+		tell(f)
 	}
+}
+
+// tell runs a hook in the background, counted in telling until it ends.
+func tell(f func()) {
+	telling.Lock()
+	telling.n++
+	telling.Unlock()
+	go func() {
+		defer func() {
+			telling.Lock()
+			if telling.n--; telling.n == 0 {
+				telling.Broadcast()
+			}
+			telling.Unlock()
+		}()
+		f()
+	}()
 }
 
 // Restart stops the host, so the next call starts one with the plugins
@@ -747,8 +776,14 @@ func start(ctx context.Context) (*host, error) {
 		return nil, err
 	}
 	h, crashed, err := startOn(ctx, bun)
+	if crashed {
+		err = whyDied(ctx, bun, err)
+	}
 	if err == nil || !crashed || os.Getenv("MAGPIE_BUN") != "" {
-		return h, err
+		// a Bun that can't be started at all isn't fallen back from: the
+		// one before is the same build for this system, and setting this
+		// one aside would mark a good version bad (#1877)
+		return h, cantStart(bun, err)
 	}
 	// the Bun magpie last took died starting the host: the one before it,
 	// and the new one set aside when that one starts it
@@ -762,6 +797,28 @@ func start(ctx context.Context) (*host, error) {
 	}
 	setAside(filepath.Base(filepath.Dir(bun)), fmt.Sprintf("the plugin host died on it: %s", err))
 	return h, nil
+}
+
+var (
+	catalogSyncing  sync.WaitGroup
+	catalogCancelMu sync.Mutex
+	catalogCancels  = map[int]context.CancelFunc{}
+	catalogCancelID int
+	syncCatalog     = catalog.SyncIfMissing // a var for tests
+)
+
+func cancelCatalogSyncs() {
+	catalogCancelMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(catalogCancels))
+	for _, c := range catalogCancels {
+		cancels = append(cancels, c)
+	}
+	catalogCancels = map[int]context.CancelFunc{}
+	catalogCancelMu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
+	catalogSyncing.Wait()
 }
 
 // startOn starts the host on the bun given; crashed is whether it died
@@ -780,10 +837,28 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 	}
 	if catalog.Source() == "" {
 		// a plugin's provider has the models models.dev lists for it, as in
-		// OpenCode; a magpie that has never fetched them does first
-		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		_ = catalog.Sync(cctx)
-		cancel()
+		// OpenCode; sync in the background so starting the host never stalls
+		// on models.dev (#1922, #1928).
+		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		catalogCancelMu.Lock()
+		catalogCancelID++
+		id := catalogCancelID
+		catalogCancels[id] = cancel
+		catalogCancelMu.Unlock()
+
+		catalogSyncing.Add(1)
+		go func() {
+			defer catalogSyncing.Done()
+			defer func() {
+				catalogCancelMu.Lock()
+				delete(catalogCancels, id)
+				catalogCancelMu.Unlock()
+				cancel()
+			}()
+			if err := syncCatalog(cctx); err == nil {
+				forgetProviders()
+			}
+		}()
 	}
 	// the host outlives the request that started it
 	proxy := hostProxy(env()) // what bunCommand gives it
@@ -819,13 +894,8 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 		proxy:    proxy,
 		proxyAt:  time.Now(),
 	}
-	go func() {
-		sc := bufio.NewScanner(stderr)
-		sc.Buffer(make([]byte, 64<<10), 4<<20)
-		for sc.Scan() {
-			log.Printf("plugin: %s", sc.Text())
-		}
-	}()
+	go drainStderr(stderr)
+
 	go h.read(out)
 	go h.writerLoop()
 	go h.ctrlLoop()
@@ -839,9 +909,9 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 	}
 	var items []item
 	for _, e := range l.Plugins {
-		// a plugin that is only gateway middleware runs in the gateway
-		// (internal/middleware), not here
-		if _, only := Middleware(Target(e.Spec)); !e.Off && !only {
+		// a plugin that is only gateway middleware or an agent runs in
+		// magpie (internal/middleware, internal/agentplug), not here
+		if !e.Off && !InMagpieOnly(Target(e.Spec)) {
 			items = append(items, item{e.Spec, Target(e.Spec), e.Options})
 		}
 	}
@@ -850,13 +920,18 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 	}
 	ictx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
+	catalogPath := catalog.Source()
+	if catalogPath == "" {
+		catalogPath = catalog.CachePath()
+	}
 	err = h.call(ictx, "init", map[string]any{
 		"authPath":      AuthPath(),
-		"modelsDevPath": catalog.Source(),
+		"modelsDevPath": catalogPath,
 		"piPath":        pi,
 		"directory":     settings.Dir(),
 		"config":        l.Config,
 		"prefer":        l.Prefer,
+		"options":       settings.Load().PluginOptions,
 		"plugins":       items,
 	}, &res)
 	if err != nil {
@@ -871,6 +946,21 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 		}
 	}
 	return h, false, nil
+}
+
+// drainStderr logs the child's stderr a line at a time. A line over 4 MiB
+// stops the scanner; the rest is read and dropped, so the child is never left
+// blocked on a pipe nobody reads, and the log says from where.
+func drainStderr(r io.Reader) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		log.Printf("plugin: %s", sc.Text())
+	}
+	if errors.Is(sc.Err(), bufio.ErrTooLong) {
+		log.Printf("plugin: a stderr line over 4 MiB; the plugin's stderr is dropped from here on")
+	}
+	io.Copy(io.Discard, r)
 }
 
 func (h *host) read(out io.Reader) {
@@ -925,6 +1015,10 @@ func (h *host) dispatch(m message) {
 		switch m.Event {
 		case "auth":
 			changed()
+		case "recovered":
+			// the host read plugin-auth.json from its last good
+			// generation (#1505): the GUI says so
+			lastgood.Noted(AuthPath(), m.Said)
 		case "renewing":
 			h.renewing.Store(int32(m.Count))
 		case "signIn":
@@ -932,7 +1026,9 @@ func (h *host) dispatch(m message) {
 			f := onSignIn
 			onSignInMu.Unlock()
 			if f != nil {
-				go f(m.Provider, m.Account, m.Said)
+				// counted, so Told waits for it: it writes the
+				// account's lapse into logins.json (#1935)
+				tell(func() { f(m.Provider, m.Account, m.Said) })
 			}
 		case "toast":
 			log.Printf("plugin: %s %s", m.Title, m.Message)
@@ -1286,6 +1382,11 @@ func Call(ctx context.Context, method string, params, out any) error {
 // Background listings allow the host its own startup budget. The optional
 // timeout begins only after initialization and bounds just the requested RPC.
 func callWithTimeout(ctx context.Context, method string, params, out any, timeout time.Duration) error {
+	// a read the user didn't ask for, held back (#1518): the plugin isn't
+	// asked either, nor does its host start for it
+	if err := netproxy.Held(ctx); err != nil {
+		return err
+	}
 	startup := ctx
 	if timeout > 0 {
 		startup = context.WithoutCancel(ctx)
@@ -1366,7 +1467,24 @@ func hostProxy(env []string) string {
 
 // proxyLookEvery is how often get asks whether the proxy moved: the
 // system's is read again at most every 15 seconds anyway (netproxy.System).
-var proxyLookEvery = 15 * time.Second
+// A host started with none asks every 2 seconds, as netproxy reads the
+// system's again then: at login the proxy app comes up after magpie
+// (#1518), and the host's requests went direct until it was asked.
+var (
+	proxyLookEvery = 15 * time.Second
+	proxyLookNone  = 2 * time.Second
+)
+
+// proxied is whether a hostProxy names a proxy at all.
+func proxied(hp string) bool {
+	for _, e := range strings.Split(hp, "\x00") {
+		k, v, _ := strings.Cut(e, "=")
+		if v != "" && !strings.EqualFold(k, "NO_PROXY") {
+			return true
+		}
+	}
+	return false
+}
 
 // proxyMoved is whether magpie's proxy is no longer the one h was started
 // with (#1363): host.js reads it once, so a host started at login before
@@ -1377,7 +1495,11 @@ var proxyLookEvery = 15 * time.Second
 // changed in Settings never reached a running host either. Called under
 // hostMu.
 func (h *host) proxyMoved() bool {
-	if h.proxyAt.IsZero() || time.Since(h.proxyAt) < proxyLookEvery {
+	every := proxyLookEvery
+	if !proxied(h.proxy) {
+		every = min(every, proxyLookNone)
+	}
+	if h.proxyAt.IsZero() || time.Since(h.proxyAt) < every {
 		return false
 	}
 	h.proxyAt = time.Now()
@@ -1407,6 +1529,9 @@ func hostEnv(env []string) []string {
 // Fetch sends r through the provider's plugin — its loader's fetch, or
 // Bun's own when it gives none — and streams back the reply.
 func Fetch(ctx context.Context, r FetchRequest) (*http.Response, error) {
+	if err := netproxy.Held(ctx); err != nil {
+		return nil, err
+	}
 	h, err := get(ctx)
 	if err != nil {
 		return nil, err

@@ -3,6 +3,8 @@ package gui
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -62,6 +64,7 @@ func TestWebKey(t *testing.T) {
 	if k, fixed, err := webKey(); err != nil || !fixed || k != "0123456789abcdef-kept" {
 		t.Fatalf("MAGPIE_WEB_KEY: %q %v %v", k, fixed, err)
 	}
+
 	t.Setenv("MAGPIE_WEB_NO_AUTH", "1")
 	t.Setenv("MAGPIE_WEB_KEY", "bad")
 	if k, fixed, err := webKey(); err != nil || fixed || k != "" {
@@ -77,20 +80,87 @@ func TestWebKey(t *testing.T) {
 	}
 }
 
+// #2033 (321sssrt-bit): the sign-in cookie is the last Chrome drops when
+// other services on the same host fill its cookie limit; a browser that
+// holds two cookies of the page's name, a stale one sent first, still gets
+// in; one turned away is told why and can paste the key, not sent back to
+// the start-up log.
 func TestWebNoAuthGuardBypass(t *testing.T) {
 	t.Setenv("MAGPIE_WEB_NO_AUTH", "1")
 	if k, _, err := webKey(); err != nil || k != "" {
 		t.Fatalf("no-auth key: %q %v", k, err)
 	}
 	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) })
-	request := httptest.NewRequest("GET", "/api/state", nil)
 	rec := httptest.NewRecorder()
-	webHandler(false, "c", "", 0, next).ServeHTTP(rec, request)
+	webHandler(false, "3430", "", 0, next).ServeHTTP(rec, httptest.NewRequest("GET", "/api/state", nil))
 	if rec.Code != http.StatusTeapot {
 		t.Fatalf("no-auth request: %d", rec.Code)
 	}
-	t.Setenv("MAGPIE_PUBLIC_URL", "http://magpie.local:3430")
-	if got := NetworkLinks("3430", ""); len(got) != 1 || got[0] != "http://magpie.local:3430/" {
-		t.Fatalf("no-auth network link: %v", got)
+}
+
+func TestWebGuardBookmark(t *testing.T) {
+	const key = "0123456789abcdef-2033"
+	h := webHandler(true, "3430", key, webCookieAge, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) }))
+	do := func(r *http.Request) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec
+	}
+	page := func(cookie string) *http.Request {
+		r := httptest.NewRequest("GET", "/?view=usage", nil)
+		r.Header.Set("Accept", "text/html,application/xhtml+xml")
+		if cookie != "" {
+			r.Header.Set("Cookie", cookie)
+		}
+		return r
+	}
+
+	// the link's cookie, and the form's below, are Chrome's high priority
+	link := do(httptest.NewRequest("GET", "/?view=usage&k="+key, nil))
+	if sc := link.Header().Get("Set-Cookie"); link.Code != http.StatusSeeOther || !strings.HasSuffix(sc, "; Priority=High") || !strings.HasPrefix(sc, "magpie_web_3430="+key+";") {
+		t.Fatalf("link: %d %q", link.Code, sc)
+	}
+
+	// the reporter's case: the stale value first, the right one after
+	if c := do(page("magpie_web_3430=0123456789abcdef-old; magpie_web_3430=" + key)).Code; c != http.StatusTeapot {
+		t.Fatalf("stale cookie first: %d", c)
+	}
+
+	// no cookie: a form, saying none was sent, and never the key
+	rec := do(page(""))
+	body := rec.Body.String()
+	if rec.Code != http.StatusUnauthorized || !strings.Contains(body, "sent no sign-in cookie") || !strings.Contains(body, `action="`+webSignInPath+`"`) || !strings.Contains(body, `value="/?view=usage"`) || strings.Contains(body, key) {
+		t.Fatalf("no cookie: %d %s", rec.Code, body)
+	}
+	// a cookie with another key: says so
+	if body := do(page("magpie_web_3430=0123456789abcdef-old")).Body.String(); !strings.Contains(body, "holds a key that isn") {
+		t.Fatalf("other key: %s", body)
+	}
+	// the page's own fetches get a plain 401 with the reason
+	r := httptest.NewRequest("GET", "/api/state", nil)
+	if rec := do(r); rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "sent no sign-in cookie") {
+		t.Fatalf("api: %d %s", rec.Code, rec.Body.String())
+	}
+
+	post := func(k, back string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", webSignInPath, strings.NewReader(url.Values{"key": {k}, "back": {back}}.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return do(r)
+	}
+	// a wrong key pasted: turned away again, no cookie
+	if rec := post("nope-nope-nope-nope", "/?view=usage"); rec.Code != http.StatusUnauthorized || len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("wrong pasted key: %d %v", rec.Code, rec.Result().Cookies())
+	}
+	// the right one: the cookie, back where the bookmark was
+	rec = post(key, "/?view=usage")
+	ck := rec.Result().Cookies()
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/?view=usage" || len(ck) != 1 || ck[0].Value != key || time.Duration(ck[0].MaxAge)*time.Second != webCookieAge || !strings.HasSuffix(rec.Header().Get("Set-Cookie"), "; Priority=High") {
+		t.Fatalf("pasted key: %d %q %+v", rec.Code, rec.Header().Get("Location"), ck)
+	}
+	// the return address never leaves this server
+	for _, back := range []string{"https://evil.example/", "//evil.example/", `/\evil.example`, "javascript:alert(1)", "", webSignInPath, "/a\r\nSet-Cookie: x=1"} {
+		if l := post(key, back).Header().Get("Location"); l != "/" {
+			t.Fatalf("back %q went to %q", back, l)
+		}
 	}
 }

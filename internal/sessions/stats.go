@@ -19,16 +19,27 @@ type Stats struct {
 	// spent in it, the most recently active first. Too many to send the
 	// page over a long range: Overview sums them up.
 	Sessions []Summary `json:"-"`
+	// Keys are those sessions' keys, agent:id, in the same order: which of
+	// the sessions the page lists were at work in the range. The list is
+	// every session ever, so without them it guessed from each one's last
+	// line — and a session whose last line is a setting or a fork's seed,
+	// written long after its last call, was listed but not counted.
+	Keys []string `json:"keys"`
 }
 
 // Summary is one session's share of a range.
 type Summary struct {
-	Key   string    `json:"key"` // agent:id as its files are grouped, for Get
-	Agent string    `json:"agent"`
-	ID    string    `json:"id"`
-	Cwd   string    `json:"cwd"`
-	Title string    `json:"title"`
-	Last  time.Time `json:"last"`
+	Key           string        `json:"key"` // agent:id as its files are grouped, for Get
+	Agent         string        `json:"agent"`
+	ID            string        `json:"id"`
+	Cwd           string        `json:"cwd"`
+	Title         string        `json:"title"`
+	Nickname      string        `json:"nickname,omitempty"`
+	Last          time.Time     `json:"last"`
+	Role          string        `json:"role,omitempty"`
+	ParentSession string        `json:"parent_session,omitempty"`
+	RootSession   string        `json:"root_session,omitempty"`
+	ModelEffort   []ModelEffort `json:"model_effort,omitempty"`
 	Tokens
 	Cost   float64  `json:"cost"`
 	Priced bool     `json:"priced"` // every model it used has a price
@@ -101,7 +112,7 @@ func statsAt(days int, now time.Time) Stats {
 		since = today.AddDate(0, 0, 1-days)
 		from = since.Format(time.DateOnly)
 	}
-	out := Stats{From: from, To: today.Format(time.DateOnly), Days: []Day{}, Sessions: []Summary{}}
+	out := Stats{From: from, To: today.Format(time.DateOnly), Days: []Day{}, Sessions: []Summary{}, Keys: []string{}}
 
 	dbReadMu.Lock()
 	defer dbReadMu.Unlock()
@@ -113,6 +124,8 @@ func statsAt(days int, now time.Time) Stats {
 	// every changed file, whatever the range, so a wider range picked later
 	// finds them read rather than starting another run
 	refresh(files, files)
+	identities := codexIdentitySnapshot(files)
+	taskTitles := codexSubagentTaskTitles(files)
 	var want []file
 	for _, f := range files {
 		if !f.mod.Before(since) {
@@ -210,6 +223,10 @@ func statsAt(days int, now time.Time) Stats {
 			}
 			sh.prompts += d.Prompts
 			sh.replies += d.Replies
+			if d.Prompts+d.Replies > 0 {
+				sh.dates[date] = true
+				dates[date] = true
+			}
 			pd.messages += d.Prompts + d.Replies
 			for name, n := range d.Tools {
 				sh.tools[name] += n
@@ -293,8 +310,11 @@ func statsAt(days int, now time.Time) Stats {
 		if !ok {
 			continue
 		}
+		setSessionCodexIdentity(&s, identities)
+		setSessionCodexTaskTitle(&s, taskTitles)
 		sum := Summary{Key: key, Agent: s.Agent, ID: s.ID, Cwd: cmp.Or(folder[key], s.Cwd), Title: clip(s.Title, 160),
-			Last: s.Last, Priced: true, Active: sh.active / 1000, Models: []string{}, Days: []int{},
+			Nickname: s.Nickname,
+			Last:     s.Last, Role: s.Role, ParentSession: s.ParentSession, RootSession: s.RootSession, Priced: true, Active: sh.active / 1000, Models: []string{}, Days: []int{},
 			Prompts: sh.prompts, Replies: sh.replies, tools: sh.tools, skills: sh.skills, skillLast: sh.skillLast,
 			perDay: map[int]*summaryDay{}}
 		for _, n := range sh.tools {
@@ -337,6 +357,10 @@ func statsAt(days int, now time.Time) Stats {
 		}
 		return a.Key < b.Key
 	})
+	// keys after the sort, so they name the sessions in the order they are in
+	for _, s := range out.Sessions {
+		out.Keys = append(out.Keys, s.Key)
+	}
 	return out
 }
 

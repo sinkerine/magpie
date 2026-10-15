@@ -31,7 +31,7 @@ func TestLoginSwitchKeepsEachAccountItself(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
 	pl := planned{order: make([]Weighed, 2)}
 	_, _, _, key := affine("t", provider.AffinitySession, false, h, provider.Anthropic, body, []candidate{a, b}, pl)
-	answered(key, a, 1, 0)
+	answered(key, a, 1, Usage{})
 	servedCandidate(a, 5000)
 
 	// signed in to b now

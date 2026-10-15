@@ -65,7 +65,7 @@ const W = {
   },
   zh: {
     asks: "跟随 Claude Code 请求的推理强度", effort: (tier) => tier + " 推理强度", title: "haiku 推理强度", def: "默认", low: "低", high: "高",
-    sub: "子 agent 推理强度：默认\n跟随 Claude Code 请求的推理强度", sep: (l, v) => `${l}：${v}`,
+    sub: "子代理推理强度：默认\n跟随 Claude Code 请求的推理强度", sep: (l, v) => `${l}：${v}`,
   },
 };
 

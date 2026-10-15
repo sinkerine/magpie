@@ -296,6 +296,41 @@ func TestAutoModeReviewOnlyForClaude(t *testing.T) {
 	}
 }
 
+// TestAutoModeReviewedRoutes: the models whose requests can carry auto
+// mode's review to Anthropic, the rule Claude Code's wiring turns the
+// review off by while none of them is behind magpie (1EFLOPS on X): the
+// Claude subscription, a Claude model under any vendor's spelling of it,
+// and Anthropic's own API. Codex, DeepSeek's Anthropic API and an
+// OpenAI-compatible relay's GPT are not.
+func TestAutoModeReviewedRoutes(t *testing.T) {
+	sub := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	codex := provider.Provider{ID: "codex", Account: &provider.Account{Agent: "codex", User: "u"}}
+	anthropic := provider.Provider{ID: "anthropic", Anthropic: "https://api.anthropic.com", Key: "k"}
+	relay := provider.Provider{ID: "or", Chat: "https://openrouter.ai/api/v1", Anthropic: "https://openrouter.ai/api", Key: "k"}
+	deepseek := provider.Provider{ID: "ds", Anthropic: "https://api.deepseek.com/anthropic", Key: "k"}
+	for _, c := range []struct {
+		p     provider.Provider
+		model string
+		want  bool
+	}{
+		{sub, "claude-opus-4-8", true},
+		{sub, "", true},
+		{anthropic, "claude-sonnet-5", true},
+		{anthropic, "some-new-name", true},
+		{relay, "anthropic/claude-sonnet-5", true},
+		{relay, "us.anthropic.claude-opus-4-8-v1:0", true},
+		{relay, "claude-opus-4-8@20260101", true},
+		{codex, "gpt-6.1-sol", false},
+		{deepseek, "deepseek-v4", false},
+		{relay, "openai/gpt-6", false},
+		{relay, "claudette-7", false},
+	} {
+		if got := AutoModeReviewed(c.p, c.model); got != c.want {
+			t.Errorf("%s/%s: %v, want %v", c.p.ID, c.model, got, c.want)
+		}
+	}
+}
+
 // A provider that turned the beta away (Bedrock's runtime: Unexpected
 // value(s) for the anthropic-beta header) is asked again without it, and
 // without the safeguards it turns on, which it would turn away next.
@@ -698,7 +733,7 @@ func TestClaudeBridgeSafeguardConcurrentHandoff(t *testing.T) {
 	}
 	blocked("a")
 	waiter := run.pending["a"]
-	segment, err := run.continueWith(results, nil)
+	segment, err := run.continueWith(results, "", nil)
 	if err != nil || (<-waiter).Content[0]["text"] != "A" {
 		t.Fatalf("first handoff: %v", err)
 	}

@@ -16,8 +16,16 @@ import (
 
 // Bound a single body and its read time without limiting how long a client
 // may wait for a provider slot or how many streams a team gateway may serve.
+//
+// The limit is on the decoded body. Codex sends the whole conversation on
+// every turn, its screenshots inline as base64, and zstd-compressed to a
+// ChatGPT account, which magpie compresses again on the way out: a long
+// session that read many images went past 128 MB decoded and got magpie's
+// 413 on every retry, while the same turn is a fraction of that on the
+// wire (NeoPengZhile, #1422). 512 MB leaves such a session room and still
+// bounds what one request may hold in memory.
 const (
-	defaultBodyLimit   = 128 << 20
+	defaultBodyLimit   = 512 << 20
 	defaultBodyTimeout = 60 * time.Second
 )
 
@@ -112,7 +120,7 @@ func readBoundedRequestBody(w http.ResponseWriter, r *http.Request, limits reque
 		limits.readTimeout = defaultBodyTimeout
 	}
 	if r.ContentLength > limits.body {
-		return reject(http.StatusRequestEntityTooLarge, errors.New("request body exceeds gateway limit"))
+		return reject(http.StatusRequestEntityTooLarge, overLimit(limits.body))
 	}
 	if err := controller.SetReadDeadline(time.Now().Add(limits.readTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
 		return reject(http.StatusInternalServerError, errors.New("could not set request body deadline"))
@@ -139,10 +147,30 @@ func readBoundedRequestBody(w http.ResponseWriter, r *http.Request, limits reque
 	// Limit decoded bytes as well, without allocating from Content-Length.
 	body, err := io.ReadAll(io.LimitReader(rd, limits.body+1))
 	if int64(len(body)) > limits.body {
-		return reject(http.StatusRequestEntityTooLarge, errors.New("request body exceeds gateway limit"))
+		return reject(http.StatusRequestEntityTooLarge, overLimit(limits.body))
 	}
 	if err != nil {
 		return readFailure(err)
 	}
 	return body, 0, nil
+}
+
+// overLimit says a body is over magpie's own limit, and that it is
+// magpie's, not the provider's: an agent shows the message as it comes,
+// and a bare "Payload Too Large" read as the model's or the vendor's
+// (#1422). writeError adds what to do about it.
+func overLimit(limit int64) error {
+	return fmt.Errorf("request body is over magpie's gateway limit of %s (decoded); the provider was not asked", sizeWord(limit))
+}
+
+// sizeWord is a byte count in MB, or in KB or bytes when it is smaller,
+// for limits set low (a test's, a route's own).
+func sizeWord(n int64) string {
+	switch {
+	case n >= 1<<20 && n%(1<<20) == 0:
+		return fmt.Sprintf("%d MB", n>>20)
+	case n >= 1<<10 && n%(1<<10) == 0:
+		return fmt.Sprintf("%d KB", n>>10)
+	}
+	return fmt.Sprintf("%d bytes", n)
 }

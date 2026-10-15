@@ -10,16 +10,20 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"sort"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // checkinAcct is an account checked in each day.
 type checkinAcct struct {
-	User string
-	On   bool
-	key  string // its entry in the file; "" for one that can't be told apart
-	do   func(context.Context) WorkBuddyCheckin
+	User     string
+	On       bool
+	key      string // its entry in the file; "" for one that can't be told apart
+	provider string // the provider its card is under, which the user can switch off
+	do       func(context.Context) WorkBuddyCheckin
 }
 
 // checkiner checks the accounts it lists in, keeping what came of it at
@@ -48,6 +52,9 @@ func (c checkiner) clock() time.Time { return c.now() }
 // out wbCheckinRetry. It says how every account stands, those it didn't
 // ask as last kept.
 func (c checkiner) checkinNow(ctx context.Context, soon bool) []WorkBuddyCheckin {
+	if discoveryOff() {
+		return nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	st := readCheckins(c.path)
@@ -58,8 +65,16 @@ func (c checkiner) checkinNow(ctx context.Context, soon bool) []WorkBuddyCheckin
 	// one account signed in twice (the built-in and the plugin) is
 	// checked in once
 	asked := map[string]bool{}
+	// and an account the user left out is not asked at all, by the loop
+	// or a press (#1902)
+	off := checkinOff()
 	for _, a := range c.accounts() {
-		if !a.On || a.key == "" || asked[a.key] {
+		if !a.On || a.key == "" || asked[a.key] || off[a.key] {
+			continue
+		}
+		// nor, by the loop, one whose provider is switched off or removed
+		// (leftAlone); a press still checks it in
+		if !soon && leftAlone(a.provider) {
 			continue
 		}
 		asked[a.key] = true
@@ -91,6 +106,59 @@ func (c checkiner) checkinNow(ctx context.Context, soon bool) []WorkBuddyCheckin
 				log.Printf("%s check-in: %v", c.label, err)
 			}
 		}
+	}
+	return out
+}
+
+// checkinOff are the accounts left out of their vendor's daily check-in
+// (settings.CheckinOff), by their entry in its file.
+func checkinOff() map[string]bool {
+	off := map[string]bool{}
+	for _, k := range settings.Load().CheckinOff {
+		off[k] = true
+	}
+	return off
+}
+
+// CheckinAccount is an account a daily check-in reaches, for Settings: its
+// entry in its vendor's file (Key, which settings.CheckinOff names), the
+// vendor (By, as WorkBuddyCheckin's), and whether it is checked in while
+// its vendor's check-in is on (#1902, magicLaLa: 根据每个账号设置是否开启
+// 自动签到).
+type CheckinAccount struct {
+	Key  string `json:"key"`
+	By   string `json:"by"`
+	User string `json:"user"`
+	On   bool   `json:"on"`
+}
+
+// CheckinAccounts are the accounts in use that each vendor's check-in
+// reaches, WorkBuddy's, Trae CN's, MiniMax Code's, Qoder's and the
+// plugins' that check in themselves, each once; asks nothing.
+func CheckinAccounts() []CheckinAccount {
+	cs := []checkiner{
+		newWBCheckiner().checkiner(),
+		newTraeCheckiner(traeCheckinAccounts),
+		newMiniMaxCheckiner(miniMaxCheckinAccounts),
+		newQoderCheckiner(qoderCheckinAccounts, time.Now),
+	}
+	for _, p := range pluginCheckinProviders() {
+		cs = append(cs, p.checkiner(time.Now))
+	}
+	off := checkinOff()
+	var out []CheckinAccount
+	seen := map[string]bool{}
+	for _, c := range cs {
+		var mine []CheckinAccount
+		for _, a := range c.accounts() {
+			if !a.On || a.key == "" || seen[c.by+"\x00"+a.key] {
+				continue
+			}
+			seen[c.by+"\x00"+a.key] = true
+			mine = append(mine, CheckinAccount{Key: a.key, By: c.by, User: a.User, On: !off[a.key]})
+		}
+		sort.SliceStable(mine, func(i, j int) bool { return mine[i].User < mine[j].User })
+		out = append(out, mine...)
 	}
 	return out
 }

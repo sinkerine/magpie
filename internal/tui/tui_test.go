@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,7 @@ import (
 	"github.com/yetone/magpie/internal/agentenv"
 	"github.com/yetone/magpie/internal/library"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // home is a sandbox: a home of its own with Claude Code and Codex in it,
@@ -23,7 +25,6 @@ func home(t *testing.T) string {
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
-	t.Setenv("PATH", "")
 	t.Setenv("XDG_DATA_HOME", filepath.Join(h, ".local", "share"))
 	for _, k := range agentenv.Vars {
 		t.Setenv(k, "")
@@ -34,6 +35,15 @@ func home(t *testing.T) string {
 	for _, f := range []string{".claude/settings.json", ".codex/config.toml"} {
 		write(t, filepath.Join(h, f), "")
 	}
+	// their CLIs beside the folders, as on a machine where they are really
+	// installed: the folder alone is an uninstall that left it behind
+	// (#2177), gone for the agents page and no target of the library's
+	bin := filepath.Join(h, "bin")
+	for _, name := range []string{"claude", "codex"} {
+		testenv.Program(t, filepath.Join(bin, name), "#!/bin/sh\n")
+		write(t, filepath.Join(bin, name+".exe"), "")
+	}
+	t.Setenv("PATH", bin)
 	for _, p := range []provider.Provider{
 		{ID: "a", Name: "A", Key: "ka", Models: []string{"m", "claude-opus-5-5"}, Chat: "http://127.0.0.1:1/v1"},
 		{ID: "b", Name: "B", Key: "kb", Models: []string{"gpt-5.5"}, Chat: "http://127.0.0.1:1/v1"},
@@ -67,6 +77,8 @@ func keyMsg(k string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyUp}
 	case "ctrl+u":
 		return tea.KeyMsg{Type: tea.KeyCtrlU}
+	case "ctrl+r":
+		return tea.KeyMsg{Type: tea.KeyCtrlR}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
 }
@@ -331,6 +343,54 @@ func TestLibraryPage(t *testing.T) {
 		t.Fatalf("still there, flash %q", m.flash)
 	}
 	if slices.ContainsFunc(m.lib, func(r libRow) bool { return r.name == "old" }) {
+		t.Fatal("still listed")
+	}
+
+	// an MCP server of Claude Code's own, the same (#1618): the rest of
+	// its .claude.json stays
+	cj := filepath.Join(h, ".claude.json")
+	read := func() string {
+		b, err := os.ReadFile(cj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	b, err := os.ReadFile(cj)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if len(b) > 0 {
+		if err := json.Unmarshal(b, &doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if doc == nil {
+		doc = map[string]any{}
+	}
+	doc["numStartups"] = 7
+	srvs, _ := doc["mcpServers"].(map[string]any)
+	if srvs == nil {
+		srvs = map[string]any{}
+	}
+	srvs["stale"] = map[string]any{"type": "stdio", "command": "stale-mcp"}
+	doc["mcpServers"] = srvs
+	b, _ = json.Marshal(doc)
+	write(t, cj, string(b))
+	m = press(t, m, "s")
+	m.lrow = row("found-mcp", "stale")
+	m = press(t, m, "d")
+	if !strings.Contains(read(), "stale-mcp") {
+		t.Fatal("one d removed it")
+	}
+	m = press(t, m, "d")
+	after := read()
+	var kept map[string]any
+	if err := json.Unmarshal([]byte(after), &kept); err != nil || strings.Contains(after, "stale") || kept["numStartups"] != float64(7) {
+		t.Fatalf("after two d, flash %q:\n%s", m.flash, after)
+	}
+	if slices.ContainsFunc(m.lib, func(r libRow) bool { return r.name == "stale" }) {
 		t.Fatal("still listed")
 	}
 }

@@ -8,6 +8,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const quotas = [
@@ -63,7 +64,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // from Agents: the Usage page would have read the allowances already
       await page.goto("http://magpie.test/?view=agents");
       await page.locator("#prefs").click();
-      await page.locator("#setTab-usage").click();
+      await openPart(page, "usage");
       const pill = page.locator("#trayUsagePick button");
       await pill.waitFor();
       assert.equal(await page.evaluate(() => quotas), null, "the allowances were read before the click");

@@ -22,20 +22,23 @@ const agentMessageTurn = `"input":[
 	{"type":"function_call_output","call_id":"c1","output":"sent"}]`
 
 // checkAgentMessageSent fails unless Grok was given the subagent's reply
-// as the user's message, in its place, its sender and recipient first.
+// as the user's message, after the run it broke, its sender and recipient
+// first. The reply sat between the call and its output on the way in;
+// joinToolRuns puts it after the output, so the exchange Grok reads is
+// whole. Its text, its role, and its conversion are as they were.
 func checkAgentMessageSent(t *testing.T, q map[string]any) {
 	t.Helper()
 	in, _ := q["input"].([]any)
 	if len(in) != 4 {
 		t.Fatalf("Grok was given %v", q["input"])
 	}
-	m, _ := in[2].(map[string]any)
+	if o, _ := in[2].(map[string]any); o["type"] != "function_call_output" || o["call_id"] != "c1" {
+		t.Fatalf("its call's output went as %v", in[2])
+	}
+	m, _ := in[3].(map[string]any)
 	got, _ := json.Marshal(m)
 	if want := `{"content":[{"text":"From /root/research to /root\n\n","type":"input_text"},{"text":"Message Type: FINAL_ANSWER\nPayload:\nfound the cause","type":"input_text"}],"role":"user","type":"message"}`; string(got) != want {
 		t.Fatalf("the agent_message went as\n%s\nwant\n%s", got, want)
-	}
-	if o, _ := in[3].(map[string]any); o["type"] != "function_call_output" || o["call_id"] != "c1" {
-		t.Fatalf("its call's output went as %v", in[3])
 	}
 }
 

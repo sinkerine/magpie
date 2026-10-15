@@ -111,8 +111,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       }
       const ab = await add.boundingBox();
       await page.mouse.click(ab.x + ab.width / 2, ab.y + ab.height / 2);
+      // a new rule asks for an intent: taken off with its ×, and
+      // compacting added from the rule's + menu instead
+      await rows.nth(1).locator('.rt-c[data-k="intent"]').hover();
+      await rows.nth(1).locator('.rt-c[data-k="intent"] .rt-cx').click();
+      await rows.nth(1).locator(".rt-addc").click();
+      await page.locator(".proto-menu .pm-item", { hasText: w.cond }).click();
       const second = rows.nth(1).locator("button.rt-cond", { hasText: w.cond });
       await second.waitFor();
+      assert.equal(await second.getAttribute("class"), "rt-cond on", "added as set");
+      await second.click();
+      assert.equal(await second.getAttribute("class"), "rt-cond");
       const at = () => page.evaluate(() => [...document.querySelectorAll("*")].filter((e) => e.scrollTop).map((e) => [e.id || e.className, e.scrollTop]).join(";") + "|" + Math.round(document.querySelector(".rt-gedit").getBoundingClientRect().top));
       await second.scrollIntoViewIfNeeded(); // by the test, as the reader would
       await page.waitForTimeout(200);

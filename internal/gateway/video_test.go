@@ -557,15 +557,17 @@ func TestVideoModelByItsBareName(t *testing.T) {
 	grokSignedIn(t)
 	up := newGrokMedia(t)
 	s := New()
-	// in this order: the second request is the one the upstream's body is checked for
-	for _, name := range []string{"grok-imagine-video", "grok-imagine-video-1.5"} {
+	// grok-imagine-video-2.0 isn't listed (grokVideoModels): any
+	// grok-imagine-video* goes to Grok by its bare name, as with the
+	// provider named (#1857)
+	for _, name := range []string{"grok-imagine-video", "grok-imagine-video-2.0", "grok-imagine-video-1.5"} {
 		code, obj, raw, _ := request(t, s, "POST", "/v1/videos", "application/json", `{"prompt":"a kite","model":"`+name+`"}`)
 		if code != 200 || obj["model"] != "grok/"+name {
 			t.Errorf("%s: %d %s", name, code, raw)
 		}
 	}
-	if !strings.Contains(up.body("/v1/videos/generations", 1), `"model":"grok-imagine-video-1.5"`) {
-		t.Fatalf("asked %s", up.body("/v1/videos/generations", 1))
+	if !strings.Contains(up.body("/v1/videos/generations", 1), `"model":"grok-imagine-video-2.0"`) || !strings.Contains(up.body("/v1/videos/generations", 2), `"model":"grok-imagine-video-1.5"`) {
+		t.Fatalf("asked %s, %s", up.body("/v1/videos/generations", 1), up.body("/v1/videos/generations", 2))
 	}
 	for name, c := range map[string]struct {
 		code int

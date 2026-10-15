@@ -72,6 +72,9 @@ type picker struct {
 	crumbs []string
 	input  textinput.Model
 	items  []agent.Option
+	// relist, on a picker of models, lists them again when an account's
+	// list or the models.dev catalog arrives while it is open
+	relist func() []agent.Option
 	match  []int
 	cursor int
 	custom bool
@@ -80,7 +83,10 @@ type picker struct {
 	// toggle, when set, is what enter does instead of onPick: it changes
 	// the item and the list stays open, with its items anew.
 	toggle func(string) (items []agent.Option, done string, ok bool)
-	empty  string
+	// refetch, on a provider's models, asks its vendor for the list again
+	// (ctrl+r): a free model list changes often (#2113)
+	refetch func() tea.Cmd
+	empty   string
 }
 
 type model struct {
@@ -170,15 +176,17 @@ func Run(ready func()) error {
 func newModel() model {
 	// in the order the app lists them, those hidden there last
 	// an app magpie has no fields in (Cindy, which takes it by a link) has
-	// nothing to pick here
+	// nothing to pick here, nor one whose CLI is gone, its folder left
+	// behind (#2177): nothing would read what is picked
 	var set []*agent.Agent
 	for _, a := range agent.Detected() {
-		if len(a.Fields) > 0 {
+		if len(a.Fields) > 0 && !a.CLIMissing() {
 			set = append(set, a)
 		}
 	}
-	shown, hidden := settings.Arrange(settings.Load(), set, func(a *agent.Agent) string { return a.ID })
-	m := model{agents: append(shown, hidden...), hidden: len(shown), period: usage.Week, srange: 1}
+	s := settings.Load()
+	shown, hidden := settings.Arrange(s, set, func(a *agent.Agent) string { return a.ID })
+	m := model{agents: append(shown, hidden...), hidden: len(shown), period: usage.Week, srange: 1, qleft: s.QuotaLeft}
 	// no model catalog yet: Init syncs it. Set here, as Init's receiver is
 	// a copy the program never sees.
 	m.syncing = catalog.Source() == ""
@@ -229,10 +237,44 @@ func (m *model) goTo(p page) tea.Cmd {
 }
 
 func (m model) Init() tea.Cmd {
+	// a signed-in account's list exists only at its vendor: asked for at
+	// start, as the app does, or Cursor offered its fallback Auto alone
+	// until m on the Providers page asked for it (#1789)
 	if m.syncing {
-		return syncCmd
+		return tea.Batch(syncCmd, fetchModelsCmd)
 	}
-	return nil
+	return fetchModelsCmd
+}
+
+// modelsMsg says FetchNew is done; missing, that an account is left
+// without its list.
+type modelsMsg struct{ missing bool }
+
+func fetchModelsCmd() tea.Msg {
+	return modelsMsg{missing: provider.FetchNew(20 * time.Second)}
+}
+
+// modelsRetry is how long the terminal waits to ask again for a list it
+// couldn't get (the network not up yet at start, a vendor slow to answer),
+// while it stays open: the app asks again each time its page is read.
+var modelsRetry = time.Minute
+
+// modelsChanged shows the models as they are now: the page, and a picker
+// of models open meanwhile, its filter and the model on its cursor kept.
+func (m *model) modelsChanged() {
+	m.reload()
+	if m.mode != modePick || m.pk.relist == nil {
+		return
+	}
+	on, _ := m.pk.choice()
+	m.pk.items = m.pk.relist()
+	m.pk.refilter()
+	for i, j := range m.pk.match {
+		if m.pk.items[j].Value == on {
+			m.pk.cursor = i
+			break
+		}
+	}
 }
 
 func syncCmd() tea.Msg {
@@ -250,7 +292,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case flashMsg:
 		m.flash, m.flashOK = msg.text, msg.ok
-		m.reload()
+		// and a picker of models open shows what was done to them (a list
+		// fetched again from it)
+		m.modelsChanged()
 		return m, nil
 	case balanceMsg:
 		m.bal = msg
@@ -299,8 +343,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, saveInstructions(msg.text)
+	case modelsMsg:
+		m.modelsChanged()
+		if msg.missing {
+			return m, tea.Tick(modelsRetry, func(time.Time) tea.Msg { return fetchModelsCmd() })
+		}
+		return m, nil
 	case syncedMsg:
 		m.syncing = false
+		m.modelsChanged()
 		if msg.err != nil {
 			m.flash, m.flashOK = "catalog sync failed: "+msg.err.Error(), false
 		} else {
@@ -417,7 +468,7 @@ func (m *model) openFieldPicker() {
 	a := m.agents[m.row]
 	f := a.Fields[m.col]
 	cur := m.values[m.row][f.Key]
-	items := f.Options(m.values[m.row])
+	items := a.Picks(f, m.values[m.row])
 	items = withCurrent(items, cur)
 	set := f.Set
 	label := a.Name + " · " + f.Label
@@ -425,6 +476,7 @@ func (m *model) openFieldPicker() {
 		crumbs: []string{a.Name, f.Label},
 		input:  newInput("type to filter, or enter a custom value"),
 		items:  items,
+		relist: func() []agent.Option { return withCurrent(a.Picks(f, a.Values()), f.Get()) },
 		custom: true,
 		empty:  "no models known yet, type one",
 		onPick: func(v string) tea.Cmd {
@@ -448,8 +500,13 @@ func (m *model) openProfiles() {
 		return
 	}
 	var items []agent.Option
+	detected := agent.Detected()
 	for _, n := range profile.Names(ps) {
-		items = append(items, agent.Option{Value: n, Note: profile.LongSummary(ps[n])})
+		note := profile.LongSummary(ps[n])
+		if profile.InUse(ps[n], detected, nil) {
+			note = strings.TrimSuffix("in use · "+note, " · ")
+		}
+		items = append(items, agent.Option{Value: n, Note: note})
 	}
 	m.pk = picker{
 		crumbs: []string{"profiles"},
@@ -501,6 +558,12 @@ func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "ctrl+p":
 		if len(m.pk.match) > 0 {
 			m.pk.cursor = (m.pk.cursor + len(m.pk.match) - 1) % len(m.pk.match)
+		}
+		return m, nil
+	case "ctrl+r":
+		if m.pk.refetch != nil {
+			m.flash, m.flashOK = "asking for the models again…", true
+			return m, m.pk.refetch()
 		}
 		return m, nil
 	case "ctrl+d":
@@ -720,6 +783,8 @@ func (m model) View() string {
 		switch {
 		case m.mode == modeProfiles:
 			footer = hints("↑↓", "move", "↵", "apply", "ctrl+d", "delete", "esc", "back")
+		case m.pk.refetch != nil:
+			footer = hints("↑↓", "move", "↵", "on / off", "ctrl+r", "fetch models again", "esc", "back")
 		case m.pk.toggle != nil:
 			footer = hints("↑↓", "move", "↵", "on / off", "esc", "back")
 		default:

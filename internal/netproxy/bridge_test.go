@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // fakeSOCKS is a SOCKS5 proxy taking user u and password pw ("" for none),
@@ -162,6 +163,46 @@ func TestBridgeSaysTheProxyIsDown(t *testing.T) {
 	got, _ := io.ReadAll(c)
 	if !strings.HasPrefix(string(got), "HTTP/1.1 502") || !strings.Contains(string(got), "socks connect tcp "+addr) {
 		t.Fatalf("answered %q", got)
+	}
+}
+
+// A bridge handed the port of the SOCKS proxy it carries to, which a port
+// just let go can be (Linux CI gave TestPluginSOCKSProxy's dead proxy port
+// to its bridge), listens elsewhere: carrying to itself, it held each
+// request for a minute instead of saying the proxy is down.
+func TestBridgeNeverCarriesToItself(t *testing.T) {
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	addr := ln.Addr().String()
+	ln.Close()
+	first := true
+	listenLoopback = func() (net.Listener, error) {
+		if first {
+			first = false
+			return net.Listen("tcp", addr)
+		}
+		return net.Listen("tcp", "127.0.0.1:0")
+	}
+	t.Cleanup(func() { listenLoopback = func() (net.Listener, error) { return net.Listen("tcp", "127.0.0.1:0") } })
+	for _, host := range []string{addr, "localhost:" + strings.Split(addr, ":")[1]} {
+		b, err := Bridge(&url.URL{Scheme: "socks5h", Host: host})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimPrefix(b, "http://") == addr {
+			t.Fatalf("the bridge for %s listens at %s, the proxy's own port", host, b)
+		}
+		c, err := net.Dial("tcp", strings.TrimPrefix(b, "http://"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetDeadline(time.Now().Add(10 * time.Second))
+		io.WriteString(c, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+		got, _ := io.ReadAll(c)
+		c.Close()
+		if !strings.HasPrefix(string(got), "HTTP/1.1 502") {
+			t.Fatalf("through %s: answered %q", host, got)
+		}
+		first = true
 	}
 }
 

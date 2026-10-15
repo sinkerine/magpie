@@ -123,6 +123,41 @@ func TestQuotaHistoryCycles(t *testing.T) {
 	}
 }
 
+// A refill can leave the deadline alone, advance it or bring it forward.
+// Preserve both readings even when they are too close for normal sampling.
+func TestQuotaHistoryUnscheduledResets(t *testing.T) {
+	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	reset := at.Add(7 * 24 * time.Hour)
+	a := QuotaPoint{At: at, Left: 20, ResetsAt: &reset}
+	for _, tc := range []struct {
+		name       string
+		gap, moved time.Duration
+		left       float64
+		want       bool
+	}{
+		{"refill with unchanged deadline", time.Minute, 0, 100, true},
+		{"refill with rounded deadline", 10 * time.Minute, time.Minute, 100, true},
+		{"manual restart", time.Minute, 24 * time.Hour, 100, true},
+		{"official earlier restart", time.Minute, -24 * time.Hour, 100, true},
+		{"ordinary reset", 7 * 24 * time.Hour, 7 * 24 * time.Hour, 100, true},
+		{"small correction", time.Minute, 0, 24, false},
+		{"deadline rounding", time.Minute, time.Minute, 20, false},
+		{"rolling recovery", time.Hour, time.Hour, 80, false},
+		{"fast rolling recovery", time.Minute, time.Minute, 80, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := reset.Add(tc.moved)
+			b := QuotaPoint{At: at.Add(tc.gap), Left: tc.left, ResetsAt: &r}
+			if got := newCycle(a, b); got != tc.want {
+				t.Fatalf("cycle break = %v, want %v", got, tc.want)
+			}
+			if tc.want && len(addPoint([]QuotaPoint{a}, b)) != 2 {
+				t.Fatal("reset folded into previous cycle")
+			}
+		})
+	}
+}
+
 // TestMergeQuotaHistory: another computer's points join this one's: the
 // union, sorted, two within half a minute of each other the newer one,
 // and merging the same again changes nothing.

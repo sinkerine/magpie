@@ -9,11 +9,12 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const words = {
-  en: { name: "Lightweight mode", sub: "A closed panel or window frees its page after a minute, about 100 MB each, and loads it anew when opened", on: "On", off: "Off" },
-  zh: { name: "轻量模式", sub: "面板或窗口关闭约一分钟后释放其网页（每个约 100 MB），再次打开时重新加载", on: "开启", off: "关闭" },
+  en: { name: "Lightweight mode", sub: "A closed window frees about 100 MB after a minute; the gateway and tasks keep running, only the page reloads", on: "On", off: "Off" },
+  zh: { name: "轻量模式", sub: "窗口关闭一分钟后释放约 100 MB；网关和后台任务照常运行，只重新加载页面", on: "开启", off: "关闭" },
 };
 
 function serve(lang, web, posted, st) {
@@ -52,7 +53,9 @@ async function open(engine, lang, web, posted, st, t) {
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/*", serve(lang, web, posted, st));
+  await watchSettingsReads(page);
   await page.goto("http://magpie.test/?view=settings&tab=general");
+  await settingsDrawn(page); // rows found are the ones that stay (#1659)
   await page.locator("#setPage-general .row.pref").first().waitFor();
   return { page, errors };
 }

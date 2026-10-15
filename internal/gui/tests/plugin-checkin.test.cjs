@@ -7,15 +7,62 @@
 // /api/usage/plugin-checkin {provider}; a captcha the vendor asks for is said
 // as such, never as a failure, as magpie never solves one. Settings' check-in
 // tabs gain Plugins while such a plugin is signed in, a row a provider with
-// Off/On. English, Chinese, Japanese and German, the window and the panel's
-// 440px; the API is faked here.
+// Off/On. English, Simplified and Traditional Chinese, Japanese and German,
+// the window and the panel's 440px; the API is faked here.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
+const vm = require("node:vm");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
+test("plugin check-in saved choices take precedence over derived defaults", async () => {
+  const source = await fs.readFile(path.join(assets, "app.js"), "utf8");
+  const fn = source.match(/const PLUGIN_CHECKIN_INHERITS = \{[\s\S]*?\n\};\nfunction pluginCheckinOn\(id\) \{[\s\S]*?\n\}/)[0];
+  const on = (settings, id = "fakeco") => vm.runInNewContext(`${fn}; pluginCheckinOn(${JSON.stringify(id)})`, { state: { settings } });
+  assert.equal(on({ pluginCheckins: { fakeco: true } }), true);
+  assert.equal(on({ pluginCheckins: { fakeco: false }, checkinPlugins: [{ id: "fakeco", on: true }] }), false);
+  assert.equal(on({ pluginCheckins: { fakeco: true }, checkinPlugins: [{ id: "fakeco", on: false }] }), true);
+  assert.equal(on({ checkinPlugins: [{ id: "fakeco", on: true }] }), true);
+  assert.equal(on({ checkinPlugins: [{ id: "another", on: true }] }), false);
+  assert.equal(on({}), false);
+  assert.equal(on(undefined), false);
+  // a plugin that took a built-in's check-in over follows the built-in's
+  // switch until its own is set, as provider.PluginCheckinOn does, also in
+  // /api/state's shape, which has no list (#1912)
+  assert.equal(on({ traeCheckin: true }, "trae-cn"), true);
+  assert.equal(on({ traeCheckin: true, pluginCheckins: { "trae-cn": false } }, "trae-cn"), false);
+  assert.equal(on({ workbuddyCheckin: true }, "workbuddy"), true);
+  assert.equal(on({ minimaxCheckin: true }, "minimax-code-global"), true);
+  assert.equal(on({ qoderCheckin: true }, "qoder-cn"), true);
+  assert.equal(on({ traeCheckin: true }, "fakeco"), false);
+  assert.equal(on({ traeCheckin: true }, "constructor"), false);
+});
+
+// the built-ins a plugin's check-in inherits are the ones Go's
+// PluginCheckinOn names, each by the setting's own JSON key
+test("the inherited switches are provider.PluginCheckinOn's", async () => {
+  const root = path.resolve(__dirname, "../../..");
+  const go = await fs.readFile(path.join(root, "internal/provider/plugin_checkin.go"), "utf8");
+  const sw = go.match(/func PluginCheckinOn\([\s\S]*?\n\}/)[0];
+  const cases = [...sw.matchAll(/case ([^:]+):\s*return s\.(\w+)/g)].map((m) => [m[1].split(",").map((x) => x.trim()), m[2]]);
+  const ids = { "wbCN.id": "workbuddy", TraeCNID: "trae-cn", MiniMaxCodeID: "minimax-code", MiniMaxCodeGlobalID: "minimax-code-global", '"qoder"': "qoder", QoderCNID: "qoder-cn" };
+  const settings = await fs.readFile(path.join(root, "internal/settings/settings.go"), "utf8");
+  const want = {};
+  for (const [names, field] of cases) {
+    const key = settings.match(new RegExp(`\\b${field} +bool +\`json:"(\\w+)`))[1];
+    for (const n of names) {
+      assert(ids[n], "an id the test doesn't know: " + n);
+      want[ids[n]] = key;
+    }
+  }
+  const source = await fs.readFile(path.join(assets, "app.js"), "utf8");
+  const got = vm.runInNewContext(source.match(/const PLUGIN_CHECKIN_INHERITS = \{[\s\S]*?\n\};/)[0] + "; PLUGIN_CHECKIN_INHERITS");
+  assert.deepEqual({ ...got }, want);
+});
+
 const today = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
 const quotas = () => [
   { provider: "plugin:fakeco", name: "FakeCo", plan: "Pro", user: "ann", windows: [{ name: "Credits", used: 12 }],
@@ -26,7 +73,7 @@ const quotas = () => [
 ];
 
 function serve(lang, asked) {
-  const settings = { theme: "light", lang, quotaLeft: false, currency: "usd",
+  const settings = { theme: "light", lang, quotaLeft: false, currency: "usd", pluginCheckins: { fakeco: false },
     checkinPlugins: [{ id: "fakeco", name: "FakeCo", on: false, checkins: [
       { user: "ann", by: "plugin:fakeco", vendor: "FakeCo", day: today, outcome: "claimed", credit: 50, streak: 3 },
       { user: "bob", by: "plugin:fakeco", vendor: "FakeCo", day: today, outcome: "captcha" },
@@ -36,10 +83,15 @@ function serve(lang, asked) {
     const json = (data) => route.fulfill({ json: data });
     if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:"${lang}",theme:"light",web:true};` });
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
-    if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings });
+    if (url.pathname === "/api/state") {
+      // stateJSON embeds settings.Settings; only settingsJSON adds this list.
+      const { checkinPlugins, ...saved } = settings;
+      return json({ agents: [], profiles: [], settings: saved });
+    }
     if (url.pathname === "/api/settings/plugin-checkin") {
       const b = route.request().postDataJSON();
       asked.push(["set", b]);
+      settings.pluginCheckins[b.provider] = b.on;
       settings.checkinPlugins = settings.checkinPlugins.map((p) => (p.id === b.provider ? { ...p, on: b.on } : p));
       return json(settings);
     }
@@ -62,6 +114,7 @@ function serve(lang, asked) {
 const words = {
   en: { done: "Checked in today +50 · 3-day streak", captcha: "Asks for a captcha; check in in its own app · slide the puzzle", auto: "Auto check-in", tab: "Plugins", sub: /FakeCo plugin check each signed-in account.*bob is asked for a captcha/ },
   zh: { done: "今日已签到 +50 · 连续 3 天", captcha: "需要验证码，请在它自己的 App 里签到 · slide the puzzle", auto: "自动签到", tab: "插件", sub: /FakeCo 插件.*bob 需要验证码/ },
+  "zh-TW": { captcha: "需要驗證碼，請在它自己的 App 裡簽到 · slide the puzzle", tab: "外掛", sub: /FakeCo 外掛.*bob 需要驗證碼/ },
   ja: { captcha: "CAPTCHA が必要です。公式アプリでチェックインしてください · slide the puzzle", tab: "プラグイン", sub: /FakeCo プラグイン.*bob は CAPTCHA が必要です/ },
   de: { captcha: "Verlangt ein Captcha; in der eigenen App einchecken · slide the puzzle", tab: "Erweiterungen", sub: /FakeCo-Plugin.*bob soll ein Captcha lösen/ },
 };
@@ -69,7 +122,7 @@ const words = {
 const scrolls = (page) => page.evaluate(() => [scrollY, ...[...document.querySelectorAll("*")].filter((e) => e.scrollTop).map((e) => e.scrollTop)].join(","));
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
-  for (const lang of ["en", "zh", "ja", "de"]) {
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
     const w = words[lang];
     test(`${engine} ${lang}: a plugin's own check-in on its Usage card`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
@@ -79,7 +132,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const errors = [], asked = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, asked));
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/?view=usage");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       const card = page.locator(".subscription-card", { hasText: "FakeCo" });
       await card.locator(".wb-checkin").first().waitFor();
       const rows = card.locator(".wb-checkin");
@@ -101,6 +156,19 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.waitForFunction(() => document.querySelector(".ci-auto")?.getAttribute("aria-pressed") === "true");
       assert.deepEqual(asked, [["set", { provider: "fakeco", on: true }]]);
       assert.equal(await scrolls(page), y, "the toggle moved the page");
+
+      // Returning to the window calls load(true), replacing settings with
+      // /api/state's raw shape. Wait for its allowance redraw as well.
+      await page.evaluate(async () => { await load(true); await loadQuotas(); });
+      assert.equal(await auto.getAttribute("aria-pressed"), "true", "saved auto check-in stays on after a state refresh");
+      await auto.click();
+      await page.waitForFunction(() => document.querySelector(".ci-auto")?.getAttribute("aria-pressed") === "false");
+      assert.deepEqual(asked, [
+        ["set", { provider: "fakeco", on: true }],
+        ["set", { provider: "fakeco", on: false }],
+      ], "the next click turns the saved setting off");
+      await page.evaluate(async () => { await load(true); await loadQuotas(); });
+      assert.equal(await auto.getAttribute("aria-pressed"), "false", "saved off stays off after a state refresh");
       assert.deepEqual(errors, []);
     });
 
@@ -112,7 +180,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const errors = [], asked = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, asked));
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/?view=settings&tab=usage");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       const tab = page.locator("#warmTab-plugins");
       await tab.waitFor();
       assert.equal(await tab.isHidden(), false);

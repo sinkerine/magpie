@@ -35,6 +35,18 @@ func sandbox(t *testing.T) string {
 	bin := filepath.Join(h, "bin")
 	testenv.Program(t, filepath.Join(bin, "gemini"), "#!/bin/sh\n")
 	write(t, filepath.Join(bin, "gemini.exe"), "")
+	// the other fixture agents' CLIs beside their folders, as on a machine
+	// where they are really installed: with the folder alone each would be
+	// gone (CLIMissing, #2177) and no target of the library's. Only these:
+	// a stand-in for an agent no folder here keeps would have it detected
+	// by its binary alone in every test.
+	for _, name := range []string{
+		"claude", "codex", "opencode", "mimo", "deveco", "pi", "goose",
+		"cursor-agent", "copilot", "crush", "dsh",
+	} {
+		testenv.Program(t, filepath.Join(bin, name), "#!/bin/sh\n")
+		write(t, filepath.Join(bin, name+".exe"), "")
+	}
 	t.Setenv("PATH", bin)
 	// never the machine's global node_modules
 	roots := piGlobalRoots
@@ -55,7 +67,7 @@ func sandbox(t *testing.T) string {
 	}
 	for _, f := range []string{
 		".claude/settings.json", ".codex/config.toml", ".gemini/settings.json",
-		".config/opencode/opencode.json", ".config/mimocode/mimocode.json", ".pi/agent/settings.json", ".config/goose/config.yaml",
+		".config/opencode/opencode.json", ".config/mimocode/mimocode.json", ".config/deveco/deveco.jsonc", ".pi/agent/settings.json", ".config/goose/config.yaml",
 		".cursor/cli-config.json", ".copilot/settings.json", ".config/crush/crush.json", ".dsh/profiles/web/cordis.patch.yml",
 	} {
 		write(t, filepath.Join(h, f), "")
@@ -71,6 +83,19 @@ func write(t *testing.T, p, s string) {
 	if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// holdCLI puts a CLI of the given name in the sandbox's bin, beside the
+// agent folder the test wrote: the folder alone is an uninstall that left
+// it behind (#2177), and no target of the library's. An empty name is
+// nothing, for an agent with no install command, which is never gone.
+func holdCLI(t *testing.T, h, bin string) {
+	t.Helper()
+	if bin == "" {
+		return
+	}
+	testenv.Program(t, filepath.Join(h, "bin", bin), "#!/bin/sh\n")
+	write(t, filepath.Join(h, "bin", bin+".exe"), "")
 }
 
 func read(t *testing.T, p string) string {
@@ -107,7 +132,7 @@ func ids(ts []*Target) []string {
 func TestTargets(t *testing.T) {
 	sandbox(t)
 	got := ids(Targets())
-	for _, id := range []string{"claude", "codex", "gemini", "opencode", "mimocode", "pi", "goose", "cursor", "copilot", "crush", "dsh"} {
+	for _, id := range []string{"claude", "codex", "gemini", "opencode", "mimocode", "deveco", "pi", "goose", "cursor", "copilot", "crush", "dsh"} {
 		if !slices.Contains(got, id) {
 			t.Errorf("%s not a target: %v", id, got)
 		}
@@ -768,7 +793,7 @@ func TestSkillsFromGitHub(t *testing.T) {
 		t.Error("the tarball wrote outside its folder")
 	}
 	version = "two"
-	ok(t)(UpdateSkill("pdf"))
+	ok(t)(UpdateSkill("pdf", false))
 	v, _ := Read(nil)
 	if v.Skills[0].Description != "PDFs two" || v.Skills[0].Source != in+"/pdf" {
 		t.Errorf("after update: %+v", v.Skills[0])
@@ -875,6 +900,7 @@ func TestReadNoAgents(t *testing.T) {
 func TestPiMCP(t *testing.T) {
 	h := sandbox(t)
 	p := filepath.Join(h, ".pi/agent/mcp.json")
+	write(t, filepath.Join(h, ".pi/agent/settings.json"), `{"packages": ["npm:pi-mcp-adapter@2.9.1"]}`)
 	write(t, p, `{"mcpServers": {"supabase": {"transport": "streamable-http", "url": "https://mcp.supabase.com/mcp", "lifecycle": "eager"}}}`)
 	tg := targetByID("pi")
 	if tg == nil || tg.MCP == nil || tg.MCP.Path != p {
@@ -909,6 +935,7 @@ func TestPiMCPAdapter3(t *testing.T) {
 	d := filepath.Join(h, ".pi/agent")
 	old, adapter := filepath.Join(d, "mcp.json"), filepath.Join(d, "mcp-adapter.json")
 	pkg := filepath.Join(d, "npm/node_modules/pi-mcp-adapter/package.json")
+	write(t, filepath.Join(d, "settings.json"), `{"packages": ["npm:pi-mcp-adapter"]}`)
 	write(t, old, `{"mcpServers": {"mine": {"command": "npx", "args": ["x"]}}}`)
 	write(t, pkg, `{"name": "pi-mcp-adapter", "version": "2.9.1"}`)
 	if tg := targetByID("pi"); tg.MCP.Path != old {

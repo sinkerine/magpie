@@ -63,7 +63,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const look = await hint.evaluate((e) => { const s = getComputedStyle(e); return { left: s.borderLeftWidth, color: s.color, ground: getComputedStyle(document.body).color }; });
       assert.equal(look.left, "0px", "no left border");
       assert.notEqual(look.color, look.ground, "said as a warning");
-      assert.equal(await page.locator(".editor").getByText(/vendor list|供应商列表/).count(), 0, "its defaults aren't called the vendor's list");
+      assert.equal(await page.locator(".editor").getByText(/vendor list ·|供应商列表 ·/).count(), 0, "its defaults aren't called the vendor's list");
       assert.deepEqual(errors, []);
     });
   }

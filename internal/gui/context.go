@@ -165,6 +165,36 @@ func sessionOfRoute(r gateway.Route) string {
 // of a prompt of some size.
 func compacted(prev, next int) bool { return prev >= 20000 && next < prev*6/10 }
 
+// ctxKey is the agent's session a route is in, "" when it names none.
+func ctxKey(r gateway.Route) string {
+	if key := sessionOfRoute(r); key != "" {
+		return r.Agent + "\x00" + key
+	}
+	return ""
+}
+
+// withTools says a prompt carries tool definitions.
+func withTools(p *gateway.Prompt) bool { return partTokens(p, gateway.PartTools) > 0 }
+
+// toolSessions are the sessions whose own turns carry tool definitions.
+// In one of them a request without any is a call the agent makes on the
+// side under the conversation's session id — Claude Code's auto mode
+// classifier ("You are a security monitor…", a transcript and no tools),
+// its title and its quota check — not a turn of the conversation, whose
+// prompt can't stand for it: a classifier's 40K after a 100K turn is no
+// compaction (Player on Discord: 45 in a session that never compacted).
+func toolSessions(routes []gateway.Route) map[string]bool {
+	out := map[string]bool{}
+	for _, r := range routes {
+		if r.Kind == "" && r.Sub == "" && r.Prompt != nil && withTools(r.Prompt) {
+			if sk := ctxKey(r); sk != "" {
+				out[sk] = true
+			}
+		}
+	}
+	return out
+}
+
 // contextOf works the agents and their sessions out of their routes.
 func contextOf(routes []gateway.Route, days int) ctxJSON {
 	sort.SliceStable(routes, func(i, j int) bool { return routes[i].Time.Before(routes[j].Time) })
@@ -181,6 +211,7 @@ func contextOf(routes []gateway.Route, days int) ctxJSON {
 	}
 	agents := map[string]*agentAcc{}
 	sess := map[string]*ctxSession{}
+	tooled := toolSessions(routes)
 	var order []string
 	for _, r := range routes {
 		if !r.Done || r.Agent == "" {
@@ -197,7 +228,7 @@ func contextOf(routes []gateway.Route, days int) ctxJSON {
 			continue
 		}
 		p := r.Prompt
-		if p == nil || p.Tokens <= 0 || r.Kind != "" {
+		if p == nil || p.Tokens <= 0 || r.Kind != "" || !withTools(p) && tooled[ctxKey(r)] {
 			// a title or another side call is neither the conversation's
 			// nor what the agent's prompts are like
 			continue
@@ -223,7 +254,9 @@ func contextOf(routes []gateway.Route, days int) ctxJSON {
 		}
 		acc.a.Window = max(acc.a.Window, window)
 		key := sessionOfRoute(r)
-		if key == "" {
+		if key == "" || r.Sub != "" {
+			// a subagent's prompt is its own conversation's, not the
+			// one whose session id it goes under
 			continue
 		}
 		acc.sessions[key] = true
@@ -251,7 +284,7 @@ func contextOf(routes []gateway.Route, days int) ctxJSON {
 	}
 	// the sessions, the latest first
 	slices.SortFunc(order, func(a, b string) int { return sess[b].Last.Compare(sess[a].Last) })
-	var codexIDs []string
+	var codexIDs, desktopIDs, piIDs []string
 	for _, sk := range order {
 		s := sess[sk]
 		if acc := agents[s.Agent]; acc != nil && s.Requests > 1 {
@@ -262,8 +295,13 @@ func contextOf(routes []gateway.Route, days int) ctxJSON {
 				s.Points = s.Points[len(s.Points)-ctxPoints:]
 			}
 			out.Sessions = append(out.Sessions, *s)
-			if s.Agent == "codex" {
+			switch s.Agent {
+			case "codex":
 				codexIDs = append(codexIDs, s.Key)
+			case "claude-desktop":
+				desktopIDs = append(desktopIDs, s.Key)
+			case "pi-desktop", "pi":
+				piIDs = append(piIDs, s.Key)
 			}
 		}
 	}
@@ -271,6 +309,26 @@ func contextOf(routes []gateway.Route, days int) ctxJSON {
 		titles := sessions.CodexTitles(codexIDs)
 		for i := range out.Sessions {
 			if out.Sessions[i].Agent == "codex" {
+				out.Sessions[i].Title = titles[out.Sessions[i].Key]
+			}
+		}
+	}
+	// Claude Desktop's go by the name Desktop saved, which a session with
+	// no transcript on this computer has too (#1675)
+	if len(desktopIDs) > 0 {
+		titles := sessions.DesktopTitles(desktopIDs)
+		for i := range out.Sessions {
+			if out.Sessions[i].Agent == "claude-desktop" {
+				out.Sessions[i].Title = titles[out.Sessions[i].Key]
+			}
+		}
+	}
+	// PI-Desktop's by the name it keeps in pi.sqlite, which no file of the
+	// chat has (#1967); Pi's own sessions find none there and go on below
+	if len(piIDs) > 0 {
+		titles := sessions.PIDesktopTitles(piIDs)
+		for i := range out.Sessions {
+			if a := out.Sessions[i].Agent; (a == "pi-desktop" || a == "pi") && out.Sessions[i].Title == "" {
 				out.Sessions[i].Title = titles[out.Sessions[i].Key]
 			}
 		}
@@ -438,5 +496,51 @@ func contextRoutesAPI(mux *http.ServeMux) {
 			days = 7
 		}
 		writeJSON(rw, contextOf(contextRoutes(r, days), days))
+	})
+	// the text of a part of a request's prompt (masaka on Discord): the
+	// part's items, and one item's text when item is given. From the
+	// gateway this GUI runs, which keeps the last requests' masked bodies
+	// in memory only; 404 when the request's is no longer kept.
+	mux.HandleFunc("GET /api/context/text", func(rw http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		id, err := strconv.ParseInt(q.Get("id"), 10, 64)
+		if err != nil || id <= 0 {
+			http.Error(rw, "invalid route id", http.StatusBadRequest)
+			return
+		}
+		item := -1
+		if v := q.Get("item"); v != "" {
+			if item, err = strconv.Atoi(v); err != nil || item < 0 {
+				http.Error(rw, "invalid item", http.StatusBadRequest)
+				return
+			}
+		}
+		gw := served.Load()
+		if gw == nil {
+			http.Error(rw, "not kept", http.StatusNotFound)
+			return
+		}
+		pt, ok := gw.PromptText(id, q.Get("kind"), item >= 0)
+		if !ok {
+			http.Error(rw, "not kept", http.StatusNotFound)
+			return
+		}
+		if item >= 0 {
+			// the one item's text; the rest by name and size only
+			if item >= len(pt.Items) {
+				http.Error(rw, "invalid item", http.StatusBadRequest)
+				return
+			}
+			for i := range pt.Items {
+				if i != item {
+					pt.Items[i].Pieces = nil
+				}
+			}
+			if pt.Items[item].Pieces == nil {
+				pt.Items[item].Pieces = []gateway.PromptPiece{}
+			}
+		}
+		rw.Header().Set("Cache-Control", "no-store")
+		writeJSON(rw, pt)
 	})
 }

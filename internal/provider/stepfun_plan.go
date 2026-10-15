@@ -34,6 +34,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/lastgood"
 )
 
 // stepfunSites are StepFun's two platforms, by the API host a provider uses.
@@ -145,6 +147,11 @@ func saveStepFun(all map[string]stepfunSession) error {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(stepfunPath()), 0o700); err != nil {
+		return err
+	}
+	// loadStepFun reads a file that doesn't parse as no session: what it
+	// held, every site's sign-in, is kept aside before it is written over
+	if err := lastgood.KeepUnparsed(stepfunPath(), lastgood.Into[map[string]stepfunSession]); err != nil {
 		return err
 	}
 	return writeFileAtomic(stepfunPath(), b)

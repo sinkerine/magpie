@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -89,21 +90,109 @@ func TestUserPathTakesAgentVars(t *testing.T) {
 	}
 }
 
+// liu_dyj on X: a NO_PROXY=127.0.0.1 in .zshrc keeps the Codex a terminal
+// or the ChatGPT app runs off the proxy, while magpie, opened from the Dock
+// without it, warned that Codex went through the proxy. The login shell's
+// proxy variables are read (LoginEnv) but never set in magpie's own
+// environment, whose requests take their proxy from netproxy.
+func TestLoginEnvProxyVarsNotSet(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sh := filepath.Join(home, "sh")
+	testenv.Program(t, sh, "#!/bin/sh\necho 'a profile that talks'\n"+
+		"export HTTP_PROXY=http://127.0.0.1:7890 no_proxy=localhost,127.0.0.1\neval \"$2\"\n")
+	t.Setenv("SHELL", sh)
+	t.Setenv("PATH", "/usr/bin:/bin")
+	for _, v := range ProxyVars {
+		t.Setenv(v, "")
+		os.Unsetenv(v)
+	}
+	exec.Command(sh, "-c", ":").Run()
+	login.Lock()
+	dirs, vars, at := login.dirs, login.vars, login.at
+	login.dirs, login.vars, login.at = nil, nil, time.Time{}
+	login.Unlock()
+	t.Cleanup(func() {
+		login.Lock()
+		login.dirs, login.vars, login.at = dirs, vars, at
+		login.Unlock()
+	})
+
+	UserPath()
+	for _, v := range ProxyVars {
+		if _, set := os.LookupEnv(v); set {
+			t.Fatalf("%s set in magpie's own environment", v)
+		}
+	}
+	if got := LoginEnv("HTTP_PROXY"); got != "http://127.0.0.1:7890" {
+		t.Fatalf("HTTP_PROXY = %q, want the profile's", got)
+	}
+	if got := LoginEnv("no_proxy"); got != "localhost,127.0.0.1" {
+		t.Fatalf("no_proxy = %q, want the profile's", got)
+	}
+	if got := LoginEnv("ALL_PROXY"); got != "" {
+		t.Fatalf("ALL_PROXY = %q, want none", got)
+	}
+}
+
+// jw1dev on X: CLAUDE_CODE_USE_BEDROCK=1 sends Claude Code to Bedrock past
+// magpie. One in the profile is read (LoginEnv), for magpie to say so, but
+// never set in magpie's own environment, where every agent magpie starts
+// would take it.
+func TestLoginEnvClaudeProvidersNotSet(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sh := filepath.Join(home, "sh")
+	testenv.Program(t, sh, "#!/bin/sh\nexport CLAUDE_CODE_USE_BEDROCK=1 CLAUDE_CODE_USE_MANTLE=true\neval \"$2\"\n")
+	t.Setenv("SHELL", sh)
+	t.Setenv("PATH", "/usr/bin:/bin")
+	for _, v := range agentenv.ClaudeProviders {
+		t.Setenv(v, "")
+		os.Unsetenv(v)
+	}
+	exec.Command(sh, "-c", ":").Run()
+	login.Lock()
+	dirs, vars, at := login.dirs, login.vars, login.at
+	login.dirs, login.vars, login.at = nil, nil, time.Time{}
+	login.Unlock()
+	t.Cleanup(func() {
+		login.Lock()
+		login.dirs, login.vars, login.at = dirs, vars, at
+		login.Unlock()
+	})
+
+	UserPath()
+	for _, v := range agentenv.ClaudeProviders {
+		if _, set := os.LookupEnv(v); set {
+			t.Fatalf("%s set in magpie's own environment", v)
+		}
+	}
+	if got := LoginEnv("CLAUDE_CODE_USE_BEDROCK"); got != "1" {
+		t.Fatalf("CLAUDE_CODE_USE_BEDROCK = %q, want the profile's", got)
+	}
+	if got := LoginEnv("CLAUDE_CODE_USE_MANTLE"); got != "true" {
+		t.Fatalf("CLAUDE_CODE_USE_MANTLE = %q, want the profile's", got)
+	}
+	if got := LoginEnv("CLAUDE_CODE_USE_VERTEX"); got != "" {
+		t.Fatalf("CLAUDE_CODE_USE_VERTEX = %q, want none", got)
+	}
+}
+
 // A login shell that doesn't expand "$CLAUDE_CONFIG_DIR" prints the
 // reference itself. That is no folder: the variable counts as unset,
 // rather than magpie setting CLAUDE_CONFIG_DIR to "$CLAUDE_CONFIG_DIR" and
 // then looking for Claude Code's sign-in under it (#738).
 func TestParseShellEnvUnexpanded(t *testing.T) {
 	s := shellMark + "$PATH"
-	for _, v := range agentenv.Vars {
+	for _, v := range shellVars {
 		s += "\x00$" + v
 	}
 	p, vars := parseShellEnv("hello from the profile\n"+s+shellMark, shellMark)
 	if p != "" {
 		t.Fatalf("PATH = %q, want none", p)
 	}
-	if len(vars) != len(agentenv.Vars) {
-		t.Fatalf("%d variables, want %d", len(vars), len(agentenv.Vars))
+	if len(vars) != len(shellVars) {
+		t.Fatalf("%d variables, want %d", len(vars), len(shellVars))
 	}
 	for v, got := range vars {
 		if got != "" {
@@ -117,7 +206,7 @@ func TestParseShellEnvUnexpanded(t *testing.T) {
 // installed, the command's shape is all that can be checked.
 func TestShellEnvNushell(t *testing.T) {
 	probe := shellProbe("/opt/homebrew/bin/nu")
-	if !strings.HasPrefix(probe, "^/bin/sh -c 'printf \""+shellMark+"%s") || !strings.HasSuffix(probe, `"$`+agentenv.Vars[len(agentenv.Vars)-1]+`"'`) {
+	if !strings.HasPrefix(probe, "^/bin/sh -c 'printf \""+shellMark+"%s") || !strings.HasSuffix(probe, `"$`+shellVars[len(shellVars)-1]+`"'`) {
 		t.Fatalf("nushell's probe: %q", probe)
 	}
 	if strings.Contains(probe, `'`+shellMark) || strings.Count(probe, "'") != 2 {
@@ -175,5 +264,196 @@ func TestAskShellOwnSession(t *testing.T) {
 	}
 	if p := ShellPath(zsh); len(p) == 0 {
 		t.Fatalf("zsh asked in a session of its own gave no PATH")
+	}
+}
+
+// fishProbeOutput is what fish 4.9.3 printed for shellProbe under a
+// config.fish that echoes a line, puts /Users/john/.fishbin first on PATH
+// and sets CODEX_HOME: PATH joined with ':' (a path variable), then each of
+// agentenv.Vars. The captured tail after CODEX_HOME was all empty values;
+// it is padded to shellVars' count (agentenv.Vars, ProxyVars, then
+// agentenv.ClaudeProviders) as it is now.
+func fishProbeOutput() string {
+	s := "hello from config.fish\n" + shellMark +
+		"/Users/john/.fishbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/pmk/env/global/bin" +
+		"\x00\x00/Users/john/codex"
+	return s + strings.Repeat("\x00", len(shellVars)-2) + shellMark
+}
+
+// fakeShells makes HOME a temp folder with a login shell (SHELL) whose
+// PATH lacks fish's folder, and a fish that answers as the real one did
+// (fishProbeOutput), where FindShell looks.
+func fakeShells(t *testing.T) (home string) {
+	home = t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("PATH", "/usr/bin:/bin")
+	for _, v := range []string{"CODEX_HOME", "CLAUDE_CONFIG_DIR"} {
+		t.Setenv(v, "")
+		os.Unsetenv(v)
+	}
+	login := filepath.Join(home, "zsh")
+	testenv.Program(t, login, "#!/bin/sh\nPATH=/from/zsh:/usr/bin:/bin\nexport CLAUDE_CONFIG_DIR=/from/zsh/claude\neval \"$2\"\n")
+	t.Setenv("SHELL", login)
+	bin := filepath.Join(home, "shells")
+	os.MkdirAll(bin, 0o755)
+	out := filepath.Join(home, "fish.out")
+	os.WriteFile(out, []byte(fishProbeOutput()), 0o644)
+	testenv.Program(t, filepath.Join(bin, "fish"), "#!/bin/sh\ncat '"+out+"'\n")
+	old := shellDirs
+	shellDirs = func() []string { return []string{bin} }
+	t.Cleanup(func() { shellDirs = old })
+	return home
+}
+
+// A terminal that opens fish while the login shell is zsh (John on
+// Discord: 二进制文件没有从用户环境变量找到，我终端环境使用的fish): fish is asked
+// too, its PATH comes after zsh's and a variable zsh leaves unset is
+// fish's, so an agent in a folder only config.fish adds is found.
+func TestShellEnvAsksFishBesideLoginShell(t *testing.T) {
+	home := fakeShells(t)
+	os.MkdirAll(filepath.Join(home, ".config", "fish"), 0o755)
+	p, vars := shellEnv()
+	dirs := filepath.SplitList(p)
+	if len(dirs) < 2 || dirs[0] != "/from/zsh" || !slices.Contains(dirs, "/Users/john/.fishbin") {
+		t.Fatalf("PATH = %q, want the login shell's first and fish's folder after", p)
+	}
+	if n := len(slices.DeleteFunc(slices.Clone(dirs), func(d string) bool { return d != "/usr/bin" })); n != 1 {
+		t.Fatalf("a folder both shells have is there twice: %q", p)
+	}
+	if got := vars["CODEX_HOME"]; got != "/Users/john/codex" {
+		t.Fatalf("CODEX_HOME = %q, want fish's", got)
+	}
+	if got := vars["CLAUDE_CONFIG_DIR"]; got != "/from/zsh/claude" {
+		t.Fatalf("CLAUDE_CONFIG_DIR = %q, want the login shell's", got)
+	}
+}
+
+// fish installed but never set up (no ~/.config/fish) isn't the terminal's
+// shell, and isn't asked.
+func TestShellEnvLeavesUnusedFish(t *testing.T) {
+	fakeShells(t)
+	if p, _ := shellEnv(); strings.Contains(p, "fishbin") {
+		t.Fatalf("fish was asked with no config of its own: %q", p)
+	}
+}
+
+// The login shell being fish itself, it is asked once, and what it printed
+// is read: PATH whole, CODEX_HOME, and nothing for the variables it hasn't.
+func TestShellEnvFishLogin(t *testing.T) {
+	home := fakeShells(t)
+	os.MkdirAll(filepath.Join(home, ".config", "fish"), 0o755)
+	fish := filepath.Join(home, "shells", "fish")
+	t.Setenv("SHELL", fish)
+	if got := termShells(fish); len(got) != 0 {
+		t.Fatalf("fish asked again beside itself: %q", got)
+	}
+	p, vars := shellEnv()
+	if !strings.HasPrefix(p, "/Users/john/.fishbin:/usr/local/bin:") || strings.Contains(p, "/from/zsh") {
+		t.Fatalf("PATH = %q", p)
+	}
+	if vars["CODEX_HOME"] != "/Users/john/codex" || vars["CLAUDE_CONFIG_DIR"] != "" {
+		t.Fatalf("variables: %v", vars)
+	}
+}
+
+// The real fish, where it is installed: a folder fish_add_path adds in
+// config.fish and a variable it sets reach magpie with zsh (here a plain
+// sh) as the login shell, and ShellPath(fish) has the folder.
+func TestShellEnvRealFish(t *testing.T) {
+	fish := FindShell("fish")
+	if fish == "" {
+		t.Skip("fish isn't installed")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("PATH", "/usr/bin:/bin")
+	for _, v := range []string{"CODEX_HOME", "CLAUDE_CONFIG_DIR"} {
+		t.Setenv(v, "")
+		os.Unsetenv(v)
+	}
+	bin := filepath.Join(home, "fish bin") // a space survives
+	os.MkdirAll(bin, 0o755)
+	os.MkdirAll(filepath.Join(home, ".config", "fish"), 0o755)
+	os.WriteFile(filepath.Join(home, ".config", "fish", "config.fish"),
+		[]byte("echo hi from fish\nfish_add_path -g '"+bin+"'\nset -gx CODEX_HOME "+home+"/codex\n"), 0o644)
+	login := filepath.Join(home, "zsh")
+	testenv.Program(t, login, "#!/bin/sh\neval \"$2\"\n")
+	t.Setenv("SHELL", login)
+	old := shellDirs
+	shellDirs = func() []string { return []string{filepath.Dir(fish)} }
+	t.Cleanup(func() { shellDirs = old })
+
+	p, vars := shellEnv()
+	if !slices.Contains(filepath.SplitList(p), bin) {
+		t.Fatalf("PATH = %q, want fish's %q in it", p, bin)
+	}
+	if got := vars["CODEX_HOME"]; got != home+"/codex" {
+		t.Fatalf("CODEX_HOME = %q, want fish's", got)
+	}
+	if got := vars["CLAUDE_CONFIG_DIR"]; got != "" {
+		t.Fatalf("CLAUDE_CONFIG_DIR = %q, want none", got)
+	}
+	if !slices.Contains(ShellPath(fish), bin) {
+		t.Fatalf("ShellPath(fish) lacks %q", bin)
+	}
+}
+
+// A profile that execs something else in an interactive shell (tmux's or
+// zellij's auto-start in config.fish) or is too slow to come up
+// interactively never prints the probe; the shell is asked again as a
+// login shell only, and MAGPIE_SHELL_PROBE=1 tells the profile who asks
+// (John on Discord, fish set with chsh).
+func TestAskShellProfileExecsOrHangs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	old := shellAsk
+	shellAsk = time.Second
+	t.Cleanup(func() { shellAsk = old })
+	for name, interactive := range map[string]string{
+		"exec": "exec /bin/cat",
+		"slow": "sleep 4",
+	} {
+		sh := filepath.Join(home, name)
+		testenv.Program(t, sh, "#!/bin/sh\ncase \"$1\" in -i*) "+interactive+";; esac\n"+
+			"PATH=/from/login:$PATH\n[ \"$MAGPIE_SHELL_PROBE\" = 1 ] && PATH=/told:$PATH\neval \"$2\"\n")
+		p, vars := askShell(sh)
+		dirs := filepath.SplitList(p)
+		if !slices.Contains(dirs, "/from/login") || vars == nil {
+			t.Fatalf("%s: PATH = %q, vars %v: the login shell wasn't asked again", name, p, vars != nil)
+		}
+		if !slices.Contains(dirs, "/told") {
+			t.Fatalf("%s: MAGPIE_SHELL_PROBE didn't reach the profile: %q", name, p)
+		}
+	}
+}
+
+// The real fish, where it is installed, with a config.fish that starts
+// tmux in an interactive shell, and one that's slow to come up in one:
+// its PATH still comes.
+func TestAskShellRealFishAutostart(t *testing.T) {
+	fish := FindShell("fish")
+	if fish == "" {
+		t.Skip("fish isn't installed")
+	}
+	old := shellAsk
+	shellAsk = 2 * time.Second
+	t.Cleanup(func() { shellAsk = old })
+	for name, block := range map[string]string{
+		"tmux": "if status is-interactive; and not set -q TMUX\n  exec /bin/cat\nend\n",
+		"slow": "if status is-interactive\n  sleep 5\nend\n",
+	} {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("XDG_CONFIG_HOME", "")
+		bin := filepath.Join(home, "fb")
+		os.MkdirAll(bin, 0o755)
+		os.MkdirAll(filepath.Join(home, ".config", "fish"), 0o755)
+		os.WriteFile(filepath.Join(home, ".config", "fish", "config.fish"),
+			[]byte("set -g fish_greeting 'Welcome to fish'\nfish_add_path -g "+bin+"\n"+block), 0o644)
+		if p, _ := askShell(fish); !slices.Contains(filepath.SplitList(p), bin) {
+			t.Fatalf("%s: PATH = %q, want %q in it", name, p, bin)
+		}
 	}
 }

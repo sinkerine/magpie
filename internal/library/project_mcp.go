@@ -26,19 +26,31 @@ import (
 // mcp-services, "Configuration Files and Default Load Paths") and Pi's
 // .pi/mcp.json (mcpServers, read once the project is trusted; pi.dev/docs/
 // latest/mcp, "Configure servers" — Pi's own MCP, 0.99 on, whatever
-// extension the user's file is written for). Each is written in the shape
-// the agent's user-wide file has.
+// extension the user's file is written for). Qoder's CLI (and Qoder CN's)
+// reads .qoder/settings.json's mcpServers as its project level, beside
+// .mcp.json (docs.qoder.com/cli/mcp-reference; @qoder-ai/qodercli and
+// @qodercn-ai/qoderclicn 1.1.69 name the project folder .qoder alike).
+// CodeBuddy Code reads the first there is of .mcp.json and mcp.json at the
+// project's root (getMcpCandidatePaths for the project scope,
+// @tencent-ai/codebuddy-code 2.164.0), and Droid .factory/mcp.json
+// (docs.factory.com/cli/configuration/mcp). Qoder and CodeBuddy, like
+// Claude Code, ask the user to approve a project's server before using
+// it. Each is written in the shape the agent's user-wide file has.
 var projectMCPFiles = map[string]struct {
 	rel    string
 	format mcpFormat
 }{
-	"claude":   {".mcp.json", fmtClaude},
-	"codex":    {".codex/config.toml", fmtCodex},
-	"gemini":   {".gemini/settings.json", fmtGemini},
-	"cursor":   {".cursor/mcp.json", fmtCursor},
-	"opencode": {"opencode.json", fmtOpenCode},
-	"zcode":    {".zcode/config.json", fmtZCode},
-	"pi":       {".pi/mcp.json", fmtPiNative},
+	"claude":    {".mcp.json", fmtClaude},
+	"codex":     {".codex/config.toml", fmtCodex},
+	"gemini":    {".gemini/settings.json", fmtGemini},
+	"cursor":    {".cursor/mcp.json", fmtCursor},
+	"opencode":  {"opencode.json", fmtOpenCode},
+	"zcode":     {".zcode/config.json", fmtZCode},
+	"pi":        {".pi/mcp.json", fmtPiNative},
+	"qoder":     {".qoder/settings.json", fmtOmp},
+	"qoder-cn":  {".qoder/settings.json", fmtOmp},
+	"codebuddy": {".mcp.json", fmtClaude},
+	"droid":     {".factory/mcp.json", fmtClaude},
 }
 
 // ProjectMCPFile is the file, in a project, an agent reads the project's
@@ -53,7 +65,8 @@ func ProjectNoSSE(agent string) bool {
 }
 
 // mcpRel is the agent's file in this project: OpenCode's opencode.jsonc
-// when that is the one the project has.
+// when that is the one the project has, and CodeBuddy's mcp.json when the
+// project has that and no .mcp.json, as CodeBuddy reads only the first.
 func (p *Project) mcpRel(agent string) (string, mcpFormat) {
 	f, ok := projectMCPFiles[agent]
 	if !ok {
@@ -62,13 +75,19 @@ func (p *Project) mcpRel(agent string) (string, mcpFormat) {
 	if f.format == fmtOpenCode && !exists(filepath.Join(p.Dir, "opencode.json")) && exists(filepath.Join(p.Dir, "opencode.jsonc")) {
 		return "opencode.jsonc", f.format
 	}
+	if agent == "codebuddy" && !exists(filepath.Join(p.Dir, ".mcp.json")) && exists(filepath.Join(p.Dir, "mcp.json")) {
+		return "mcp.json", f.format
+	}
 	return f.rel, f.format
 }
 
 // formatOfRel is the format of a project's file magpie wrote servers in.
 func formatOfRel(rel string) (mcpFormat, bool) {
-	if rel == "opencode.jsonc" {
+	switch rel {
+	case "opencode.jsonc":
 		return fmtOpenCode, true
+	case "mcp.json":
+		return fmtClaude, true
 	}
 	for _, f := range projectMCPFiles {
 		if f.rel == rel {

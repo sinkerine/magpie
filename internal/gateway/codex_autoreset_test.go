@@ -169,9 +169,9 @@ func TestCodexAutoResetAfterEveryAccount(t *testing.T) {
 	}
 }
 
-// No reset is spent when the user didn't say so, when only the five hours
-// are used up, or when the account holds none: ChatGPT's refusal goes back
-// as it came.
+// No reset is spent when the user didn't say so, when they kept it to
+// the one about to expire (#2078), when only the five hours are used up,
+// or when the account holds none: ChatGPT's refusal goes back as it came.
 func TestCodexAutoResetNot(t *testing.T) {
 	for _, c := range []struct {
 		name string
@@ -179,11 +179,14 @@ func TestCodexAutoResetNot(t *testing.T) {
 		week float64
 		held int
 		gone bool
+		// expiringOnly: on before one expires, off when the week runs out
+		expiringOnly bool
 	}{
-		{"not turned on", false, 100, 1, false},
-		{"only the five hours", true, 60, 1, false},
-		{"none held", true, 100, 0, false},
-		{"no credit when spent", true, 100, 1, true},
+		{"not turned on", false, 100, 1, false, false},
+		{"only before one expires", true, 100, 1, false, true},
+		{"only the five hours", true, 60, 1, false, false},
+		{"none held", true, 100, 0, false, false},
+		{"no credit when spent", true, 100, 1, true, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			codexSignedIn(t)
@@ -191,6 +194,11 @@ func TestCodexAutoResetNot(t *testing.T) {
 			b.week["acct-1"], b.held["acct-1"], b.gone = c.week, c.held, c.gone
 			if c.on {
 				if err := provider.SetCodexAutoReset("me@example.com", true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.expiringOnly {
+				if err := provider.SetCodexAutoResetCase("me@example.com", provider.ResetCaseWeek, false); err != nil {
 					t.Fatal(err)
 				}
 			}

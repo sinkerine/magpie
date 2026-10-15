@@ -16,11 +16,14 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { reach } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const now = new Date();
 const ago = (s) => new Date(now.getTime() - s * 1e3).toISOString();
-const ahead = (m) => new Date(now.getTime() + m * 60e3).toISOString();
+// a rest runs from when the test builds it, not from when the file loaded:
+// under load the webkit half runs minutes after, past a 3-minute rest
+const ahead = (m) => new Date(Date.now() + m * 60e3).toISOString();
 const M = "gpt-6";
 const rest = (k) => ({ why: "rate", until: ahead(3), key: k, for: 180e9 });
 const acct = (p, name, user, extra = {}) => ({ id: `${p}@${user}`, provider: p, name, who: user, kind: "account", model: M, plan: "Pro", ...extra });
@@ -140,8 +143,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const depth = (li) => li.evaluate((x) => getComputedStyle(x).getPropertyValue("--depth").trim());
       assert.equal(await depth(fold("ChatGPT")), "1");
       assert.equal(await depth(page.locator(".rt-accts > li").nth(2)), "2");
-      // Team folded by the reader, Big opened
+      // Team folded by the reader, Big opened: with the pool open they are
+      // under the window's foot (the page beside the sidebar since
+      // 18e82adc6), and the reader scrolls down to them
+      await reach(page, fold("Team"));
       await fold("Team").click();
+      await reach(page, fold("Big"));
       await fold("Big").click();
       await page.waitForFunction(() => document.querySelectorAll(".rt-accts > li").length === 1 + 1 + 8 + 1 + 1 + 7 + 1);
 

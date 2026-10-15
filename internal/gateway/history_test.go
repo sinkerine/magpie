@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"io"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // historyNoon holds the history's clock at noon of a past day and returns
@@ -280,6 +283,59 @@ func TestHistoryLeavesADayItCantRead(t *testing.T) {
 	}
 }
 
+// A day dropped for the size kept is dropped whole: a late route's file left
+// beside its day's .gz goes with the .gz. The .gz can't be read at the prune,
+// which leaves the file beside it, and reads again before the day is listed:
+// the day isn't left listed without its late route.
+func TestHistoryDropsADayWhole(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	now := historyNoon(t)
+	y, m, d := now.AddDate(0, 0, -2).Date()
+	late := time.Date(y, m, d, 23, 59, 0, 0, time.Local)
+	day, dir := late.Format(dayForm), HistoryDir()
+	path := filepath.Join(dir, day+".jsonl")
+	saveRoute(Route{ID: 1, Time: late, Model: "a", Done: true})
+	pruneHistory(dir, now)
+	saveRoute(Route{ID: 2, Time: late.Add(10 * time.Second), Model: "b", Done: true}) // done after the prune
+	if err := os.Chmod(path+".gz", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadFile(path + ".gz"); err == nil {
+		t.Skip("a file at mode 0 still reads here: root, Windows, or a file system without Unix permissions")
+	}
+	gz, err := os.Stat(path + ".gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a newer day takes the rest of the size kept: the day's two files are
+	// over it, and either of them alone isn't
+	newer := filepath.Join(dir, now.AddDate(0, 0, -1).Format(dayForm)+".jsonl.gz")
+	if err := os.WriteFile(newer, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(newer, historyBytes-max(gz.Size(), file.Size())); err != nil {
+		t.Fatal(err)
+	}
+	pruneHistory(dir, now)
+	os.Chmod(path+".gz", 0o600)
+	var left []string
+	for _, f := range historyFiles(dir) {
+		left = append(left, filepath.Base(f.path))
+	}
+	days, rs, _ := History(day)
+	var got []int64
+	for _, r := range rs {
+		got = append(got, r.ID)
+	}
+	if want := []string{filepath.Base(newer)}; !slices.Equal(left, want) || len(got) > 0 {
+		t.Errorf("kept %v, days %+v, routes %v; want %v alone: the day dropped whole", left, days, got, want)
+	}
+}
+
 func TestRouteUsageCompactAndLegacyJSON(t *testing.T) {
 	// Ignore fields that full ledger records wrote into earlier route history.
 	var old Route
@@ -375,4 +431,50 @@ func TestHistoryRouteDayAndNoLock(t *testing.T) {
 	if _, ok := HistoryRoute(123, day.AddDate(0, 0, 2)); ok {
 		t.Fatal("searched outside the three-day window")
 	}
+}
+
+// A done route isn't written to disk in a test binary testenv isolated,
+// where the write, run behind the request, outlived the test that sent it
+// and put routing/ back into its config folder as that was removed
+// (#1543); outside one it is.
+func TestNoRouteWrittenInATestSandbox(t *testing.T) {
+	keepRoutes = true
+	t.Cleanup(func() { keepRoutes = false })
+	send := func() string {
+		f := &fake{t: t, ctype: "application/json", reply: `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`}
+		setup(t, provider.Chat, f)
+		rec := httptest.NewRecorder()
+		New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"fake/m1","messages":[{"role":"user","content":"hi"}]}`)))
+		if rec.Code != 200 {
+			t.Fatal(rec.Code, rec.Body)
+		}
+		return HistoryDir()
+	}
+	t.Run("sandbox", func(t *testing.T) {
+		if os.Getenv(testSandbox) == "" {
+			t.Fatal("the package's TestMain left the sandbox marker unset")
+		}
+		dir := send()
+		time.Sleep(200 * time.Millisecond) // a write begun would be on disk by now
+		if _, err := os.Stat(dir); err == nil {
+			t.Fatalf("a route was written to %s", dir)
+		}
+	})
+	t.Run("outside", func(t *testing.T) {
+		t.Setenv(testSandbox, "")
+		dir := send()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if es, _ := os.ReadDir(dir); len(es) > 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no route written to %s", dir)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		// saveRoute holds the lock until its write and prune are done
+		history.mu.Lock()
+		history.mu.Unlock()
+	})
 }

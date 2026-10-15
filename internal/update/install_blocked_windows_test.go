@@ -51,9 +51,63 @@ func TestTrialStart(t *testing.T) {
 	if err := trialStart(bad); err == nil {
 		t.Fatal("text started")
 	}
-	// ended, not left running: its file can go
-	if err := os.Remove(good); err != nil {
-		t.Fatalf("still held: %v", err)
+	// ended, not left running: its file can go, once whatever checks a
+	// program as it starts (an antivirus) has let go, as moveIn waits (#2272)
+	for i := 0; ; i++ {
+		err := os.Remove(good)
+		if err == nil {
+			break
+		}
+		if i == len(asideWaits) {
+			t.Fatalf("still held: %v", err)
+		}
+		time.Sleep(asideWaits[i])
+	}
+}
+
+// #2272: a download something still holds a moment after the trial (an
+// antivirus that checks a program as it starts) goes in once it is let
+// go, rather than failing the install.
+func TestInstallBinaryWaitsForHeldDownload(t *testing.T) {
+	exe, staged := rollbackFiles(t)
+	release := holdForRollbackTest(t, staged)
+	if err := os.Rename(staged, staged+".probe"); !errors.Is(err, errSharingViolation) {
+		t.Fatalf("fixture: renaming the held download = %v, want sharing violation", err)
+	}
+	go func() { time.Sleep(150 * time.Millisecond); release() }()
+	old, err := InstallBinaryAside(staged, exe)
+	if err != nil {
+		t.Fatal("install while the download is held a moment:", err)
+	}
+	wantInstallFile(t, exe, "new version")
+	wantInstallFile(t, old, "old version")
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Errorf("download left: %v", err)
+	}
+}
+
+// #2272: the install as an update runs it, the real trial start first and
+// the move straight after, on a real program under the .new name a
+// download has, its bytes new to this computer.
+func TestInstallBinaryRightAfterTheTrial(t *testing.T) {
+	ping := filepath.Join(os.Getenv("SystemRoot"), "System32", "PING.EXE")
+	b, err := os.ReadFile(ping)
+	if err != nil {
+		t.Skip("no PING.EXE:", err)
+	}
+	was := canStart
+	canStart = trialStart
+	t.Cleanup(func() { canStart = was })
+	exe, staged := rollbackFiles(t)
+	prog := append(b, []byte(t.Name()+time.Now().String())...) // a file no scanner has seen
+	if err := os.WriteFile(staged, prog, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallBinaryAside(staged, exe); err != nil {
+		t.Fatal("install after the trial:", err)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != string(prog) {
+		t.Fatal("the new version is not in place")
 	}
 }
 

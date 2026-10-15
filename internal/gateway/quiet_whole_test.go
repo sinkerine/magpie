@@ -40,6 +40,10 @@ func TestQuietWholeReplyStreamed(t *testing.T) {
 	}{
 		{"chat", "application/json", `{"id":"chatcmpl-9f2","object":"chat.completion","created":1791370000,"model":"m","system_fingerprint":"fp_1","choices":[{"index":0,"message":{"role":"assistant","content":"` + text + `","reasoning_content":"` + think + `","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},"logprobs":null,"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":9,"total_tokens":21}}`,
 			provider.Chat, "think:" + think + "|text:" + text + "|tool:get_weather " + args + "|stop:tool", 0},
+		// a call the model wrote into its text, made the call it is as a
+		// stream's would be (#1845)
+		{"chat with a call in its text", "application/json", `{"id":"chatcmpl-9f4","object":"chat.completion","created":1791370000,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"` + text + `\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":9,"total_tokens":21}}`,
+			provider.Chat, "text:" + text + "\n|tool:get_weather " + args + "|stop:tool", 0},
 		// a reply that isn't streamed, whatever its type says
 		{"chat as text/plain", "text/plain; charset=utf-8", `{"id":"chatcmpl-9f3","object":"chat.completion","created":1791370000,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"` + text + `"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":2,"total_tokens":14}}`,
 			provider.Chat, "text:" + text + "|stop:stop", 0},
@@ -255,8 +259,11 @@ func TestWholeAsStreamResponsesCitations(t *testing.T) {
 
 // A held try's reply under a type that says neither JSON nor a stream,
 // once the agent has a stream's headers: its first bytes decide, however
-// they are split, and a stream goes through whole, the bytes held of its
-// start too.
+// they are split. A stream is held as a stream from there, read event by
+// event like one that says so: its frames stay held, a failure among them
+// is the try's (#1418: it went straight through before, and an error
+// after its frames reached the agent), and the first word of the reply
+// lets it through, the bytes held of its start too.
 func TestHeldUnsureStreamPasses(t *testing.T) {
 	for _, c := range []struct {
 		name   string
@@ -281,8 +288,15 @@ func TestHeldUnsureStreamPasses(t *testing.T) {
 					t.Fatalf("wrote %d of %q: %v", n, w, err)
 				}
 			}
-			if c.stream && (!h.passing || h.whole || rec.Body.String() != all) {
-				t.Fatalf("passing %v, whole %v, agent has %q", h.passing, h.whole, rec.Body.String())
+			if c.stream {
+				if h.passing || h.whole || !h.stream || h.held.String() != all || rec.Body.Len() != 0 {
+					t.Fatalf("frames only: passing %v, whole %v, stream %v, held %q, agent has %q", h.passing, h.whole, h.stream, h.held.String(), rec.Body.String())
+				}
+				said := "data: " + chatOK + "\n\n"
+				h.Write([]byte(said))
+				if !h.passing || rec.Body.String() != all+said {
+					t.Fatalf("said: passing %v, agent has %q", h.passing, rec.Body.String())
+				}
 			}
 			if !c.stream && (h.passing || !h.whole || h.held.String() != all || rec.Body.Len() != 0) {
 				t.Fatalf("passing %v, whole %v, held %q, agent has %q", h.passing, h.whole, h.held.String(), rec.Body.String())
@@ -310,7 +324,30 @@ func TestHeldUnsureKeptAlive(t *testing.T) {
 		t.Fatalf("the agent has %q", got)
 	}
 	h.Write([]byte("data: {}\n\n"))
-	if got := rec.Body.String(); got != ": keepalive\ndata: {}\n\n" {
+	if got := rec.Body.String(); got != ": keepalive\n" {
+		t.Fatalf("a frame went: the agent has %q", got)
+	}
+	h.Write([]byte("data: " + chatOK + "\n\n"))
+	if got := rec.Body.String(); got != ": keepalive\ndata: {}\n\ndata: "+chatOK+"\n\n" {
 		t.Fatalf("the agent has %q", got)
+	}
+}
+
+// A held try's reply under a type that says neither JSON nor a stream,
+// which begins as a stream, frames only, then fails: the failure is the
+// try's, for the next candidate to answer, and nothing of it went to the
+// agent (#1418, Aliceonly: the sseStart branch passed such a stream
+// through at once).
+func TestHeldUnsureStreamFailsHeld(t *testing.T) {
+	rec := httptest.NewRecorder()
+	h := newHoldWriter(rec, true)
+	h.alive = &keptAlive{proto: provider.Responses, sent: true}
+	h.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	h.WriteHeader(http.StatusOK)
+	h.Write([]byte(strings.Join(overloadedLead, "\n\n") + "\n\n"))
+	h.Write([]byte("event: response.rate_limits.updated\ndata: {\"type\":\"response.rate_limits.updated\"}\n\n"))
+	h.Write([]byte(overloadedFailed + "\n\n"))
+	if h.passing || !h.failed() || rec.Body.Len() != 0 {
+		t.Fatalf("passing %v, failed %v, agent has %q", h.passing, h.failed(), rec.Body.String())
 	}
 }

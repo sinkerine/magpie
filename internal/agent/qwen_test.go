@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 )
@@ -130,7 +131,7 @@ func TestQwen(t *testing.T) {
 			t.Errorf("%s missing: %v", id, order)
 			continue
 		}
-		if e["name"] != "magpie/"+id || e["baseUrl"] != gatewayV1() || e["envKey"] != "MAGPIE_QWEN_API_KEY" {
+		if e["name"] != listLabels("qwen")[id] || e["baseUrl"] != gatewayV1() || e["envKey"] != "MAGPIE_QWEN_API_KEY" {
 			t.Errorf("%s: %v", id, e)
 		}
 	}
@@ -153,9 +154,9 @@ func TestQwen(t *testing.T) {
 		t.Fatalf("sync: %v", ms)
 	}
 	// something else rewrote magpie's entry: its baseUrl is the one
-	// before its name, as the fields are ordered
+	// before its id, as the fields are ordered
 	cur := readFile(path)
-	at := strings.Index(cur, `"magpie/anth/claude-sonnet-5"`)
+	at := strings.Index(cur, `"id": "anth/claude-sonnet-5"`)
 	base := strings.LastIndex(cur[:at], gatewayV1())
 	if base < 0 {
 		t.Fatal("no baseUrl before the entry's name:\n" + cur)
@@ -343,5 +344,43 @@ func TestQwenHomeOverride(t *testing.T) {
 	a := qwen(home)
 	if a.Dir != other || a.Path != filepath.Join(other, "settings.json") {
 		t.Fatalf("override: %s %s", a.Dir, a.Path)
+	}
+}
+
+// love1sbug on X: Names in agents' lists changed nothing in Qwen Code's
+// /model, which shows an entry's name (the id beside it), as magpie named
+// every entry magpie/<id>. The name follows the setting now, written again
+// as it changes.
+func TestQwenNamesFollowSuffixMode(t *testing.T) {
+	_, path := qwenHome(t)
+	writeFile(t, path, qwenUser)
+	if err := provider.SetModelName("deepseek/flash", "Quick"); err != nil {
+		t.Fatal(err)
+	}
+	a, err := Find("qwen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply("model", "magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	catalog.Changed = SyncCatalog
+	t.Cleanup(func() { catalog.Changed = nil })
+	for _, c := range []struct{ mode, pro, flash string }{
+		{provider.SuffixOn, "pro · DeepSeek", "Quick · DeepSeek"},
+		{provider.SuffixOwn, "pro · DeepSeek", "Quick"},
+		{provider.SuffixOff, "pro", "Quick"},
+		{provider.SuffixOn, "pro · DeepSeek", "Quick · DeepSeek"},
+	} {
+		if err := provider.SetSuffixMode(c.mode); err != nil {
+			t.Fatal(err)
+		}
+		ms, _, _ := qwenFile(t, path)
+		if ms["deepseek/pro"]["name"] != c.pro || ms["deepseek/flash"]["name"] != c.flash {
+			t.Fatalf("%s: %v / %v", c.mode, ms["deepseek/pro"], ms["deepseek/flash"])
+		}
+		if ms["glm-5"]["name"] != "[IdeaLab] glm-5" {
+			t.Fatalf("%s: the user's entry renamed: %v", c.mode, ms["glm-5"])
+		}
 	}
 }

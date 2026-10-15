@@ -56,7 +56,7 @@ const codexProvider = {
 };
 
 const said = "Not connected · goes through magpie only to fail over to your other ChatGPT accounts";
-const title = "magpie set openai_base_url in {agent}'s config.toml, so a request the ChatGPT account {agent} is signed in to has no allowance for goes on to your other ChatGPT accounts on in magpie. {agent} keeps to its own models. To stop it, switch those accounts off under Providers › Codex; connecting {agent} adds magpie's models.";
+const title = "magpie set openai_base_url in {agent}'s config.toml, so a request the ChatGPT account {agent} is signed in to has no allowance for goes on to your other ChatGPT accounts on in magpie. {agent} keeps to its own models. To stop it, tick Only switch {agent}'s sign-in under Providers › Codex, or switch those accounts off; connecting {agent} adds magpie's models.";
 const button = "ChatGPT accounts";
 const plain = "Not connected · {agent} uses its own settings";
 const row = (id) => `.row.agent[data-id="${id}"]`;

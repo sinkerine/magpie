@@ -34,6 +34,25 @@ func TestListeningOn(t *testing.T) {
 	}
 }
 
+// A port nothing listens on is no listener and no error, on every system:
+// the take-over reads exactly that to know an older magpie let the port go
+// (#2231, where Windows answered "exit status 1").
+func TestNothingListeningIsNoError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	pids, err := ListeningOn(context.Background(), port)
+	if err != nil {
+		t.Fatalf("nothing listens on %d: %v", port, err)
+	}
+	if len(pids) != 0 {
+		t.Fatalf("nothing listens on %d, read %v", port, pids)
+	}
+}
+
 func evalPath(p string) string {
 	if q, err := filepath.EvalSymlinks(p); err == nil {
 		return q

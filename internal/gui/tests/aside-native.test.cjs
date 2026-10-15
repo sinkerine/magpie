@@ -76,7 +76,7 @@ for (const engine of ['chromium', 'webkit']) {
       let revision = 'confirmed-plan';
       let failPreview = false, releasePreview = null, blockPreview = false;
       const a = {
-        id: 'aside', name: 'Aside', icon: 'aside', wired: true, cliMissing: true, path: '~/.aside/u/0/settings.json',
+        id: 'aside', name: 'Aside', icon: 'aside', wired: true, path: '~/.aside/u/0/settings.json',
         native: { provider: 'connected', runtime: 'applied', fields: {} },
         fields: [{ key: 'model', label: 'model', value: 'native/current', options: [{ value: 'native/current', label: 'Current model' }, { value: 'magpie/relay/m1', ref: 'relay/m1', label: 'New model' }] }],
       };

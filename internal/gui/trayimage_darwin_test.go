@@ -21,7 +21,7 @@ func TestTrayImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cells, _, _ := trayUsageView(trayCards(), time.Now(), false)
+	cells, _, _ := trayUsageView(trayCards(), time.Now(), false, false)
 	out := os.Getenv("MAGPIE_TRAY_PREVIEW")
 	widths := map[bool][]int{}
 	for _, dark := range []bool{false, true} {
@@ -88,7 +88,7 @@ func TestTrayImageCellAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cells, _, _ := trayUsageView(trayCards(), time.Now(), false)
+	cells, _, _ := trayUsageView(trayCards(), time.Now(), false, false)
 	const h = 22.0
 	_, w, _ := trayImagePNG(cells, bird, h, 2, false, false)
 	width := float64(w) / 2
@@ -231,7 +231,7 @@ func TestTrayImageClickIdentity(t *testing.T) {
 	onTrayCellClick = func(id string) { clicked <- id }
 	cards := trayCards()
 	cards[1].User = "a\"b\\c@例子.test"
-	cells, _, _ := trayUsageView(cards, time.Now(), false)
+	cells, _, _ := trayUsageView(cards, time.Now(), false, false)
 	for _, layout := range [][]trayCell{cells, trayPlain(cells)} {
 		if trayImageClickAt(layout, true, 22, 5, 0) {
 			t.Fatal("bird intercepted")
@@ -265,7 +265,7 @@ func TestTrayImageClickWithoutBird(t *testing.T) {
 	t.Cleanup(func() { onTrayCellClick = prior })
 	clicked := make(chan string, 1)
 	onTrayCellClick = func(id string) { clicked <- id }
-	cells, _, _ := trayUsageView(trayCards(), time.Now(), false)
+	cells, _, _ := trayUsageView(trayCards(), time.Now(), false, false)
 	for _, layout := range [][]trayCell{cells, trayPlain(cells)} {
 		for i := range layout {
 			x := trayImageCellStart(layout, 22, i) - (22 + 2) + 1 // the same cell, with no bird before it

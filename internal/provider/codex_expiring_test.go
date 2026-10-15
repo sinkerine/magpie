@@ -123,6 +123,14 @@ func TestSpendExpiringCodexResets(t *testing.T) {
 	if read.Load() != 0 || consumed.Load() != 0 {
 		t.Fatalf("not turned on, yet read %d, spent %d", read.Load(), consumed.Load())
 	}
+	// kept to its week used up (#2078): the one about to run out isn't its to spend
+	if err := SetCodexAutoResetCase("me@example.com", ResetCaseWeek, true); err != nil {
+		t.Fatal(err)
+	}
+	SpendExpiringCodexResets(t.Context())
+	if read.Load() != 0 || consumed.Load() != 0 {
+		t.Fatalf("kept to its week, yet read %d, spent %d", read.Load(), consumed.Load())
+	}
 	if err := SetCodexAutoReset("me@example.com", true); err != nil {
 		t.Fatal(err)
 	}
@@ -135,6 +143,65 @@ func TestSpendExpiringCodexResets(t *testing.T) {
 	SpendExpiringCodexResets(t.Context())
 	if read.Load() != n || consumed.Load() != 1 {
 		t.Fatalf("read %d more, spent %d", read.Load()-n, consumed.Load())
+	}
+}
+
+// #2226 (JasonBuildAI): a Codex switched off or removed from magpie is
+// left alone in the background, so the loop reads none of its accounts'
+// allowance and spends none of their resets, even with auto-use on.
+func TestExpiringResetLeftAlone(t *testing.T) {
+	signIn(t)
+	old, oldUntil := expiring.next, expiring.until
+	expiring.next, expiring.until = map[string]time.Time{}, map[string]time.Time{}
+	t.Cleanup(func() { expiring.next, expiring.until = old, oldUntil })
+	soon := time.Now().Add(20 * time.Minute).UTC().Format(time.RFC3339)
+	var read, consumed atomic.Int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/wham/usage":
+			read.Add(1)
+			json.NewEncoder(w).Encode(map[string]any{"plan_type": "pro",
+				"rate_limit": map[string]any{
+					"primary_window":   map[string]any{"used_percent": 0, "limit_window_seconds": 18000},
+					"secondary_window": map[string]any{"used_percent": 35, "limit_window_seconds": 604800, "reset_at": time.Now().Add(72 * time.Hour).Unix()}},
+				"rate_limit_reset_credits": map[string]any{"available_count": 1}})
+		case "/backend-api/wham/rate-limit-reset-credits":
+			json.NewEncoder(w).Encode(map[string]any{"available_count": 1, "credits": []any{
+				map[string]any{"id": "soon", "status": "available", "expires_at": soon},
+			}})
+		case "/backend-api/wham/rate-limit-reset-credits/consume":
+			consumed.Add(1)
+			json.NewEncoder(w).Encode(map[string]any{"code": "reset", "windows_reset": 2})
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	t.Cleanup(fake.Close)
+	oldBase := CodexBase
+	CodexBase = fake.URL + "/backend-api/codex"
+	t.Cleanup(func() { CodexBase = oldBase })
+	if err := SetCodexAutoReset("me@example.com", true); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct {
+		name string
+		p    map[string]any
+	}{
+		{"switched off", map[string]any{"id": "codex", "off": true}},
+		{"removed from magpie", map[string]any{"id": "codex", "hidden": true}},
+	} {
+		writeFile(t, Path(), map[string]any{"providers": []map[string]any{c.p}})
+		SpendExpiringCodexResets(t.Context())
+		if read.Load() != 0 || consumed.Load() != 0 {
+			t.Errorf("%s: read its allowance %d times, spent %d of its resets", c.name, read.Load(), consumed.Load())
+		}
+	}
+	// switched on again, the same pass spends the one running out
+	writeFile(t, Path(), map[string]any{"providers": []map[string]any{{"id": "codex"}}})
+	SpendExpiringCodexResets(t.Context())
+	if consumed.Load() != 1 {
+		t.Fatalf("switched on: spent %d, want the one running out", consumed.Load())
 	}
 }
 

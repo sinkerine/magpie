@@ -68,7 +68,11 @@ type qwenGen struct {
 func qwenEntriesAt(v1 string) []qwenEntry {
 	var out []qwenEntry
 	for _, m := range magpieModels("qwen") {
-		e := qwenEntry{ID: m.ID, Name: magpieID + "/" + m.ID, BaseURL: v1, EnvKey: qwenEnvKey}
+		// name is what /model shows, the id beside it when they differ:
+		// the model's name as every agent's list calls it, by the Provider
+		// in model names setting (magpie/<id> before, which none of the
+		// setting's ways changed)
+		e := qwenEntry{ID: m.ID, Name: m.Name, BaseURL: v1, EnvKey: qwenEnvKey}
 		if m.Context > 0 {
 			e.Generation = &qwenGen{ContextWindowSize: m.Context}
 		}
@@ -324,7 +328,7 @@ func qwenIn(at place) *Agent {
 		},
 		Notice: func() string {
 			if Running(`(^|/)qwen( |$)`) {
-				return "Qwen Code reads a session's model at start-up — start a new session, or /model anew, to use this."
+				return noticeQwen.String()
 			}
 			return ""
 		},
@@ -429,3 +433,8 @@ func qwenOwnOptions(path, cur string) []Option {
 	}
 	return group("Qwen Code", out)
 }
+
+// what qwen says after a change (notice.go)
+var (
+	noticeQwen = newNotice("Qwen Code reads a session's model at start-up — start a new session, or /model anew, to use this.")
+)

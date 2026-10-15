@@ -49,18 +49,29 @@ func codexSign(token func(context.Context) (tok, accountID string, err error)) f
 			return nil
 		}
 		req.Header.Set("Accept", "text/event-stream")
-		var v struct {
-			Key string `json:"prompt_cache_key"`
-		}
-		json.Unmarshal(body, &v)
-		if v.Key != "" {
-			req.Header.Set("session_id", v.Key)
-			req.Header.Set("conversation_id", v.Key)
-		} else {
-			req.Header.Del("session_id")
-			req.Header.Del("conversation_id")
-		}
+		sessionHeaders(req.Header, body)
 		return nil
+	}
+}
+
+// sessionHeaders names the conversation body belongs to (its
+// prompt_cache_key) in the headers Codex CLI 0.162 sends it in, session-id
+// and thread-id. The ChatGPT backend finds a conversation's cached prompt
+// by them, not by the body's key: on a real account a request with tools
+// and the key alone was cached 0 tokens six times in a row, and 7552 of
+// 7659 from the second on with the headers (#1473). The underscored names
+// older Codex sent go no more, since a proxy may drop a header named with
+// an underscore. A body without a key leaves the session the client named.
+func sessionHeaders(h http.Header, body []byte) {
+	h.Del("session_id")
+	h.Del("conversation_id")
+	var v struct {
+		Key string `json:"prompt_cache_key"`
+	}
+	json.Unmarshal(body, &v)
+	if v.Key != "" {
+		h.Set("session-id", v.Key)
+		h.Set("thread-id", v.Key)
 	}
 }
 
@@ -236,7 +247,8 @@ func codexInstructions(model string) string {
 // codexBody makes a Responses request the one Codex CLI would send: it
 // streams only, keeps nothing (so its items carry no ids), carries Codex's
 // instructions — the client's own riding first in the input — and rejects
-// the sampling knobs and any service tier but Fast's and Ultrafast's.
+// the sampling knobs, explicit cache options and any service tier but
+// Fast's and Ultrafast's.
 func codexBody(body []byte) []byte {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
@@ -244,7 +256,12 @@ func codexBody(body []byte) []byte {
 	if dec.Decode(&m) != nil || m == nil {
 		return body
 	}
-	for _, k := range []string{"max_output_tokens", "max_completion_tokens", "temperature", "top_p", "previous_response_id", "user", "safety_identifier"} {
+	// prompt_cache_options, which pi-ai sends as {"mode":"explicit"}: the
+	// ChatGPT backend turns it away on every model it serves ("is not
+	// supported on this model", 400, tried 2026-10-14 on gpt-5.5,
+	// gpt-5.6-sol, gpt-6-sol, gpt-6-astra and gpt-6-luna, #2154); its
+	// cache follows the session-id header instead (#1473)
+	for _, k := range []string{"max_output_tokens", "max_completion_tokens", "temperature", "top_p", "previous_response_id", "user", "safety_identifier", "prompt_cache_options"} {
 		delete(m, k)
 	}
 	// Codex's Fast mode sends "priority", its Ultrafast "ultrafast"; any

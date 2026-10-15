@@ -3,6 +3,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { reach } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const now = new Date();
@@ -183,6 +184,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.setViewportSize({ width: 1100, height: 1000 });
         await page.locator(".rt-reqs").screenshot({ path: path.join(process.env.ARTIFACT_DIR, `${engine}-${lang}-background-memory.png`) });
       }
+      // at 560 By request is under the groups, out of sight: a resize lets
+      // go of what the last click held in place (heldWidth), so the reader
+      // scrolls down to it
+      await reach(page, page.locator(".rt-group-by button").first());
       await page.locator(".rt-group-by button").first().click();
       assert.equal(await page.locator(".rt-req").count(), 11, "by-request view retains all requests");
       assert.deepEqual(errors, []);

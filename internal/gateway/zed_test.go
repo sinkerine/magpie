@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -217,8 +218,13 @@ func TestZedRequestShapes(t *testing.T) {
 func TestZedToolResultSaysIsError(t *testing.T) {
 	req := &Request{Model: "m", MaxTokens: 10, Messages: []Message{
 		{Role: "user", Parts: []Part{{Kind: Text, Text: "run echo hi"}}},
-		{Role: "assistant", Parts: []Part{{Kind: ToolCall, ID: "toolu_1", Name: "bash", Args: json.RawMessage(`{"command":"echo hi","n":12345678901234567890}`)}}},
-		{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: "toolu_1", Text: "hi"}, {Kind: ToolResult, CallID: "toolu_2", Text: "no", IsError: true}}},
+		{Role: "assistant", Parts: []Part{
+			{Kind: ToolCall, ID: "toolu_1", Name: "bash", Args: json.RawMessage(`{"command":"echo hi","n":12345678901234567890}`)},
+			{Kind: ToolCall, ID: "toolu_2", Name: "bash", Args: json.RawMessage(`{"command":"false"}`)},
+		}},
+		// toolu_9 answers no call the request has: it goes as the text it
+		// said (pairToolBlocks), as the cloud refuses it as Anthropic does
+		{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: "toolu_1", Text: "hi"}, {Kind: ToolResult, CallID: "toolu_2", Text: "no", IsError: true}, {Kind: ToolResult, CallID: "toolu_9", Text: "late"}}},
 	}}
 	raw, _, err := zedRequest(req, "anthropic", "claude-sonnet-5-5")
 	if err != nil {
@@ -233,6 +239,7 @@ func TestZedToolResultSaysIsError(t *testing.T) {
 		t.Fatal(err)
 	}
 	var errs []any
+	var texts []string
 	for _, m := range got.Messages {
 		for _, b := range m.Content {
 			if b["type"] == "tool_result" {
@@ -242,6 +249,11 @@ func TestZedToolResultSaysIsError(t *testing.T) {
 				}
 				errs = append(errs, v)
 			}
+			if b["type"] == "text" {
+				if s, ok := b["text"].(string); ok {
+					texts = append(texts, s)
+				}
+			}
 		}
 	}
 	if !bytes.Contains(raw, []byte(`12345678901234567890`)) {
@@ -249,5 +261,8 @@ func TestZedToolResultSaysIsError(t *testing.T) {
 	}
 	if len(errs) != 2 || errs[0] != false || errs[1] != true {
 		t.Errorf("is_error: %v in %s", errs, raw)
+	}
+	if !slices.Contains(texts, "late") {
+		t.Errorf("what the lost result said is not kept: %v in %s", texts, raw)
 	}
 }

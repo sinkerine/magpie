@@ -66,8 +66,19 @@ line.
 and `GET /v1/magpie/route?session=<id>` says which model a routing group
 picked for the turn and the fallbacks it tried, before the first token
 (long-poll with `after=<seq>&wait=<s>`). `GET /v1/magpie/quotas` lists the
-user's subscription allowances. Both answer only this machine, or another
-with a gateway key. [Connecting anything else](reference.md#connecting-anything-else)
+user's subscription allowances, and `GET /v1/magpie/usage` and
+`/v1/magpie/usage/requests` the Usage page's numbers and its requests
+(with `session`, and `subagent`/`parent_agent` for a Claude Code
+subagent's call). They answer only this machine, or another with a gateway
+key; a key held to a budget, models or accounts sees its own calls and
+routes alone, and is refused the quotas unless its owner lets it see
+those of what it may use (`magpie gateway-key quotas <id> on`, #2216;
+its own limit is `GET /v1/magpie/limit`).
+Calls your app makes to its vendor itself can be reported with `POST
+/v1/magpie/usage/requests` (one record or up to 5000 a post, in
+`usage.jsonl`'s shape, each with a `rid`; past times are kept, so a
+history can be backfilled). They show on the Usage page as reported, and
+never count against a key's limit. [Connecting anything else](reference.md#connecting-anything-else)
 has the details.
 
 **Keep the user's providers.** Add magpie as one more provider (named

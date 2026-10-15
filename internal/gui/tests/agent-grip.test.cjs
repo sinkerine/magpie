@@ -21,7 +21,7 @@ const { chromium, webkit } = require("playwright");
 const assets = path.resolve(__dirname, "../assets");
 
 function fixture(lang) {
-  const state = { agents: ["alpha", "beta", "gamma"].map((id) => ({ id, name: id, icon: "generic", path: "/fixture/" + id, fields: [] })), profiles: [], settings: { lang, theme: "light" } };
+  const state = { agents: ["alpha", "beta", "gamma"].map((id) => ({ id, name: id, icon: "generic", path: "/fixture/" + id, fields: [] })), profiles: [], settings: { lang, theme: "light", guideHidden: true } }; // the Get started card put away: these rows are the page, the test reads where they sit
   const posted = [];
   const route = async (route) => {
     const request = route.request(), url = new URL(request.url());
@@ -125,7 +125,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
         // the fold says something is hidden; opened, its Show is there with
         // the pointer away, and brings the row back
-        const more = page.locator("#agents > .agent-more");
+        const more = page.locator("#agents .agent-more");
         assert.match(await more.textContent(), /1/);
         await more.click();
         await page.mouse.move(1, 1);

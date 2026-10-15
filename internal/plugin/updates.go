@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -22,6 +23,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/ghtoken"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
 	"github.com/yetone/magpie/internal/update"
@@ -37,12 +40,16 @@ type Updates struct {
 	Updated []Updated `json:"updated"`
 }
 
-// Waiting is a plugin with a newer version on npm than the one installed.
+// Waiting is a plugin with a newer version on npm than the one installed,
+// or, for one from a git repository (Git), whose repository is at another
+// commit than the one installed: Version and Latest are then the two
+// commits.
 type Waiting struct {
 	Spec    string `json:"spec"`
 	Package string `json:"package"`
 	Version string `json:"version"`
 	Latest  string `json:"latest"`
+	Git     bool   `json:"git,omitempty"`
 }
 
 // Updated is a plugin magpie updated by itself.
@@ -106,6 +113,17 @@ func readUpdates() Updates {
 	return u
 }
 
+// writeUpdates writes b as plugin-updates.json. readUpdates reads a file
+// that doesn't parse as no updates, and Updated, the plugins magpie updated
+// by itself, can't be found again: such a file is kept aside first, and
+// one that can't be isn't written over.
+func writeUpdates(b []byte) error {
+	if err := lastgood.KeepUnparsed(updatesPath(), lastgood.Into[Updates]); err != nil {
+		return err
+	}
+	return writeWhole(updatesPath(), b)
+}
+
 // PendingUpdates is what the last look found, less what has changed since:
 // a plugin updated, removed or switched off since waits no more.
 func PendingUpdates() Updates {
@@ -118,6 +136,10 @@ func PendingUpdates() Updates {
 	}
 	u.Waiting = slices.DeleteFunc(u.Waiting, func(w Waiting) bool {
 		e, ok := have[w.Package]
+		if ok && w.Git {
+			// updated since: the commit installed is the one it was at
+			return e.Off || e.Spec != w.Spec || !GitBehind(e.Spec, w.Latest)
+		}
 		return !ok || e.Off || !update.Newer(w.Latest, Installed(e.Spec))
 	})
 	if u.Waiting == nil {
@@ -146,11 +168,14 @@ func LastUpdated(pkg string, since time.Time) (Updated, bool) {
 // waiting. The plugins updated are loaded again, a reply streaming
 // through the old ones finishing first.
 func CheckUpdates(ctx context.Context) (Updates, error) {
-	var es []Entry
+	var es, gits []Entry
 	var names []string
 	for _, e := range Load().Plugins {
-		// a git one's package may be on npm too, as someone else's
-		if !IsPath(e.Spec) && !IsGit(e.Spec) {
+		// a git one's package may be on npm too, as someone else's: its
+		// repository is asked instead
+		if IsGit(e.Spec) && !e.Off {
+			gits = append(gits, e)
+		} else if !IsPath(e.Spec) && !IsGit(e.Spec) {
 			es = append(es, e)
 			names = append(names, Name(e.Spec))
 		}
@@ -162,6 +187,13 @@ func CheckUpdates(ctx context.Context) (Updates, error) {
 	var waiting []Waiting
 	var made []Updated
 	var errs []error
+	// a git one waits for the reader whoever's it is: its repository's
+	// newest commit is nobody's release
+	for _, e := range gits {
+		if head, err := GitHead(ctx, e.Spec, true); err == nil && GitBehind(e.Spec, head) {
+			waiting = append(waiting, Waiting{Spec: e.Spec, Package: Name(e.Spec), Version: short(GitCommit(e.Spec)), Latest: short(head), Git: true})
+		}
+	}
 	for _, e := range es {
 		pkg, have, now := Name(e.Spec), Installed(e.Spec), latest[Name(e.Spec)]
 		if e.Off || have == "" || now == "" || !update.Newer(now, have) {
@@ -194,7 +226,7 @@ func CheckUpdates(ctx context.Context) (Updates, error) {
 	}
 	if b, err := json.MarshalIndent(u, "", "  "); err == nil {
 		if err := os.MkdirAll(settings.Dir(), 0o700); err == nil {
-			_ = writeWhole(updatesPath(), b)
+			_ = writeUpdates(b)
 		}
 	}
 	updatesMu.Unlock()
@@ -205,6 +237,36 @@ func CheckUpdates(ctx context.Context) (Updates, error) {
 		return u, errs[0]
 	}
 	return u, nil
+}
+
+// InstallMissing installs again each plugin on the list whose package
+// isn't in plugins/ (a git one's too when package.json no longer names
+// it), as its spec says, and says how many it installed. Nothing else
+// does: an update skips a plugin with no version installed, and the host
+// says "no such plugin" for it at every start until the user takes it off
+// and adds it again (#2002, anganing: after an update every plugin
+// switched on said so, on Windows). One switched off is installed too, so
+// it loads when it is switched back on.
+func InstallMissing(ctx context.Context) (int, error) {
+	n := 0
+	var errs []error
+	for _, e := range Load().Plugins {
+		if IsPath(e.Spec) || Installed(e.Spec) != "" {
+			continue
+		}
+		if err := install(ctx, e.Spec); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", e.Spec, err))
+			continue
+		}
+		if err := ensurePi(ctx, Target(e.Spec)); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", e.Spec, err))
+		}
+		n++
+	}
+	if n > 0 {
+		Restart()
+	}
+	return n, errors.Join(errs...)
 }
 
 // KeepUpdated looks for plugin updates a little after magpie starts, then
@@ -221,6 +283,9 @@ func KeepUpdated(ctx context.Context) {
 		}
 		if len(Load().Plugins) > 0 {
 			cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+			if n, err := InstallMissing(cctx); n > 0 || err != nil {
+				log.Printf("installed %d missing plugins again: %v", n, err)
+			}
 			_, _ = CheckUpdates(cctx)
 			cancel()
 		}
@@ -235,18 +300,36 @@ type VersionCheck struct {
 	Version string `json:"version"`          // installed
 	Latest  string `json:"latest,omitempty"` // npm's newest, when it answered
 	// Status is "update" (npm has a newer version), "current", "unknown"
-	// (npm didn't say: Why and Error say why), or "git" or "folder" for
-	// one npm has no versions of
+	// (npm didn't say: Why and Error say why), or "folder" for one that
+	// has no versions to ask about. For a plugin from a git repository it
+	// is its repository's answer: "update" when it is at another commit
+	// than Commit (Head), "current", "unknown" (it didn't say), or "git"
+	// when no commit can be compared (bun named none it installed).
 	Status string `json:"status"`
+	// Commit and Head are a git one's commit installed and its
+	// repository's now, as the page shows them
+	Commit string `json:"commit,omitempty"`
+	Head   string `json:"head,omitempty"`
 	// Why is why npm didn't say: "offline" (not reached), "limited" (too
 	// many requests), "registry" (it answered with an error) or "missing"
 	// (it has no such package)
 	Why   string `json:"why,omitempty"`
 	Error string `json:"error,omitempty"`
+	// Limited is set when a git one's repository couldn't be asked
+	// because GitHub's rate limit was used up, for the page to say so in
+	// its own words, as the library's skills do (#1942)
+	Limited *GitHubLimit `json:"limited,omitempty"`
 	// Auto is whether magpie updates it by itself (the community's,
 	// unpinned, switched on), so an update found would come anyway
 	Auto bool `json:"auto"`
 	Off  bool `json:"off"`
+}
+
+// GitHubLimit is GitHub's rate limit used up: until when (RFC 3339, ""
+// when GitHub didn't say), and whether the request carried a GitHub token.
+type GitHubLimit struct {
+	Until string `json:"until,omitempty"`
+	Token bool   `json:"token,omitempty"`
 }
 
 // VersionChecks is what a check asked now found.
@@ -276,10 +359,40 @@ func CheckNow(ctx context.Context) VersionChecks {
 		case IsPath(e.Spec):
 			c.Status = "folder"
 		case IsGit(e.Spec):
-			c.Status = "git"
+			c.Auto = false
+			if c.Commit = short(GitCommit(e.Spec)); c.Commit == "" {
+				c.Status = "git"
+			}
 		}
 		out[i] = c
 		if c.Status != "" {
+			continue
+		}
+		if IsGit(e.Spec) {
+			wg.Add(1)
+			go func(c *VersionCheck, spec string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				cctx, cancel := context.WithTimeout(ctx, checkEach)
+				head, err := GitHead(cctx, spec, true)
+				cancel()
+				if err != nil {
+					c.Status, c.Why, c.Error = "unknown", whyNot(err), err.Error()
+					var l ghtoken.Limited
+					if errors.As(err, &l) {
+						c.Limited = &GitHubLimit{Token: l.Token}
+						if !l.Until.IsZero() {
+							c.Limited.Until = l.Until.UTC().Format(time.RFC3339)
+						}
+					}
+					return
+				}
+				c.Head, c.Status = short(head), "current"
+				if GitBehind(spec, head) {
+					c.Status = "update"
+				}
+			}(&out[i], e.Spec)
 			continue
 		}
 		wg.Add(1)
@@ -323,7 +436,11 @@ func CheckNow(ctx context.Context) VersionChecks {
 			continue
 		}
 		asked[c.Package] = true
-		if c.Status == "update" && !c.Off && !c.Auto {
+		switch {
+		case c.Status != "update" || c.Off || c.Auto:
+		case c.Head != "":
+			waiting = append(waiting, Waiting{Spec: c.Spec, Package: c.Package, Version: c.Commit, Latest: c.Head, Git: true})
+		default:
 			waiting = append(waiting, Waiting{Spec: c.Spec, Package: c.Package, Version: c.Version, Latest: c.Latest})
 		}
 	}
@@ -335,7 +452,7 @@ func CheckNow(ctx context.Context) VersionChecks {
 	u.Checked, u.Waiting = now, waiting
 	if b, err := json.MarshalIndent(u, "", "  "); err == nil {
 		if err := os.MkdirAll(settings.Dir(), 0o700); err == nil {
-			_ = writeWhole(updatesPath(), b)
+			_ = writeUpdates(b)
 		}
 	}
 	updatesMu.Unlock()
@@ -351,7 +468,7 @@ func whyNot(err error) string {
 	switch {
 	case errors.Is(err, errNotFound):
 		return "missing"
-	case errors.As(err, &se) && se.Code == http.StatusTooManyRequests:
+	case errors.As(err, &se) && se.Code == http.StatusTooManyRequests, errors.As(err, new(ghtoken.Limited)):
 		return "limited"
 	case errors.As(err, &se):
 		return "registry"

@@ -119,7 +119,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#barIconSegs .opt").first().waitFor();
         assert.equal((await page.locator(".om-theme-name").textContent()).trim(), "tokyo-night");
         assert.equal(await page.locator("#themeSegs").isVisible(), false, "the theme is Omarchy's to pick");
-        assert.equal(await page.locator("#langSegs .opt").first().evaluate((b) => getComputedStyle(b).borderTopLeftRadius), "0px", "square");
+        assert.equal(await page.locator("#textSizeSegs .opt").first().evaluate((b) => getComputedStyle(b).borderTopLeftRadius), "0px", "square");
         assert.equal((await page.locator("#barIconRow .name").textContent()).trim(), barName);
 
         // On, then Off: each posted, the pick drawn, the page not moved
@@ -156,7 +156,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.route("**/*", server(lang, theme, { available: false, on: false }, asked, posted));
         await page.goto("http://magpie.test/");
         await page.locator("#prefs").click();
-        await page.locator("#langSegs .opt").first().waitFor();
+        await page.locator("#langPick span").first().waitFor();
         await page.waitForTimeout(300);
         assert(asked.includes("GET /api/omarchy/widget"));
         assert.equal(await page.locator("#barIconRow").isVisible(), false);

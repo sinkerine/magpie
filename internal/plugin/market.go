@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/ghtoken"
 	"github.com/yetone/magpie/internal/source"
+	"github.com/yetone/magpie/internal/update"
 )
 
 // The plugin market: the plugins magpie suggests, from the community
@@ -40,7 +42,7 @@ type Listing struct {
 	Providers []string          `json:"providers,omitempty"` // OpenCode's ids of those it signs in to
 	Community bool              `json:"community,omitempty"` // written by magpie's community
 	Replaces  string            `json:"replaces,omitempty"`  // the built-in subscription it does the work of
-	Kind      string            `json:"kind,omitempty"`      // "middleware" for gateway middleware; none for a provider
+	Kind      string            `json:"kind,omitempty"`      // "middleware" for gateway middleware, "agent" for an agent; none for a provider
 	Summary   map[string]string `json:"summary,omitempty"`   // by language: en, zh
 }
 
@@ -57,6 +59,24 @@ type NPM struct {
 	Homepage    string `json:"homepage,omitempty"`
 	Repository  string `json:"repository,omitempty"`
 	Weekly      int    `json:"weekly"` // downloads last week
+	// Icon is the picture the package gives in package.json's
+	// magpie.icon, as npm has it: magpie checks and keeps it before the
+	// page shows it, as a GitHub-tagged plugin's (the GUI's listings)
+	Icon string `json:"icon,omitempty"`
+}
+
+// ownIcon is a picture a package.json's magpie.icon gives, as host.js's
+// iconOf takes one: an https URL or a data:image URI, not too big; ""
+// for anything else.
+func ownIcon(said string) string {
+	ic := strings.TrimSpace(said)
+	if len(ic) > 3<<19 {
+		return ""
+	}
+	if l := strings.ToLower(ic); strings.HasPrefix(l, "https://") || strings.HasPrefix(l, "data:image/") {
+		return ic
+	}
+	return ""
 }
 
 var (
@@ -219,6 +239,10 @@ func fetchJSONFrom(ctx context.Context, u string, limit int64, do func(*http.Cli
 	}
 	req.Header.Set("User-Agent", "magpie")
 	req.Header.Set("Accept", "application/json")
+	// GitHub's API is asked with the user's GitHub token, as the
+	// library's skills are: without one it answers an address 60
+	// requests an hour, which a few git plugins' checks use up (#1942)
+	token := ghtoken.Authorize(req, githubAPI)
 	res, err := do(http.DefaultClient, req)
 	if err != nil {
 		return nil, err
@@ -227,6 +251,15 @@ func fetchJSONFrom(ctx context.Context, u string, limit int64, do func(*http.Cli
 	if res.StatusCode == http.StatusNotFound {
 		return nil, errNotFound
 	}
+	if res.StatusCode != http.StatusOK && sameHost(u, githubAPI) {
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
+		if e, ok := ghtoken.LimitedBy(res, body, token); ok {
+			return nil, e
+		}
+		if res.StatusCode == http.StatusUnauthorized && token {
+			return nil, ghtoken.Refused()
+		}
+	}
 	if res.StatusCode != http.StatusOK {
 		return nil, &statusError{URL: u, Code: res.StatusCode, Status: res.Status}
 	}
@@ -234,6 +267,13 @@ func fetchJSONFrom(ctx context.Context, u string, limit int64, do func(*http.Cli
 }
 
 var errNotFound = errors.New("not found")
+
+// sameHost is whether u is on base's host.
+func sameHost(u, base string) bool {
+	a, err1 := url.Parse(u)
+	b, err2 := url.Parse(base)
+	return err1 == nil && err2 == nil && a.Host != "" && strings.EqualFold(a.Host, b.Host)
+}
 
 // statusError is a server's answer other than 200 or 404.
 type statusError struct {
@@ -328,6 +368,9 @@ type npmLatest struct {
 	NPMUser struct {
 		Name string `json:"name"`
 	} `json:"_npmUser"`
+	Magpie struct {
+		Icon string `json:"icon"`
+	} `json:"magpie"`
 }
 
 func person(v any) string {
@@ -392,13 +435,7 @@ func npmAsk(ctx context.Context, name string) (NPM, error) {
 			latestErr = err
 			return
 		}
-		info.Version, info.Description, info.Homepage = l.Version, l.Description, l.Homepage
-		info.License, _ = l.License.(string)
-		info.Repository = repoURL(l.Repository)
-		info.Publisher = person(l.Author)
-		if info.Publisher == "" {
-			info.Publisher = l.NPMUser.Name
-		}
+		info = npmOf(l)
 	}()
 	var weekly int
 	go func() {
@@ -413,11 +450,30 @@ func npmAsk(ctx context.Context, name string) (NPM, error) {
 		}
 	}()
 	wg.Wait()
+	// a @magpie-community package npm doesn't have yet, or has an older
+	// version of, is as the community repo's dist branch has it, which
+	// magpie installs it from (dist.go)
+	if d, ok := distInfo(ctx, name); ok && (latestErr != nil || update.Newer(d.Version, info.Version)) {
+		info, latestErr = d, nil
+	}
 	info.Weekly = weekly
 	if latestErr != nil {
 		return NPM{}, latestErr
 	}
 	return info, nil
+}
+
+// npmOf is what a version's package.json says, as NPM has it.
+func npmOf(l npmLatest) NPM {
+	info := NPM{Version: l.Version, Description: l.Description, Homepage: l.Homepage}
+	info.License, _ = l.License.(string)
+	info.Repository = repoURL(l.Repository)
+	info.Publisher = person(l.Author)
+	info.Icon = ownIcon(l.Magpie.Icon)
+	if info.Publisher == "" {
+		info.Publisher = l.NPMUser.Name
+	}
+	return info
 }
 
 // Hit is a package npm's search found.
@@ -547,6 +603,11 @@ func Readme(ctx context.Context, name string) (Page, error) {
 	defer cancel()
 	b, err := fetchJSON(ctx, npmRegistry+"/"+npmPath(name), 32<<20)
 	if err != nil {
+		// one npm doesn't have (yet): the README the community repo's
+		// dist branch packed with it
+		if d := distPkg(ctx, name); d != nil && d.Readme != "" {
+			return Page{Readme: d.Readme}, nil
+		}
 		return Page{}, err
 	}
 	var d struct {
@@ -612,6 +673,26 @@ func Installed(spec string) string {
 	var p struct{ Version string }
 	_ = json.Unmarshal(b, &p)
 	return p.Version
+}
+
+// InstalledIcon is the picture the installed plugin spec's package.json
+// gives in magpie.icon, as ownIcon takes one: the plugin's own, for its
+// row, apart from those its providers give themselves in the auth hook
+// (#1775). "" for none, or a plugin that is one file.
+func InstalledIcon(spec string) string {
+	b, err := os.ReadFile(filepath.Join(Target(spec), "package.json"))
+	if err != nil {
+		return ""
+	}
+	var p struct {
+		Magpie struct {
+			Icon string `json:"icon"`
+		} `json:"magpie"`
+	}
+	if json.Unmarshal(b, &p) != nil {
+		return ""
+	}
+	return ownIcon(p.Magpie.Icon)
 }
 
 // Upgrade installs the newest version of one plugin: npm's, or its git

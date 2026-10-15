@@ -226,6 +226,10 @@ func TestLaneReleasedOnFailure(t *testing.T) {
 		io.WriteString(w, "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
 	}))
 	t.Cleanup(up.Close)
+	// runs before up.Close, which waits for a's held request: a check that
+	// fails before the gate opens below doesn't leave it held (#1808)
+	let := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(let)
 	one := 1
 	if err := provider.Save(provider.Provider{ID: "slow", Name: "Slow", Key: "k", Models: []string{"m"}, Chat: up.URL + "/v1", MaxConcurrency: &one}); err != nil {
 		t.Fatal(err)
@@ -236,7 +240,7 @@ func TestLaneReleasedOnFailure(t *testing.T) {
 	within(t, "a out", func() bool { return lane().Busy == 1 })
 	g.send(context.Background(), "/v1/chat/completions", "slow/m", "b")
 	within(t, "b queued", func() bool { return lane().Waiting == 1 })
-	close(gate)
+	let()
 	got := map[string]laneReply{}
 	for range 2 {
 		r := g.reply()

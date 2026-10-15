@@ -26,6 +26,7 @@ func restsOf(cs []candidate) string {
 }
 
 func TestRouting(t *testing.T) {
+	forgetRouting()
 	cs := []candidate{{rest: "r#a"}, {rest: "r#b"}, {rest: "r#c"}}
 	p := provider.Provider{ID: "r"}
 	if got := restsOf(route(p, cs, "m", provider.Chat)); got != "r#a r#b r#c " {
@@ -98,6 +99,7 @@ func TestRoutingKeepsModelAllowancesSeparate(t *testing.T) {
 // Smart routing keeps the first while it has quota to spare, then goes to
 // whichever has the most; a failure rests as long as it says.
 func TestSmartRouting(t *testing.T) {
+	forgetRouting()
 	old := allowances
 	defer func() { allowances = old }()
 	one := func(used float64, resets time.Time) provider.Allowance {
@@ -120,7 +122,7 @@ func TestSmartRouting(t *testing.T) {
 	}
 
 	// the allowance renewing soonest goes first: what it has left is lost
-	// at its reset; one not known, or already renewed, after
+	// at its reset; an already renewed account is unused and goes first
 	now := time.Now()
 	share = map[string]provider.Allowance{
 		"a": one(5, now.Add(6*24*time.Hour)),
@@ -131,13 +133,13 @@ func TestSmartRouting(t *testing.T) {
 		"f": one(99, now.Add(-time.Hour)), // used up, but that has renewed since
 	}
 	cs = []candidate{acct("a"), acct("b"), acct("c"), acct("d"), acct("e"), acct("f")}
-	if got := restsOf(route(p, cs, "m", provider.Chat)); got != "s#b s#d s#a s#c s#f s#e " {
+	if got := restsOf(route(p, cs, "m", provider.Chat)); got != "s#f s#b s#d s#a s#c s#e " {
 		t.Fatalf("by reset: %s", got)
 	}
 	// minutes apart is the same hour: the order given stays
 	share["a"] = one(5, share["b"][0].Resets.Truncate(time.Hour).Add(time.Minute))
 	share["b"] = one(70, share["b"][0].Resets.Truncate(time.Hour).Add(2*time.Minute))
-	if got := restsOf(route(p, cs, "m", provider.Chat)[:2]); got != "s#a s#b " {
+	if got := restsOf(route(p, cs, "m", provider.Chat)[1:3]); got != "s#a s#b " {
 		t.Fatalf("same hour: %s", got)
 	}
 
@@ -189,6 +191,14 @@ func TestSmartRouting(t *testing.T) {
 		{429, "You've hit your limit · resets 5pm (Asia/Shanghai)", failQuota},
 		{502, "Claude AI usage limit reached|1790000000", failQuota},
 		{503, `overloaded`, failOther},
+		// a 5xx is the server's, whatever its words, unless the vendor's
+		// quota code says otherwise (#1418)
+		{500, `当前模型 gpt-5.5 负载已经达到上限，请稍后重试 (request id: 20261011161901234567890abcdefgh)`, failOther},
+		{503, `{"error":{"message":"upstream quota service unavailable"}}`, failOther},
+		{500, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":3600}}`, failQuota},
+		{503, `{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}`, failQuota},
+		{403, `今日额度已达上限`, failQuota},
+		{429, `{"error":{"message":"当前分组上游负载已饱和，请稍后再试"}}`, failRate},
 	} {
 		if got := failure(c.status, []byte(c.body)); got != c.want {
 			t.Errorf("%d %s: %s, want %s", c.status, c.body, got, c.want)

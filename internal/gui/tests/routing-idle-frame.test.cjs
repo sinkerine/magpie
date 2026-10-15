@@ -16,7 +16,7 @@ const { chromium, webkit } = require("playwright");
 const engines = process.env.BROWSER ? [process.env.BROWSER] : ["webkit"];
 
 const assets = path.resolve(__dirname, "../assets");
-const routing = path.join(assets, "routing.js");
+const routing = path.join(assets, "plugins/routing/client.js");
 const iso = (ms) => new Date(ms).toISOString();
 const acct = (n) => ({ id: `acct-${n}`, provider: `prov${n}`, name: `Provider ${n}`, who: `user${n}@example.com`, kind: "account", model: `model-${n}`, known: true, used: 10 * n, plan: "Pro" });
 const agentsOf = ["codex", "claude", "opencode", "kimi"];
@@ -80,7 +80,7 @@ const selfRaf = (src) => { const m = src.match(/requestAnimationFrame\s*\(\s*([A
 
 test("the loop's frame is still there to be counted, and asks for itself", async () => {
   const src = await fs.readFile(routing, "utf8");
-  assert(byName(src) || selfRaf(src), "routing.js must still keep its frame loop in a function of its own, or the test below counts nothing");
+  assert(byName(src) || selfRaf(src), "routing/client.js must still keep its frame loop in a function of its own, or the test below counts nothing");
 });
 
 for (const engine of engines) for (const lang of ["en", "zh"]) {

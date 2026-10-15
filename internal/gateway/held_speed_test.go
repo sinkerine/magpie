@@ -133,12 +133,22 @@ var kimiShapes = []kimiShape{
 
 // The reply's speed as each agent's protocol has it, through the real
 // gateway from a fake Kimi Code: the held replies tell none, the steady one
-// its 50 tok/s. The wait is shorter than John's (first content at 1.3 s,
-// the end at 4 s) to keep the test short; the burst is his, 236 ms.
+// its 50 tok/s. The wait is shorter than John's (first content at 0.5 s,
+// the end at 7 s) to keep the test short; the burst is his, 236 ms.
 // Before, the held call read 1,790 tok/s and the held answer 2,237.
+//
+// The wait is still long enough that a pause of the machine running it
+// doesn't change what the replies tell. The held call is told held by its
+// flow (~245 ms) under a quarter of its window from its first text
+// (usage.HeldShare): a window of 6.3 s takes a flow under ~1.6 s, so the
+// burst can be split by a pause of a second and still tell none. The
+// steady one, timed over the same window, stays within its 20% with a
+// pause as long. With the end at 4 s and the first content at 1.3 s (a
+// window of 2.5 s), one pause of ~520 ms mid-burst on macOS CI under
+// -race read the held call at 176 tok/s (#1469).
 func TestKimiHeldBurstTellsNoSpeed(t *testing.T) {
 	fresh(t)
-	const first, end = 1300 * time.Millisecond, 4000 * time.Millisecond
+	const first, end = 500 * time.Millisecond, 7000 * time.Millisecond
 	agents := []struct{ path, body string }{
 		{"/v1/chat/completions", `{"model":"kimi-code/%s","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"write the file"}],"tools":[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"content":{"type":"string"}}}}}]}`},
 		{"/v1/responses", `{"model":"kimi-code/%s","stream":true,"input":"write the file","tools":[{"type":"function","name":"write","parameters":{"type":"object","properties":{"content":{"type":"string"}}}}]}`},

@@ -26,15 +26,25 @@ today.setHours(0, 0, 0, 0);
 const from = new Date(today);
 from.setDate(from.getDate() - ((today.getDay() + 6) % 7) - 7 * 52);
 const SPAN = Math.round((today - from) / 864e5) + 1; // 7 × 52 + this week's days so far
-// a day of every fifth quiet; the busiest by tokens is today, by requests ten days ago
+// a day of every fifth quiet; the busiest by tokens is today, by requests ten
+// days ago (never one of the quiet: on a Sunday SPAN - 11 is a fifth day)
 const DAYS = [];
 for (let i = 0; i < SPAN; i++) {
   const d = new Date(from);
   d.setDate(d.getDate() + i);
-  if (i % 5 === 0 && i !== SPAN - 1) continue;
+  if (i % 5 === 0 && i !== SPAN - 1 && i !== SPAN - 11) continue;
   const calls = i === SPAN - 11 ? 500 : (i % 13) + 1;
   DAYS.push({ date: iso(d), calls, tokens: i === SPAN - 1 ? 9e9 : calls * 1e5 * (1 + (i % 7)), cost: calls * 0.5 });
 }
+// #1921's four days, their tokens as the reporter's ledger had them: the
+// busiest two are 2% apart, the quietest two more than twice
+const ago = (n) => iso(new Date(today.getFullYear(), today.getMonth(), today.getDate() - n));
+const FEW = [
+  { date: ago(3), calls: 1889, tokens: 145001026, cost: 1.21 },
+  { date: ago(2), calls: 400, tokens: 18162196, cost: 0.3 },
+  { date: ago(1), calls: 1322, tokens: 141812013, cost: 7.81 },
+  { date: ago(0), calls: 600, tokens: 40766476, cost: 0.9 },
+];
 const ROW = { t: new Date().toISOString(), agent: "claude", agentName: "Claude Code", icon: "claudecode-color", provider: "anthropic", providerName: "Claude", model: "claude-sonnet-5", req: "sonnet", in: 2, out: 600, cache_write: 900, cache_read: 390000, ms: 2380, status: 200, cost: 0.087, priced: true };
 const share = (id, name) => ({ id, name, icon: "generic", calls: 1, errors: 0, input: 2, output: 600, cache_write: 900, cache_read: 390000, cost: 0.087 });
 const PAGE = {
@@ -53,7 +63,7 @@ function server(lang, theme, variant, asked) {
     if (url.pathname === "/api/usage/requests") return json(PAGE);
     if (url.pathname === "/api/usage/heatmap") {
       asked.push(url.searchParams);
-      return json({ from: iso(from), to: iso(today), days: variant === "none" ? [] : DAYS });
+      return json({ from: iso(from), to: iso(today), days: variant === "none" ? [] : variant === "few" ? FEW : DAYS });
     }
     if (url.pathname === "/api/usage/quotas") return json([]);
     if (url.pathname === "/api/usage") return json({ calls: 1, errors: 0, input: 1, output: 1, cache_read: 0, cache_write: 0, reasoning: 0, unpriced: 0, cost: 1, bucket: "day", series: [], agents: [], models: [], path: "~/.config/magpie/usage.jsonl" });
@@ -89,7 +99,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await p.route("**/*", server(lang, theme, variant, asked));
       await p.goto("http://magpie.test/");
       await p.locator('[data-view="usage"]').first().click();
-      await p.locator("#usageTab .opt").nth(1).click();
+      await p.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
       await p.locator("#ledRank .rk").first().waitFor();
       return { p, errors, asked, context };
     };
@@ -141,7 +151,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         else assert(!sc.over, "a wide card holds every week");
 
         // the pointer on a day: its date and what it had, inside the card
-        const busy = DAYS.find((d) => d.date === iso(new Date(today.getTime() - 10 * 864e5)));
+        const busy = DAYS.find((d) => d.date === iso(new Date(today.getFullYear(), today.getMonth(), today.getDate() - 10)));
         const cell = heat.locator(`.heat-grid i[data-date="${busy.date}"]`);
         // the reader wheels the page to the card (magpie puts back a scroll by
         // code), and the pointer then rests on a day
@@ -193,11 +203,27 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       });
     }
 
+    // a few days are shaded by their share of the busiest, not by quartiles
+    // that each hold one day (#1921)
+    await t.test("a few days", async () => {
+      const { p, errors, context } = await open("en", { width: 1100, variant: "few" });
+      const cells = p.locator("#ledHeat .heat-grid i");
+      await cells.first().waitFor();
+      const shade = (n) => p.locator(`#ledHeat .heat-grid i[data-date="${ago(n)}"]`).getAttribute("class");
+      assert.deepEqual([await shade(3), await shade(1), await shade(0), await shade(2), await shade(4)], ["l4", "l4", "l2", "l1", "l0"]);
+      assert.deepEqual(errors, []);
+      await context.close();
+    });
+
     await t.test("dark, and none", async () => {
       const { p, errors, context } = await open("en", { width: 1100, theme: "dark" });
       await p.locator("#ledHeat .heat-grid i").first().waitFor();
-      // a frame for the reduced-motion transitions the shades start with
-      await p.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+      // the shades start with reduced motion's .01ms transitions, which
+      // Chromium under load can still hold at their start two frames later
+      await p.evaluate(async () => {
+        await new Promise((r) => requestAnimationFrame(r));
+        await Promise.all(document.querySelector("#ledHeat").getAnimations({ subtree: true }).map((a) => a.finished));
+      });
       const [l0, l4, card] = await p.evaluate(() => [".heat-grid i.l0", ".heat-grid i.l4", "#ledHeat"].map((s) => getComputedStyle(document.querySelector(s)).backgroundColor));
       assert(l0 !== l4 && l0 !== card, `dark shades: ${l0} ${l4} on ${card}`);
       if (shots) await p.locator("#ledHeat").screenshot({ path: path.join(shots, `heatmap-${engine}-dark.png`) });

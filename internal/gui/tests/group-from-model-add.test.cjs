@@ -118,7 +118,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // every label beside its own field, or over it where the editor is one
         // column: a hidden classifier left its cell behind, and Levels' label
         // sat at the right, its choices below. Under 760px the editor is one
-        // column on purpose (routing.css), so the label is above its field
+        // column on purpose (plugins/routing/routing.css), so the label is above its field
         // there — beside is only what a wide window can ask for.
         const oneColumn = width <= 760;
         const rows = await ed.evaluate((e, oneColumn) => [...e.children].filter((c) => c.matches("label") && !c.hidden && c.offsetParent).map((l) => {

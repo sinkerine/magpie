@@ -10,6 +10,25 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 )
 
+func TestFromCodex(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		head http.Header
+		want bool
+	}{
+		{"acp user-agent", http.Header{"User-Agent": {"acp-extension-codex/0.160.1 (Mac OS 26.2.0; arm64) unknown (acp-extension-codex; 0.9.0)"}}, true},
+		{"acp originator", http.Header{"Originator": {"acp-extension-codex"}}, true},
+		{"other agent", http.Header{"User-Agent": {"opencode/1.0"}}, false},
+		{"host client name", http.Header{"Originator": {"lody"}}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := fromCodex(c.head); got != c.want {
+				t.Errorf("fromCodex(%v) = %t, want %t", c.head, got, c.want)
+			}
+		})
+	}
+}
+
 // A relay that serves only Codex (Discord: "This account only allows Codex
 // official clients", sub2api's codex_cli_only: an official User-Agent or
 // originator, and an x-codex- header) gets Codex's own headers as it sent
@@ -43,7 +62,7 @@ func TestCodexHeadersReachKeyedRelay(t *testing.T) {
 			"application/json", `{"id":"r","object":"response","status":"completed","output":[]}`},
 		// Codex's default web_search makes magpie build the request again
 		{provider.Responses, "/v1/responses", `{"model":"fake/m1","input":"hi","stream":false,"tools":[{"type":"web_search","external_web_access":false}]}`,
-			"", "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n"},
+			"", "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n"},
 		{provider.Chat, "/v1/responses", `{"model":"fake/m1","input":"hi","stream":false}`,
 			"", "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"},
 	} {

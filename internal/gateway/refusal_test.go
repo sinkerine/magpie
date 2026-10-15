@@ -203,7 +203,8 @@ func TestContentFilterFailsOver(t *testing.T) {
 
 // With nobody else to ask, the agent is told it was refused, as a request
 // not to send again as it is — not handed an empty reply that looks whole —
-// and the usage says it failed.
+// and the usage says it failed. An agent on Anthropic's API has the
+// vendor's refusal itself, which says so in its own words.
 func TestRefusalWithNobodyLeftIsAnError(t *testing.T) {
 	fresh(t)
 	a := &scripted{replies: []reply{{200, "text/event-stream", anthropicRefusal}}}
@@ -221,12 +222,14 @@ func TestRefusalWithNobodyLeftIsAnError(t *testing.T) {
 		t.Fatalf("route: %+v", r)
 	}
 
-	// a model asked by its own name, on Anthropic's API
+	// a model asked by its own name, on Anthropic's API: the vendor's
+	// refusal as it said it, for Claude Code to switch to its fallback
+	// model on, which a 400 isn't to it (DD on Discord)
 	fresh(t)
 	a = &scripted{replies: []reply{{200, "text/event-stream", anthropicRefusal}}}
 	scriptedOn(t, "a", provider.Anthropic, a)
 	code, body = sendTo(New(), "/v1/messages", `{"model":"a/m","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
-	if code != 400 || !strings.Contains(body, `"invalid_request_error"`) || !strings.Contains(body, "refused this request") || a.n != 1 {
+	if code != 200 || !strings.Contains(body, `"stop_reason":"refusal"`) || !strings.Contains(body, "message_stop") || strings.Contains(body, "refused this request") || a.n != 1 {
 		t.Fatalf("messages: %d %s (a %d)", code, body, a.n)
 	}
 

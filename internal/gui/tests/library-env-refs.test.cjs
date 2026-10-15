@@ -14,6 +14,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { strings } = require("./strings.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const HOME = "/Users/emo";
@@ -26,8 +27,7 @@ const lib = (servers) => ({
 
 let I18N;
 async function loadI18N() {
-  const src = await fs.readFile(path.join(assets, "i18n.js"), "utf8");
-  I18N = new Function(src.slice(0, src.indexOf("\n};") + 3) + "; return I18N;")();
+  I18N = strings().I18N; // i18n.js's and the plugins'
 }
 function tr(lang, key, vars = {}) {
   let s = key;

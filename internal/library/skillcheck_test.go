@@ -157,7 +157,7 @@ func TestCheckSkills(t *testing.T) {
 	clear(asked)
 	got = check(t)
 	for _, n := range []string{"pdf", "docx", "x", "y"} {
-		if c := got[n]; c.Status != "unknown" || c.Error != (errLimited{until: time.Unix(2000000000, 0)}).Error() {
+		if c := got[n]; c.Status != "unknown" || c.Error != (errLimited{Until: time.Unix(2000000000, 0)}).Error() {
 			t.Errorf("%s: %+v", n, c)
 		}
 	}

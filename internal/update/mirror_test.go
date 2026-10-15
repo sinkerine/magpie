@@ -168,6 +168,31 @@ func TestUpdateThroughAProxyGiven(t *testing.T) {
 	}
 }
 
+// #1886: CheckProxy's error, shown in the GUI and the CLI, names the
+// proxy without its user and password.
+func TestCheckProxyErrorShowsNoCredentials(t *testing.T) {
+	for _, c := range []struct{ proxy, shown string }{
+		{"ftp://alice:s3cret@10.0.0.2:21", `"ftp://10.0.0.2:21"`},
+		{"socks4://ali%40ce:s3%3Acret@10.0.0.2:1080", `"socks4://10.0.0.2:1080"`},
+		{"socks4://alice@10.0.0.2:1080", `"socks4://10.0.0.2:1080"`},
+		{"http://alice:s3cret@", ""},
+		{"alice:s3cret%zz@10.0.0.2:8080", ""},
+	} {
+		err := CheckProxy(c.proxy)
+		if err == nil {
+			t.Fatalf("%s taken as a proxy", c.proxy)
+		}
+		if c.shown != "" && !strings.Contains(err.Error(), c.shown) {
+			t.Errorf("%s: %v, want it to name %s", c.proxy, err, c.shown)
+		}
+		for _, secret := range []string{"ali", "s3"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("%s: %v shows %q", c.proxy, err, secret)
+			}
+		}
+	}
+}
+
 // A download that fails through a mirror says it is the mirror's (#893):
 // one that doesn't answer, answers 404, or sends another file, which is
 // never kept; the GUI then offers GitHub itself. One from GitHub is no

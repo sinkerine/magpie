@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -119,24 +121,17 @@ func (r piReply) seen(t *testing.T) map[string]any {
 // from pi's stream: text, thinking with its signature, tool calls and
 // their thought signatures back, usage, and a failure's status.
 func TestPiPackage(t *testing.T) {
-	home, _ := os.UserHomeDir()
 	sandbox(t)
-	// pi is fetched once into Bun's own cache, not each run's HOME
-	if os.Getenv("BUN_INSTALL_CACHE_DIR") == "" && home != "" {
-		t.Setenv("BUN_INSTALL_CACHE_DIR", filepath.Join(home, ".bun", "install", "cache"))
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
+	installPinnedPi(t, ctx)
 	abs, _ := filepath.Abs("testdata/pi")
 	if _, err := Add(ctx, abs); err != nil {
-		if strings.Contains(err.Error(), "bun add") {
-			t.Skipf("pi couldn't be installed: %v", err)
-		}
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(Dir(), "node_modules", "@earendil-works", "pi-coding-agent", "package.json")); err != nil {
-		t.Fatalf("pi wasn't installed with the package: %v", err)
+	if v := Version(piAgent); v != pinnedPi {
+		t.Fatalf("pi is %q after adding the package, not the %s the lock has", v, pinnedPi)
 	}
 	ls, err := Plugins(ctx)
 	if err != nil || len(ls) != 1 || ls[0].Error != "" {
@@ -273,6 +268,21 @@ func TestPiPackage(t *testing.T) {
 	if md["type"] != "message_delta" || md["delta"].(map[string]any)["stop_reason"] != "end_turn" || u["input_tokens"] != 11.0 || u["output_tokens"] != 7.0 || u["cache_read_input_tokens"] != 3.0 || u["cache_creation_input_tokens"] != 2.0 {
 		t.Fatalf("message_delta = %v", md)
 	}
+	// message_start tells the prompt's usage pi's start named, which
+	// Claude Code's context meter reads before message_delta (#1887)
+	if u := r.events[0]["message"].(map[string]any)["usage"].(map[string]any); u["input_tokens"] != 11.0 || u["output_tokens"] != 0.0 || u["cache_read_input_tokens"] != 3.0 || u["cache_creation_input_tokens"] != 2.0 {
+		t.Fatalf("message_start's usage = %v", u)
+	}
+	// and the prompt pi-ai's anthropic-messages counts only after its
+	// start, on the message the events after it share, which goes on being
+	// written: its output isn't the start's
+	r = piAsk(t, ctx, "fakepi", "fp-plain", map[string]any{"max_tokens": 100, "stream": true, "messages": []map[string]any{{"role": "user", "content": "late"}}})
+	if u := r.events[0]["message"].(map[string]any)["usage"].(map[string]any); u["input_tokens"] != 11.0 || u["output_tokens"] != 0.0 || u["cache_read_input_tokens"] != 3.0 || u["cache_creation_input_tokens"] != 2.0 {
+		t.Fatalf("message_start's usage, counted after pi's start = %v", u)
+	}
+	if u := r.events[len(r.events)-2]["usage"].(map[string]any); u["input_tokens"] != 11.0 || u["output_tokens"] != 7.0 || u["cache_read_input_tokens"] != 3.0 || u["cache_creation_input_tokens"] != 2.0 {
+		t.Fatalf("message_delta's usage, counted after pi's start = %v", u)
+	}
 
 	// a model that can't think less than "low" is asked to, one that
 	// doesn't think isn't
@@ -385,5 +395,96 @@ func TestSearchFindsPiPackages(t *testing.T) {
 	}
 	if err != nil || !slices.Equal(names, []string{"opencode-antigravity-auth", "pi-antigravity"}) {
 		t.Fatalf("Search = %v, %v", names, err)
+	}
+}
+
+// pinnedPi is the pi testdata/pi-lock installs. Its bun.lock names every
+// package of pi at a version and its npm integrity, so the test runs on
+// the same pi each time. Installed as ensurePi installs it, at npm's
+// latest, the test ran on whatever pi's packages were that minute: in the
+// three minutes between @earendil-works/pi-codemode 1.2.0 (which dropped
+// MCP_TYPESCRIPT_PREAMBLE) and pi-coding-agent 1.2.0, latest was
+// pi-coding-agent 1.1.0, whose ^1.1.0 took pi-codemode 1.2.0, and pi
+// didn't load (#1879). To move to a newer pi, set its version in
+// testdata/pi-lock/package.json and run `bun install --ignore-scripts`
+// there, with npm's registry, to write the lock again.
+const pinnedPi = "1.2.0"
+
+// installPinnedPi installs testdata/pi-lock's pi into the plugins folder
+// with its lock frozen, as the folder would have it after ensurePi.
+func installPinnedPi(t *testing.T, ctx context.Context) {
+	t.Helper()
+	if err := os.MkdirAll(Dir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"package.json", "bun.lock"} {
+		b, err := os.ReadFile(filepath.Join("testdata", "pi-lock", f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(Dir(), f), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bun, err := Bun(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := bunCommand(ctx, bun, Dir(), "install", "--frozen-lockfile", "--ignore-scripts").CombinedOutput(); err != nil {
+		t.Skipf("pi couldn't be installed: %v: %s", err, lastLines(string(out), 6))
+	}
+	if v := Version(piAgent); v != pinnedPi {
+		t.Fatalf("installed pi %q, the lock has %s", v, pinnedPi)
+	}
+}
+
+// A pi package added without pi has pi installed with it (ensurePi), once;
+// with pi there already, and for an OpenCode plugin, nothing is installed.
+func TestEnsurePi(t *testing.T) {
+	// sandbox's folders, without the Bun on PATH it needs: bun never runs
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_BUN", self) // never downloaded
+	var ran [][]string
+	orig := bunCommand
+	bunCommand = func(ctx context.Context, bun, dir string, args ...string) *exec.Cmd {
+		ran = append(ran, args)
+		if dir != Dir() {
+			t.Errorf("bun ran in %s, not the plugins folder", dir)
+		}
+		// as bun add leaves it; the test binary running no test stands in
+		// for bun
+		if err := os.MkdirAll(Target(piAgent), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(Target(piAgent), "package.json"), []byte(`{"version":"9.9.9"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return exec.CommandContext(ctx, self, "-test.run=^$")
+	}
+	t.Cleanup(func() { bunCommand = orig })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	opencode, _ := filepath.Abs("testdata/fake/index.js")
+	if err := ensurePi(ctx, opencode); err != nil || len(ran) != 0 {
+		t.Fatalf("an OpenCode plugin: bun ran %q, %v", ran, err)
+	}
+	pi, _ := filepath.Abs("testdata/pi")
+	if err := ensurePi(ctx, pi); err != nil {
+		t.Fatal(err)
+	}
+	if want := [][]string{{"add", "--ignore-scripts", piAgent}}; !reflect.DeepEqual(ran, want) {
+		t.Fatalf("bun ran %q, want %q", ran, want)
+	}
+	if err := ensurePi(ctx, pi); err != nil || len(ran) != 1 {
+		t.Fatalf("with pi installed: bun ran %q, %v", ran, err)
 	}
 }

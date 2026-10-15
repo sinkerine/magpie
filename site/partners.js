@@ -2,8 +2,8 @@
 // magpie's "Add provider" sheet, under a heading that says they sponsor
 // magpie. The app fetches this list from /api/partners every six hours and
 // keeps it (internal/provider/partners.go), so a change here reaches users
-// with `npx wrangler deploy`, no release. At most 12 are listed, in this
-// order.
+// with `npx wrangler deploy`, no release. At most 12 whose term hasn't
+// ended are listed, in this order.
 //
 // An entry is a preset (internal/provider/presets.go) and a few fields more:
 //
@@ -26,4 +26,10 @@
 //   from, until  RFC 3339 times bounding when it is listed (the paid term)
 //
 // Every URL is https. An entry that breaks a rule is left out by the app.
+//
+// The app gets keysUrl and website (a region's too) as usemagpie.ai/go/…
+// links, which count the click and send the browser on (worker.js). The
+// providers users add keep those links, so an entry stays here after its
+// term ends: /api/partners leaves it out, /go still finds it. Remove one
+// only when nobody can still be using it.
 export const PARTNERS = [];

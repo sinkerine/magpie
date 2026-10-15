@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -164,7 +163,7 @@ func SawCodexClient(h http.Header) {
 // PATH it looks where npm, nvm, bun, volta, pnpm, mise and the standalone
 // installer put it, which a desktop app's PATH lacks.
 var codexExecutable = func() string {
-	if p, err := exec.LookPath("codex"); err == nil {
+	if p, err := proc.LookPath("codex"); err == nil {
 		return p
 	}
 	names := []string{"codex"}
@@ -430,6 +429,28 @@ func CodexNativeHidden() map[string]bool {
 	return out
 }
 
+// CodexNativeUnlisted is the ChatGPT account's own models kept out of the
+// lists agents see, which the backend lists to Codex all the same: every
+// one (all) when the codex provider serves only through routing groups
+// (Provider.Unlisted), and by slug those a routing group keeps out of the
+// lists (Group.Unlists). The gateway drops them from its /models answer as
+// it does the ones hidden; Codex then reaches them only through its groups
+// (#1602). A provider switched off keeps none out: it serves nothing, and
+// its setting is kept for when it is switched on again.
+func CodexNativeUnlisted() (all bool, slugs map[string]bool) {
+	p, ok := find(All(), "codex")
+	all = ok && !p.Off && p.Unlisted
+	for _, e := range Unlisted() {
+		if CodexOwn(e) {
+			if slugs == nil {
+				slugs = map[string]bool{}
+			}
+			slugs[e.Model] = true
+		}
+	}
+	return all, slugs
+}
+
 // CodexOrder is where each model of Codex's list goes when the user put
 // them in an order of their own on the Agents page (#855), by the slug
 // Codex knows it by — a ChatGPT account's own by its bare one, as the
@@ -479,6 +500,18 @@ func codexListTag(kind string) string {
 	for _, slug := range off {
 		ms = append(ms, catalog.Model{ID: "-" + slug})
 	}
+	// and those kept out of the lists for routing groups (#1602)
+	all, unlisted := CodexNativeUnlisted()
+	if all {
+		ms = append(ms, catalog.Model{ID: "~unlisted"})
+	}
+	for _, slug := range slices.Sorted(maps.Keys(unlisted)) {
+		ms = append(ms, catalog.Model{ID: "~unlisted:" + slug})
+	}
+	// and the models the user disabled (#1867)
+	for _, pat := range DisabledModels() {
+		ms = append(ms, catalog.Model{ID: "!" + pat})
+	}
 	// and the order the user put them in, the account's own among them
 	for _, id := range ModelOrder("codex") {
 		ms = append(ms, catalog.Model{ID: "^" + id})
@@ -492,6 +525,12 @@ func codexListTag(kind string) string {
 	// and the model Codex's auto-review runs on (#938)
 	if v := settings.Load().CodexAutoReview; v != "" {
 		ms = append(ms, catalog.Model{ID: "~autoreview:" + v})
+	}
+	// and the effort new sessions start at, which magpie's models take as
+	// their default (codexcat.ModelDefault): another one set, Codex asks
+	// for the list again
+	if v := codexcat.NewSessionEffort(); v != "" {
+		ms = append(ms, catalog.Model{ID: "~effort:" + v})
 	}
 	return codexcat.PolicyTag(kind + codexcat.Tag(ms))
 }
@@ -576,19 +615,32 @@ func codexListed(shown []Entry, members func(id string) []Member, own bool) []ca
 			continue
 		}
 		m := catalog.Model{ID: e.ID, Name: labels[i], Efforts: e.Efforts, Images: e.Images || seen, Context: e.Context, AgentsV2: e.AgentsV2}
-		m.Compact = compactSet(s, e.ID, find)
-		// a provider the user added by its address is sent the tier Codex
-		// asks for as it is (hsiangron on X)
-		m.OwnTier = e.Group == "" && e.Provider.Preset == "" && e.Provider.Account == nil && e.Provider.ID != ""
-		if e.Group != "" {
-			for _, mb := range members(e.ID) {
-				if a := mb.Provider.Account; a != nil && a.Agent == "codex" && strings.HasPrefix(mb.Model, "gpt-") {
-					m.Fast = true
-					break
-				}
-			}
-		}
+		m.Compact = CompactFor(s, e, find)
+		CodexTiers(&m, e, members)
 		ms = append(ms, m)
 	}
 	return ms
+}
+
+// CodexTiers sets on m what Codex is offered on e's service tiers
+// (codexcat.Entries turns them into the entry's service_tiers): one source
+// for every list Codex is handed, the gateway's and the models.json file
+// magpie writes for a Codex CLI that names magpie its provider (#1530).
+func CodexTiers(m *catalog.Model, e Entry, members func(id string) []Member) {
+	// a provider the user added by its address is sent the tier Codex
+	// asks for as it is (hsiangron on X)
+	m.OwnTier = e.Group == "" && e.Provider.Preset == "" && e.Provider.Account == nil && e.Provider.ID != ""
+	// another magpie offers the tiers its own Codex is offered on the
+	// model, and is sent the one Codex asks for as it is (#1234)
+	if e.Group == "" && e.Provider.IsRemoteMagpie() {
+		m.Tiers = e.Tiers
+	}
+	if e.Group != "" {
+		for _, mb := range members(e.ID) {
+			if a := mb.Provider.Account; a != nil && a.Agent == "codex" && strings.HasPrefix(mb.Model, "gpt-") {
+				m.Fast = true
+				break
+			}
+		}
+	}
 }

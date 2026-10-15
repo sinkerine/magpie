@@ -27,6 +27,9 @@ function lift(header) {
   return source.slice(start, end + 2);
 }
 const providersSource = lift("function providersWhileFetching() {");
+// a plugin's page that reads with Providers (the Gateway page) is polled too
+const pageLine = source.match(/^const providersPage = .*$/m);
+assert.ok(pageLine, "app.js no longer has providersPage");
 
 // values cross the vm's realm boundary (its Object is not the test's), so what
 // is handed to assert is copied into this one first
@@ -39,6 +42,10 @@ function page() {
   const script = [
     `
 let view = "providers", editing = null, adding = false;
+const magpie = { page: (v) => (v === "gateway" ? { loads: "providers" } : undefined) };
+`,
+    pageLine[0],
+    `
 const document = { hidden: false };
 let providers = { fetching: true, providers: [], gateway: { calls: 0 } };
 const timers = [];
@@ -121,6 +128,16 @@ test("arming twice leaves one timer", () => {
   const p = page();
   assert.equal(p.arm(), 1);
   assert.equal(p.arm(), 1, "a second arming added a second timer");
+});
+
+test("a poll under the Gateway page, a plugin's page that reads with Providers, reads", async () => {
+  const p = page();
+  p.refuses();
+  p.arm();
+  p.set("view", "gateway");
+  await p.fire();
+  assert.equal(plain(p.counts()).api, 1, "it read nothing under the Gateway page");
+  assert.equal(p.pending(), 1);
 });
 
 for (const [guard, set] of [

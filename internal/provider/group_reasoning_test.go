@@ -1,10 +1,15 @@
 package provider
 
 import (
+	"cmp"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/codexcat"
 )
 
 // A group reasons when a member does: a member that doesn't think is no
@@ -16,11 +21,6 @@ import (
 // 不支持推理, and the agent turned thinking off for it: a routing group of
 // deepseek-v4-flash-0731-max (a Trae plugin model magpie read as one that
 // doesn't reason) with a DeepSeek that does lost reasoning for both.
-//
-// What the group offers as levels is not changed here: a member known to
-// take none still leaves the group none (#597), and the group is then
-// Levelless — magpie's shape for a model that thinks with no level to
-// pick from — rather than 不支持推理.
 func TestGroupReasoningFromAMemberThatThinks(t *testing.T) {
 	groupReasoningHome(t)
 	for name, in := range map[string][]Entry{
@@ -53,16 +53,19 @@ func TestGroupReasoningFromNoMember(t *testing.T) {
 
 // A group that thinks offers the levels its members have in common, as
 // before: a member that thinks with none of its own doesn't take the
-// others' away (the #597 rule for a model whose levels nothing knows), and
-// two that think share theirs.
+// others' away (the #597 rule for a model whose levels nothing knows), nor
+// does one known not to think, which the gateway sends no reasoning ask
+// (#2127: the group had none, and Codex no effort control for it), and two
+// that think share theirs.
 func TestGroupReasoningLevels(t *testing.T) {
 	groupReasoningHome(t)
 	for name, c := range map[string]struct {
 		in   []Entry
 		want []string
 	}{
-		"one thinks":       {[]Entry{thinksMember(), quietMember()}, nil},
-		"quiet first":      {[]Entry{quietMember(), thinksMember()}, nil},
+		"one thinks":       {[]Entry{thinksMember(), quietMember()}, levels},
+		"quiet first":      {[]Entry{quietMember(), thinksMember()}, levels},
+		"quiet between":    {[]Entry{thinksMember(), quietMember(), thinks("b", []string{"low", "high", "medium"})}, []string{"low", "high"}},
 		"two think":        {[]Entry{thinksMember(), thinks("b", []string{"low", "high", "medium"})}, []string{"low", "high"}},
 		"thinks no levels": {[]Entry{thinks("a", nil), thinks("b", []string{"low", "high"})}, []string{"low", "high"}},
 	} {
@@ -149,6 +152,69 @@ func TestGroupReasoningOfAPluginModelThatDoesNotThink(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no group mix")
+	}
+}
+
+// #2127: a routing group with a member known not to think, as Codex is
+// handed it. The group's entry lists the levels of the member that thinks,
+// so Codex shows its effort control and starts new sessions at the level
+// set for them, not at its own medium with no control to change it.
+func TestGroupQuietMemberKeepsCodexEffortControl(t *testing.T) {
+	isolate(t)
+	groupReasoningHome(t)
+	codex := t.TempDir()
+	t.Setenv("CODEX_HOME", codex)
+	// a vendor whose own list says its model doesn't think (models.dev's
+	// reasoning false): known quiet, not #597's unknown
+	if err := os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(catalog.CachePath(), []byte(`{"opencode-go": {"models": {"plain": {"id":"plain","reasoning":false}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+	if err := Save(Provider{ID: "q", Name: "Q", Key: "k", Chat: "http://127.0.0.1:1/v1", Catalog: "opencode-go", Models: []string{"plain"}}); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := ServedEntryOf("q/plain"); !ok || !e.Quiet() {
+		t.Fatalf("q/plain isn't a member known not to think: %+v", e)
+	}
+	if err := SaveGroup(Group{Name: "high", Members: []string{"q/plain", "a/m"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, effort := range []string{"", "max"} {
+		if effort != "" {
+			if err := os.WriteFile(filepath.Join(codex, "config.toml"), []byte("model_reasoning_effort = \""+effort+"\"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		type entry struct {
+			Slug    string `json:"slug"`
+			Default string `json:"default_reasoning_level"`
+			Levels  []struct {
+				Effort string `json:"effort"`
+			} `json:"supported_reasoning_levels"`
+		}
+		var out struct {
+			Models []entry `json:"models"`
+		}
+		if err := json.Unmarshal(codexcat.Catalog(CodexListed()), &out); err != nil {
+			t.Fatal(err)
+		}
+		i := slices.IndexFunc(out.Models, func(m entry) bool { return m.Slug == GroupPrefix+"high" })
+		if i < 0 {
+			t.Fatalf("no group/high in Codex's list: %+v", out.Models)
+		}
+		m := out.Models[i]
+		var got []string
+		for _, l := range m.Levels {
+			got = append(got, l.Effort)
+		}
+		want := cmp.Or(effort, "high") // DefaultEffort: medium, else high
+		if !slices.Equal(got, levels) || m.Default != want {
+			t.Errorf("new sessions at %q: levels %v, default %q; want %v, %q", effort, got, m.Default, levels, want)
+		}
 	}
 }
 
