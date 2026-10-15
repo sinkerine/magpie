@@ -35,7 +35,9 @@ func identity(n int) []int {
 	return idx
 }
 
-// Smart is the default: of those with quota to spare, the one whose
+// Smart is the default: known unused subscription accounts first, by the
+// tokens sent lately while the vendor still rounds their use to zero;
+// among those alike, and other routes with quota to spare, the one whose
 // allowance renews soonest, since what it has left is lost then, while one
 // renewing later keeps: the biggest window decides — the week, not the five
 // hours in it — and the next one only when that renews in the same hour. An
@@ -54,7 +56,7 @@ func identity(n int) []int {
 // One not known that tells what it has left as it answers goes first,
 // once: else, kept after those known, it would never answer and never be
 // known (Anthropic's usage endpoint can turn magpie away for hours).
-var Smart = Strategy{Order: func(_ string, seats []Seat) []int {
+var Smart = Strategy{ByUse: true, Order: func(_ string, seats []Seat) []int {
 	var fine, low, spent []int
 	for i, s := range seats {
 		switch tier(s.Used) {
@@ -70,6 +72,16 @@ var Smart = Strategy{Order: func(_ string, seats []Seat) []int {
 		a, b := seats[fine[i]], seats[fine[j]]
 		if a.Learns != b.Learns {
 			return a.Learns
+		}
+		unused := func(s Seat) bool {
+			return s.Account && s.Known && s.Used == 0 && len(s.Soon) > 0
+		}
+		ua, ub := unused(a), unused(b)
+		if ua != ub {
+			return ua
+		}
+		if ua && a.Tokens != b.Tokens {
+			return a.Tokens < b.Tokens
 		}
 		ri, rj := a.Soon, b.Soon
 		for k := 0; k < len(ri) || k < len(rj); k++ {
