@@ -28,7 +28,3 @@ func (h *host) glidePanel(height int, g Glide) bool {
 
 // TintPanel: the page paints the panel's tint itself here.
 func (h *host) TintPanel(c [4]uint8, ms int) bool { return false }
-
-// setPageZoom zooms w's page to z, as a browser zooms (WebView2's zoom
-// factor, WebKitGTK's zoom level): the text size.
-func setPageZoom(w *application.WebviewWindow, z float64) { w.SetZoom(z) }

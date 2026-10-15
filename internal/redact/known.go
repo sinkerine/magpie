@@ -1,6 +1,9 @@
 package redact
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // A value masked once is masked again wherever it is in a request, as it
 // is, whatever is around it. The rules find a value by what is around it
@@ -79,11 +82,43 @@ func kindOf(p string) string {
 	return ""
 }
 
-var personalKinds = map[string]bool{"EMAIL": true, "ID_CARD": true, "PHONE": true, "BANK_CARD": true}
+// kindCats are the categories each kind of personal data is found under
+// (Options.covers): a user name is under both home folders and user@host.
+// A kind not in it is a secret's, the user's rules' among them.
+var kindCats = func() map[string][]string {
+	m := map[string][]string{}
+	for _, r := range rules {
+		kinds := r.groups
+		if len(kinds) == 0 {
+			kinds = []string{r.kind}
+		}
+		for _, k := range kinds {
+			if r.cat != "" && !slices.Contains(m[k], r.cat) {
+				m[k] = append(m[k], r.cat)
+			}
+		}
+	}
+	return m
+}()
 
-// knownSpans are where s has a known value o masks: a personal one when o
-// masks personal data, any other when it masks secrets. Where two start
-// at the same place, the longer.
+// coversKind says o masks a known value of kind: a personal one when one
+// of the categories it is found under is on, any other when o masks
+// secrets.
+func (o Options) coversKind(kind string) bool {
+	cats, ok := kindCats[kind]
+	if !ok {
+		return o.Secrets
+	}
+	for _, c := range cats {
+		if o.covers(c) {
+			return true
+		}
+	}
+	return false
+}
+
+// knownSpans are where s has a known value o masks (coversKind). Where two
+// start at the same place, the longer.
 func knownSpans(s string, o Options) []span {
 	if !o.Secrets && !o.Personal || len(s) < minKnown {
 		return nil
@@ -100,7 +135,7 @@ func knownSpans(s string, o Options) []span {
 		}
 		var best *knownValue
 		for j, k := range known[s[i:i+minKnown]] {
-			if personalKinds[k.kind] && !o.Personal || !personalKinds[k.kind] && !o.Secrets {
+			if !o.coversKind(k.kind) {
 				continue
 			}
 			if best != nil && len(k.v) <= len(best.v) || !strings.HasPrefix(s[i:], k.v) || !standsAlone(k.kind, s, i, i+len(k.v)) {
@@ -133,8 +168,14 @@ func standsAlone(kind, s string, a, b int) bool {
 	switch kind {
 	case "PHONE", "BANK_CARD":
 		return !is(before, digits) && !is(after, digits)
-	case "ID_CARD":
+	case "ID_CARD", "IBAN", "SSN", "PASSPORT", "SERIAL":
 		return !is(before, alnum) && !is(after, alnum)
+	case "IP", "MAC":
+		// not a piece of a longer address or a version: 1.2.3.45, 1.2.3.4.5
+		if is(before, alnum+".:") || is(after, alnum+":") {
+			return false
+		}
+		return after != '.' || b+1 >= len(s) || !is(s[b+1], digits)
 	case "EMAIL":
 		if is(before, alnum+"._%+-") || is(after, alnum+"_%+") {
 			return false

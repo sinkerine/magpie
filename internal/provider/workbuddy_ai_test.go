@@ -127,6 +127,30 @@ func TestWorkBuddyAI(t *testing.T) {
 	if also := p.AlsoOn(); len(also) != 1 || also[0].Account.User != "Second" || also[0].ID != WorkBuddyAIID {
 		t.Fatalf("also on: %+v", also)
 	}
+	// the second account keeps what was set on the provider, as the first
+	// does: its queue (#1899), how many go at once, its routing
+	if err := SetQueue(WorkBuddyAIID, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetRPM(WorkBuddyAIID, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetRouting(WorkBuddyAIID, Ordered); err != nil {
+		t.Fatal(err)
+	}
+	two := 2
+	pk, _ := Find(WorkBuddyAIID)
+	pk.MaxConcurrency = &two
+	if err := Save(*pk); err != nil {
+		t.Fatal(err)
+	}
+	p, _ = find(All(), WorkBuddyAIID)
+	for _, q := range append([]Provider{p}, p.AlsoOn()...) {
+		if q.QueueLimit != 1 || q.QueueWait != 1 || q.MaxRPM != 7 || q.Routing != Ordered || q.LaneLimit() != 2 {
+			t.Errorf("%s: queue %d, wait %ds, rpm %d, routing %q, at once %d; want the provider's 1, 1s, 7, %q, 2",
+				q.Account.User, q.QueueLimit, q.QueueWait, q.MaxRPM, q.Routing, q.LaneLimit(), Ordered)
+		}
+	}
 	if cnp, ok := find(All(), "workbuddy"); !ok || cnp.Account.User != "国内" || cnp.Chat != cn.URL+"/v2" {
 		t.Fatalf("WorkBuddy: %+v", cnp)
 	}

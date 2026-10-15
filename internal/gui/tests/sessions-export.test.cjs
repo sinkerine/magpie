@@ -12,6 +12,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { reach } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const at = (min) => new Date(Date.now() - min * 60e3).toISOString();
@@ -94,6 +95,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert(await exp.isVisible(), "the button is in sight at 560px");
         const box = await exp.boundingBox();
         assert(box.x + box.width <= 560, `the button fits the window: ${JSON.stringify(box)}`);
+        // under a Claude Code folder's Relocate project (#1131) the web
+        // layout's taller folder row puts the button at the window's foot:
+        // the reader wheels down to it, then the click must hold the page
+        await reach(page, exp);
         const top = await row.evaluate((e) => e.getBoundingClientRect().top);
         if (web) {
           // the browser's own download of sessions/markdown, its name the
@@ -115,7 +120,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(calls.filter((c) => c.path === "transcript").length, 0, "the conversation wasn't shown");
 
         // an agent whose sessions can't be read has nothing to export
-        await view.locator(".sm-agents .opt", { hasText: "OpenCode" }).click();
+        const oc = view.locator(".sm-agents .opt", { hasText: "OpenCode" });
+        await reach(page, oc); // back up, past the export the reader wheeled to
+        await oc.click();
         const o = view.locator('.row.sm-sess[data-id="o-1"]');
         await o.waitFor();
         await o.locator(".who").click();

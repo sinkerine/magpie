@@ -20,6 +20,7 @@ type scripted struct {
 	replies []reply
 	n       int
 	hang    chan struct{} // when set, the first request waits on it
+	hanging chan struct{} // when set, closed as the first request begins to wait on hang
 	limited http.Header   // headers each 429 goes with
 }
 
@@ -34,6 +35,9 @@ func (s *scripted) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	i := min(s.n, len(s.replies)-1)
 	s.n++
 	if s.hang != nil && i == 0 {
+		if s.hanging != nil {
+			close(s.hanging)
+		}
 		<-s.hang
 	}
 	x := s.replies[i]
@@ -249,17 +253,33 @@ func TestRateLimitIsWaitedOut(t *testing.T) {
 // rests for it and nobody else is asked.
 func TestCanceledRequestRestsNobody(t *testing.T) {
 	fresh(t)
-	a := &scripted{replies: []reply{{200, "", chatOK}}, hang: make(chan struct{})}
+	a := &scripted{replies: []reply{{200, "", chatOK}}, hang: make(chan struct{}), hanging: make(chan struct{})}
 	b := &scripted{replies: []reply{{200, "", chatOK}}}
 	scriptedOn(t, "a", provider.Chat, a)
 	scriptedOn(t, "b", provider.Chat, b)
 	provider.SaveGroup(provider.Group{Name: "G", Members: []string{"a/m", "b/m"}, Routing: provider.Ordered})
 	s := New()
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() { time.Sleep(50 * time.Millisecond); cancel(); time.Sleep(50 * time.Millisecond); close(a.hang) }()
+	served := make(chan struct{})
+	// the agent goes away while a is asked (not a moment after the request
+	// began: on a busy machine a may not be asked yet, #2175), and a never
+	// answers until the gateway is done with the request
+	go func() {
+		select {
+		case <-a.hanging:
+			cancel()
+		case <-served:
+		}
+		select {
+		case <-served:
+		case <-time.After(10 * time.Second):
+		}
+		close(a.hang)
+	}()
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"group/g","messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx))
+	close(served)
 	r := s.trace.routes[len(s.trace.routes)-1]
 	if b.n != 0 || len(r.Tries) != 1 || r.Tries[0].Fail != failCanceled || r.Tries[0].Rest != nil || s.resting("a") {
 		t.Fatalf("b tried %d, tries %+v", b.n, r.Tries)

@@ -3,21 +3,24 @@ package sessions
 import (
 	"bytes"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/lastgood"
 )
 
 // Sessions in WSL. On Windows an agent installed in a WSL distro keeps its
 // sessions in the distro's home, which magpie opens through
 // \\wsl.localhost\<distro> — the distros internal/agent's wsl.go already
 // finds and probes for the agents it sets up (WSLHomes, which that package
-// sets; this one can't import it). Claude Code's, Codex's and Pi's session
-// files there are read as this computer's are, each session marked with its
-// distro (Session.WSL) and resumed through wsl.exe (wslResume).
+// sets; this one can't import it). Claude Code's, Codex's, Pi's and omp's
+// session files there are read as this computer's are, each session marked
+// with its distro (Session.WSL) and resumed through wsl.exe (wslResume).
 //
 // Reading over \\wsl.localhost is slow, and looking at a stopped distro's
 // files starts it. So the distros' files are listed behind, at most every
@@ -64,6 +67,8 @@ var wslAgents = []struct{ agent, dir string }{
 	{"claude", ".claude"},
 	{"codex", ".codex"},
 	{"pi", filepath.Join(".pi", "agent")},
+	{"omp", filepath.Join(".omp", "agent")},
+	{"kimi", ".kimi-code"},
 }
 
 // wslScan lists the session files under a distro's home.
@@ -78,6 +83,10 @@ func wslScan(home string) []file {
 			out = append(out, codexFilesIn(dir)...)
 		case "pi":
 			out = append(out, piFilesIn(dir, "")...)
+		case "omp":
+			out = append(out, ompFilesIn(dir)...)
+		case "kimi":
+			out = append(out, kimiFilesIn(filepath.Join(dir, "sessions"))...)
 		}
 	}
 	return out
@@ -237,7 +246,12 @@ func wslList(gen uint64, done chan struct{}) {
 	}
 	if b != nil && !bytes.Equal(b, wslSess.kept) {
 		p := wslListPath()
-		if os.MkdirAll(filepath.Dir(p), 0o755) == nil {
+		// wslFiles reads a file that doesn't parse as no listing: it is
+		// copied aside before this one goes over it, and one that can't be
+		// copied isn't written over (#2263)
+		if err := lastgood.KeepUnparsed(p, lastgood.Into[map[string]*wslListing]); err != nil {
+			log.Printf("sessions-wsl.json wasn't written over: %v", err)
+		} else if os.MkdirAll(filepath.Dir(p), 0o755) == nil {
 			tmp := p + ".tmp"
 			if os.WriteFile(tmp, b, 0o644) == nil && os.Rename(tmp, p) == nil {
 				wslSess.kept = b

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
 )
@@ -48,14 +49,17 @@ func dir() string { return filepath.Dir(provider.Path()) }
 // OthersDir is where the other computers' days are kept: one folder each.
 func OthersDir() string { return filepath.Join(dir(), "usage-others") }
 
+// computerFile is usage-computer.json.
+type computerFile struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
 // Computer is this computer's id and name, the id made the first time and
 // kept in usage-computer.json, which no backup or sync carries.
 func Computer() (id, name string) {
 	p := filepath.Join(dir(), "usage-computer.json")
-	var c struct {
-		ID   string `json:"id"`
-		Name string `json:"name,omitempty"`
-	}
+	var c computerFile
 	if b, err := os.ReadFile(p); err == nil {
 		json.Unmarshal(b, &c)
 	}
@@ -64,7 +68,10 @@ func Computer() (id, name string) {
 		rand.Read(b)
 		c.ID = hex.EncodeToString(b)
 		os.MkdirAll(dir(), 0o755)
-		if j, err := json.Marshal(c); err == nil {
+		// a file that doesn't parse held this computer's id, the one its
+		// synced days are under: it is kept aside before a new id goes
+		// over it, and not written over when it can't be
+		if j, err := json.Marshal(c); err == nil && lastgood.KeepUnparsed(p, lastgood.Into[computerFile]) == nil {
 			edit.WriteAtomic(p, j)
 		}
 	}
@@ -104,7 +111,7 @@ func OwnDays(since time.Time) map[string][]SharedCall {
 	if reader == nil {
 		reader = sessions.Calls
 	}
-	rows, _, _, _ := ledgerWith(since, Filter{}, Load(since.Add(-24*time.Hour)), reader(since))
+	rows, _, _, _ := ledgerWith(since, Filter{}, gatewayRecords(since.Add(-24*time.Hour)), reader(since))
 	out := map[string][]SharedCall{}
 	for i := len(rows) - 1; i >= 0; i-- { // oldest first
 		r := rows[i]

@@ -8,7 +8,17 @@
 //                          Both take ?lang=zh for the notes in Chinese, where a
 //                          release has them (below its <!-- lang:zh --> marker);
 //                          any other lang, or none, is the English alone.
-//   /api/partners          {partners: [...]}: the add sheet's Partners (partners.js)
+//   /api/partners          {partners: [...]}: the add sheet's Partners (partners.js),
+//                          their website and key links through /go
+//   /go/<id>/keys[/<region>], /go/<id>/site[/<region>]
+//                          a partner's key page or website, counted
+//   /go/<id>/home, /go/<id>/readme
+//                          a sponsor's link from the home page or the
+//                          READMEs (sponsors.js), counted
+//   /api/icon?url=<https URL>
+//                          a picture a plugin, market or import link names,
+//                          fetched here so its host sees Cloudflare, not the
+//                          user (the app fetches every remote icon this way)
 //   /download              the Apple Silicon dmg
 //   /download/mac-arm64    the same;  /download/mac-intel  the Intel dmg
 //   /download/windows      the Windows app (x64);  /download/windows-arm64
@@ -24,6 +34,7 @@
 
 import { LANGS } from "./i18n.js";
 import { PARTNERS } from "./partners.js";
+import { SPONSORS } from "./sponsors.js";
 
 const REPO = "yetone/magpie-releases";
 const TTL = 300; // seconds the newest release is remembered
@@ -59,7 +70,21 @@ export default {
       return json({ ...got.rel, notes: inLang(got.rel.notes, lang) }, 200, cacheFor(got));
     }
     if (url.pathname === "/api/partners") {
-      return json({ partners: PARTNERS }, 200, { "Cache-Control": "public, max-age=600" });
+      const now = Date.now();
+      if (PARTNERS.some((p) => live(p, now)) && Math.random() < 1 / FETCH_SAMPLE)
+        ctx.waitUntil(capture("magpie partners fetch", { weight: FETCH_SAMPLE, country: country(req) }));
+      return json({ partners: served(PARTNERS, now) }, 200, { "Cache-Control": "public, max-age=600" });
+    }
+    if (url.pathname.startsWith("/go/")) {
+      let id, what, region, to, counted;
+      try {
+        [, , id, what, region] = url.pathname.split("/").map(decodeURIComponent);
+        if ((to = goTarget(PARTNERS, id, what, region))) counted = ["magpie partner go", { id, what, region: region || "" }];
+        else if (region === undefined && (to = sponsorTarget(SPONSORS, id, what))) counted = ["magpie sponsor go", { id, where: what }];
+      } catch {}
+      if (!to) return new Response("not found\n", { status: 404 });
+      if (req.method === "GET") ctx.waitUntil(capture(counted[0], { ...counted[1], country: country(req) }));
+      return new Response(null, { status: 302, headers: { Location: to, "Cache-Control": "no-store" } });
     }
     if (url.pathname === "/api/notes") {
       const got = await releases(ctx, env);
@@ -71,6 +96,7 @@ export default {
         .map((r) => ({ ...r, notes: inLang(r.notes, lang) }));
       return json({ releases: pick }, 200, cacheFor(got));
     }
+    if (url.pathname === "/api/icon") return icon(url.searchParams.get("url"));
     if (url.pathname === "/download" || url.pathname.startsWith("/download/")) {
       const want = url.pathname.split("/")[2] || "mac-arm64";
       const got = await latest(ctx, env);
@@ -116,6 +142,87 @@ export default {
     return beacon(await env.ASSETS.fetch(req));
   },
 };
+
+// A partner's reach and clicks are counted here, not in the app: the app's
+// own counts (provider.CountPartner) go only from users who let the stats
+// go, and these are what the server sees anyway. /api/partners hands out
+// each partner's website and key page as a /go link, which counts the
+// click (event "magpie partner go") and sends the browser on. Each app
+// fetches the list every six hours, so the fetches tell how many apps a
+// partner can be seen in: one in FETCH_SAMPLE is sent, as "magpie partners
+// fetch" with weight FETCH_SAMPLE (sum it), and only while someone is
+// listed. No id, address or account goes: a country, at most.
+const FETCH_SAMPLE = 10;
+const GO = "https://usemagpie.ai/go/";
+const POSTHOG = "https://us.i.posthog.com/i/v0/e/";
+// the Magpie project's PostHog key, as the app's (internal/stats): it can
+// send events and read nothing
+const POSTHOG_KEY = "phc_nyDyYyrUTRGvNq5U7FBesCyM2j4GdKeqGp8ko7DBerTC";
+
+// live reports whether a partner's term includes now.
+function live(p, now) {
+  return (!p.from || Date.parse(p.from) <= now) && (!p.until || now < Date.parse(p.until));
+}
+
+// served is the list the app gets: those whose term hasn't ended (an
+// ended one stays in partners.js, so the /go links of providers added from
+// it keep working), with their website and key page as /go links.
+export function served(list, now) {
+  const go = (p, what, r) => GO + [p.id, what, r && r.id].filter(Boolean).map(encodeURIComponent).join("/");
+  const linked = (o, p, r) => ({ ...o, ...(o.website && { website: go(p, "site", r) }), ...(o.keysUrl && { keysUrl: go(p, "keys", r) }) });
+  return list
+    .filter((p) => !p.until || now < Date.parse(p.until))
+    .map((p) => ({ ...linked(p, p), ...(p.regions && { regions: p.regions.map((r) => linked(r, p, r)) }) }));
+}
+
+// goTarget is where a /go link sends the browser: the partner's own key
+// page or website, the region's where it has one. Only partners.js's own
+// addresses, never one the link names. It says it came from magpie, as
+// ref=magpie, unless the address names a ref of its own (a referral code).
+export function goTarget(list, id, what, region) {
+  const p = list.find((x) => x.id === id);
+  const field = what === "keys" ? "keysUrl" : what === "site" ? "website" : "";
+  if (!p || !field) return "";
+  if (!region) return fromMagpie(p[field] || "");
+  const r = (p.regions || []).find((x) => x.id === region);
+  return r ? fromMagpie(r[field] || p[field] || "") : "";
+}
+
+// sponsorTarget is where a sponsor's /go link sends the browser: the link
+// sponsors.js has for that place, as it is (its own ref is how the sponsor
+// counts us).
+export function sponsorTarget(list, id, where) {
+  const s = list.find((x) => x.id === id);
+  if (!s || (where !== "home" && where !== "readme")) return "";
+  return s[where] || "";
+}
+
+function fromMagpie(to) {
+  if (!to) return "";
+  try {
+    const u = new URL(to);
+    if (!u.searchParams.has("ref")) u.searchParams.set("ref", "magpie");
+    return u.toString();
+  } catch {
+    return to;
+  }
+}
+
+function country(req) {
+  return (req.cf && req.cf.country) || "";
+}
+
+// capture sends one event to PostHog, under an id of its own: a count, not
+// a person.
+async function capture(event, props) {
+  try {
+    await fetch(POSTHOG, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_key: POSTHOG_KEY, event, distinct_id: crypto.randomUUID(), properties: { ...props, $process_person_profile: false } }),
+    });
+  } catch {}
+}
 
 // preferred is the home page's language for this browser: the one picked on
 // the page (the lang cookie), else the first of its Accept-Language that the
@@ -484,6 +591,90 @@ async function checksums(tag) {
     if (hash && name) sums[name] = hash;
   }
   return sums;
+}
+
+// ---- icons ------------------------------------------------------------------
+
+// An icon a plugin's package.json, a market listing or an import link names
+// is fetched here, not by the app, so its host learns nothing about who
+// looks: a plugin author's https picture would otherwise see the IP of
+// everyone who opened Discover. Nothing of the asker's request is passed
+// on, only the picture comes back, and Cloudflare keeps it a day.
+export const ICON_MAX = 1 << 20; // the app's MaxIcon
+
+export async function icon(raw) {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    return new Response("not a URL\n", { status: 400 });
+  }
+  if (u.protocol !== "https:" || u.username || u.password || (u.port && u.port !== "443"))
+    return new Response("only a public https picture\n", { status: 400 });
+  // the app asks for usemagpie.ai's own pictures straight; asking here for
+  // one would only send the worker round to itself
+  if (u.hostname === "usemagpie.ai" || u.hostname.endsWith(".usemagpie.ai"))
+    return new Response("a usemagpie.ai picture is fetched as it is\n", { status: 400 });
+  let res;
+  try {
+    res = await fetch(u.toString(), {
+      headers: { Accept: "image/*", "User-Agent": "magpie-icon/1 (+https://usemagpie.ai)" },
+      redirect: "follow",
+      signal: AbortSignal.timeout(10000),
+      // a missing or failing picture is asked for again soon, not in a day
+      cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": 86400, "404": 300, "500-599": 0 } },
+    });
+  } catch (e) {
+    return new Response("could not fetch the picture\n", { status: 502 });
+  }
+  if (!res.ok) return new Response(`the picture's host answered ${res.status}\n`, { status: 502 });
+  const b = await readUpTo(res, ICON_MAX + 1);
+  if (b.byteLength > ICON_MAX) return new Response("the picture is over 1 MB\n", { status: 413 });
+  const type = imageType(new Uint8Array(b));
+  if (!type) return new Response("not a picture\n", { status: 415 });
+  return new Response(b, {
+    headers: {
+      "Content-Type": type,
+      "Cache-Control": "public, max-age=86400",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+    },
+  });
+}
+
+async function readUpTo(res, max) {
+  const r = res.body.getReader();
+  const parts = [];
+  let n = 0;
+  while (n < max) {
+    const { done, value } = await r.read();
+    if (done) break;
+    parts.push(value);
+    n += value.byteLength;
+  }
+  r.cancel().catch(() => {});
+  const out = new Uint8Array(Math.min(n, max));
+  let at = 0;
+  for (const p of parts) {
+    const take = p.subarray(0, out.length - at);
+    out.set(take, at);
+    at += take.length;
+    if (at >= out.length) break;
+  }
+  return out.buffer;
+}
+
+// imageType is the picture's type by its bytes, as the app's StoreIcon
+// takes them: PNG, JPEG, GIF, WebP, ICO or SVG; "" for anything else.
+export function imageType(b) {
+  const at = (i, ...xs) => xs.every((x, k) => b[i + k] === x);
+  if (at(0, 0x89, 0x50, 0x4e, 0x47)) return "image/png";
+  if (at(0, 0xff, 0xd8, 0xff)) return "image/jpeg";
+  if (at(0, 0x47, 0x49, 0x46, 0x38)) return "image/gif";
+  if (at(0, 0x52, 0x49, 0x46, 0x46) && at(8, 0x57, 0x45, 0x42, 0x50)) return "image/webp";
+  if (at(0, 0, 0, 1, 0)) return "image/x-icon";
+  if (new TextDecoder().decode(b.subarray(0, 1024)).toLowerCase().includes("<svg")) return "image/svg+xml";
+  return "";
 }
 
 function json(v, status = 200, headers = {}) {

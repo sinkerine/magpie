@@ -330,6 +330,16 @@ func TestMagpieImageIsOptIn(t *testing.T) {
 	}
 }
 
+// Magpie Image's card doesn't say videos need a Grok subscription: the
+// gateway also makes them with Seedance, another magpie and a provider whose
+// model list marks video models (#1399).
+func TestMagpieImageSaysVideoModels(t *testing.T) {
+	d := selfServer().Description
+	if strings.Contains(d, "Grok subscription") || !strings.Contains(d, "video model set up in Magpie") {
+		t.Fatalf("description %q", d)
+	}
+}
+
 // A skill taken in from an agent's folder has no GitHub source, and adding
 // it from the market is turned away by its name; the market says it's had
 // by the same name (#444).

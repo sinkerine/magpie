@@ -13,7 +13,9 @@ import (
 // Claude Desktop shows a gateway model of 1M tokens or more twice, its
 // plain entry and a "1M context window" one it adds itself (#1272: 21
 // models made 34 entries). With DesktopLongest on, such a model is listed
-// by its "[1m]" id alone, so Desktop's menu has one entry per model; one
+// by its "[1m]" id alone, so Desktop's menu has one entry per model, told
+// as the 1M one by the "1M context window" Desktop gives its own (a lone
+// "[1m]" row was shown as the plain model: 杰多夫 on Discord); one
 // under 1M (872K) keeps its own id and window, and a request on the plain id
 // a session was saved with is still served.
 func TestClaudeDesktopLongestOnly(t *testing.T) {
@@ -37,6 +39,7 @@ func TestClaudeDesktopLongestOnly(t *testing.T) {
 	type row struct {
 		ID       string `json:"id"`
 		MaxInput int    `json:"max_input_tokens"`
+		Said     string `json:"description"`
 	}
 	list := func() map[string]row {
 		t.Helper()
@@ -94,6 +97,16 @@ func TestClaudeDesktopLongestOnly(t *testing.T) {
 	} {
 		if r := on[id]; r.ID != want {
 			t.Errorf("on: %s listed as %q, want %q", id, r.ID, want)
+		}
+	}
+	for id, r := range on {
+		if want := map[bool]string{true: "1M context window"}[strings.HasSuffix(r.ID, "[1m]")]; r.Said != want {
+			t.Errorf("on: %s (%s) described %q, want %q", id, r.ID, r.Said, want)
+		}
+	}
+	for id, r := range off {
+		if r.Said != "" {
+			t.Errorf("off: %s described %q", id, r.Said)
 		}
 	}
 	if r := on["vend/exo-free"]; r.MaxInput != 872_000 {

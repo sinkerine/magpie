@@ -26,9 +26,82 @@ async function inView(page, locator) {
   throw new Error("control did not come into sight: " + JSON.stringify({view:v,target:await locator.boundingBox(),scroll:await view.evaluate(e=>e.scrollTop)}));
 }
 
+// reach is inView for any page: the reader wheels the view the control is
+// in (its .view) until the control is wholly in that view and nothing drawn
+// over it (a sticky bar, the window's foot) takes the point Playwright will
+// press. Playwright's own scroll is put back by the app, as any scroll that
+// isn't the reader's, and one partly in sight it doesn't scroll at all, so
+// its press can wait on a control out of sight or under a bar till it times
+// out (in WebKit; Chromium gets through some of these by a few pixels).
+async function reach(page, locator) {
+  await locator.waitFor({ state: "visible" });
+  const id = await locator.evaluate((e) => e.closest(".view")?.id || "");
+  if (!id) return;
+  const v = await page.locator("#" + id).boundingBox();
+  await page.mouse.move(v.x + v.width / 2, v.y + v.height / 2);
+  for (let i = 0; i < 120; i++) {
+    const at = await locator.evaluate((e) => {
+      const b = e.getBoundingClientRect(), v = e.closest(".view").getBoundingClientRect();
+      const x = b.left + b.width / 2, y = b.top + b.height / 2;
+      const inside = b.top >= v.top && b.bottom <= v.bottom, hit = document.elementFromPoint(x, y);
+      return { clear: inside && !!hit && (e === hit || e.contains(hit)), down: y > v.top + v.height / 2 };
+    });
+    if (at.clear) { await page.waitForTimeout(300); return; }
+    await page.mouse.wheel(0, at.down ? 20 : -20);
+    await page.waitForTimeout(40);
+  }
+  throw new Error("control did not come clear into sight: " + JSON.stringify({ view: v, target: await locator.boundingBox() }));
+}
+
 async function click(page, locator) {
   await inView(page, locator);
   await locator.click();
 }
 
-module.exports = { inView, click };
+// Settings is drawn from each read of the settings, and opening the page
+// reads them twice: the page's own read, then the window's load() once the
+// state is in. Every row is replaced by the second draw, so a row found
+// after the first is detached under whatever the test does to it next
+// (#1653: scrollIntoViewIfNeeded in WebKit on a busy machine). Call
+// watchSettingsReads before page.goto; settingsDrawn then waits until load()
+// has asked for its read and every read asked for has been drawn. A page is
+// watched once however many times it is opened.
+const watched = new WeakSet();
+async function watchSettingsReads(page) {
+  if (watched.has(page)) return;
+  watched.add(page);
+  await page.addInitScript(() => {
+    const reads = window.__settingsReads = { asked: 0, drawn: 0 };
+    const fetch0 = window.fetch;
+    window.fetch = function (input, init) {
+      const p = fetch0.apply(this, arguments);
+      const url = new URL(typeof input === "string" ? input : input.url, location.href);
+      if (url.pathname !== "/api/settings" || (init?.method || "GET") !== "GET") return p;
+      reads.asked++;
+      // drawn a task after its body is in: loadSettings draws in the
+      // microtasks that follow
+      const drawn = () => setTimeout(() => reads.drawn++);
+      return p.then((res) => {
+        const text = res.text;
+        res.text = function () { return text.call(this).finally(drawn); };
+        return res;
+      }, (e) => { drawn(); throw e; });
+    };
+  });
+}
+
+// load.done is set in the same run of load() that then asks for the
+// settings, with no wait between, so once it is set the read is counted.
+const settingsDrawn = (page) => page.waitForFunction(() => load.done && __settingsReads.asked === __settingsReads.drawn);
+
+// openPart opens a part of Settings (a tab, or its entry in the sidebar's
+// strip) the way the keyboard does. A click waits for the tab to hold still
+// over two animation frames, and on a loaded machine WebKit draws no frames
+// for seconds while the page itself runs on, so the click can sit out the
+// test's whole timeout over a tab that isn't moving (#2150). Enter on the
+// focused button clicks it with no frame to wait for.
+async function openPart(page, id) {
+  await page.locator(`:is(#setTab-${id}, .nav-s[data-of=setTab-${id}]):visible`).press("Enter");
+}
+
+module.exports = { inView, reach, click, openPart, watchSettingsReads, settingsDrawn };

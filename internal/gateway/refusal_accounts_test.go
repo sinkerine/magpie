@@ -215,11 +215,14 @@ func TestClaudeRefusalMovesToNextKey(t *testing.T) {
 	}
 }
 
-// A Claude subscription with two accounts, served through the claude CLI:
-// the first's run ends in stop_reason "refusal" with nothing said (then
-// Claude Code's own "unable to respond" result), and the spare answers —
-// streamed to Codex and to an Anthropic client, and not streamed.
-func TestClaudeSubscriptionRefusalMovesToNextAccount(t *testing.T) {
+// claudeSubscriptionRefusing signs in two Claude subscription accounts,
+// served through a claude CLI whose run on the first (its own sign-in)
+// ends in stop_reason "refusal" with nothing said, category cyber in its
+// stop_details (then Claude Code's own "unable to respond" result), and
+// whose run on the spare answers "pong". It returns the file each run
+// writes its token to: "own" for the first, tok-spare for the spare.
+func claudeSubscriptionRefusing(t *testing.T) string {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("a shell script stands in for Claude Code")
 	}
@@ -256,7 +259,7 @@ while read -r line; do
     echo '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'
     echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}}'
     echo '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}'
-    echo '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":2}}}'
+    echo '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":null}},"usage":{"output_tokens":2}}}'
     echo '{"type":"stream_event","event":{"type":"message_stop"}}'
     echo '{"type":"result","subtype":"success","is_error":true,"result":"API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy"}'
   else
@@ -272,6 +275,15 @@ done
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	provider.ForgetAccounts()
 	t.Cleanup(provider.ForgetAccounts)
+	return log
+}
+
+// A Claude subscription with two accounts, served through the claude CLI:
+// the first's run ends in stop_reason "refusal" with nothing said (then
+// Claude Code's own "unable to respond" result), and the spare answers —
+// streamed to Codex and to an Anthropic client, and not streamed.
+func TestClaudeSubscriptionRefusalMovesToNextAccount(t *testing.T) {
+	log := claudeSubscriptionRefusing(t)
 	s := New()
 	for _, ask := range []struct{ path, body string }{
 		{"/v1/responses", `{"model":"claude/claude-sonnet-5","stream":true,"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
@@ -287,6 +299,10 @@ done
 		r := lastRoute(s)
 		if len(r.Tries) != 2 || r.Tries[0].Fail != failRefused || r.Tries[0].Rest != nil || r.Tries[1].Status != 200 {
 			t.Fatalf("%s: tries: %+v", ask.path, r.Tries)
+		}
+		// the classifier's category, on the try it refused (#1768)
+		if ask.path == "/v1/messages" && !strings.Contains(r.Tries[0].Error, "category cyber") {
+			t.Errorf("%s: refused try says %q", ask.path, r.Tries[0].Error)
 		}
 	}
 }

@@ -21,7 +21,7 @@ import (
 func init() {
 	movers["kiro"] = &mover{
 		pkg:    "@magpie-community/opencode-kiro-auth",
-		min:    "0.1.8", // a tool named past 64 characters sent under a short name, as the built-in (#1393)
+		min:    "0.1.11", // a thinking model offers xhigh as its own level (50k), so Claude Code's xhigh isn't routed as max (plugins#120); 0.1.10: the caller's prompt-cache marks reach Kiro as cachePoints (plugins#110)
 		agents: []string{"kiro"},
 		out: func() ([]Moving, error) {
 			var out []Moving

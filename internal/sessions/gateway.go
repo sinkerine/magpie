@@ -130,8 +130,13 @@ func saveGatewayTurn(turn GatewayTurn, generation uint64) error {
 	}
 	// Append one bounded line; the cost is independent of other sessions and
 	// of this session's earlier turns. Cleanup runs outside the request path.
+	// Not O_APPEND: on Windows that opens the file for appending only, and
+	// the truncate below, which drops a cut-off last line, is refused
+	// ("Access is denied"), so every later turn of the session failed.
+	// The line is written at the end found instead; gatewayMu keeps
+	// another save from writing between.
 	path := filepath.Join(dir, "turns.jsonl")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
@@ -153,7 +158,7 @@ func saveGatewayTurn(turn GatewayTurn, generation uint64) error {
 			return err
 		}
 	}
-	_, err = f.Write(append(b, '\n'))
+	_, err = f.WriteAt(append(b, '\n'), end)
 	return errors.Join(err, f.Close())
 }
 
@@ -194,9 +199,31 @@ func SetGatewayRecording(on, clear bool) error {
 		return err
 	}
 	if clear {
-		return os.RemoveAll(gatewayDir())
+		// deleted sessions' text in magpie's trash is recorded text too
+		return errors.Join(os.RemoveAll(gatewayDir()), clearGatewayTrash(nil))
 	}
 	return nil
+}
+
+// HasGatewayConversations says whether any gateway conversation text is kept,
+// so the Sessions page offers to delete it only when there is something to
+// delete. A folder that can't be read counts as holding some: the reader can
+// still ask to clear it.
+func HasGatewayConversations() bool {
+	if paths, _ := gatewayTrashFiles(); len(paths) > 0 {
+		return true
+	}
+	errFound := errors.New("found")
+	err := filepath.WalkDir(gatewayDir(), func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type().IsRegular() {
+			return errFound
+		}
+		return nil
+	})
+	return err != nil && !errors.Is(err, os.ErrNotExist)
 }
 
 // PruneGatewayConversations removes expired date buckets even while recording is
@@ -204,7 +231,15 @@ func SetGatewayRecording(on, clear bool) error {
 func PruneGatewayConversations(now time.Time) error {
 	gatewayMu.Lock()
 	root, generation := gatewayDir(), gatewayGeneration
+	// a deleted session's text in magpie's trash expires as it would have
+	trashErr := clearGatewayTrash(func(d string) bool {
+		date, err := time.Parse(time.DateOnly, d)
+		return err == nil && !date.Add(24*time.Hour).After(now.Add(-GatewayRetention))
+	})
 	gatewayMu.Unlock()
+	if trashErr != nil {
+		return trashErr
+	}
 	type saved struct {
 		path    string
 		info    os.FileInfo

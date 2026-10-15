@@ -12,10 +12,12 @@ import (
 )
 
 // keyRow is a gateway key as the Gateway page lists it, with what it has
-// used of its limit (#585).
+// used of its limit (#585): Used of its first, UsedAll of each (#2227),
+// in the order of its limits.
 type keyRow struct {
 	access.Key
-	Used *budget.Status `json:"used,omitempty"`
+	Used    *budget.Status  `json:"used,omitempty"`
+	UsedAll []budget.Status `json:"usedAll,omitempty"`
 }
 
 // keyModelJSON is a model a gateway key may be held to, as its picker
@@ -35,7 +37,11 @@ func withLimits(keys []access.Key) []keyRow {
 	now := time.Now()
 	out := make([]keyRow, 0, len(keys))
 	for _, k := range keys {
-		out = append(out, keyRow{Key: k, Used: budget.Of(k, now)})
+		row := keyRow{Key: k, UsedAll: budget.All(k, now)}
+		if len(row.UsedAll) > 0 {
+			row.Used = &row.UsedAll[0]
+		}
+		out = append(out, row)
 	}
 	return out
 }

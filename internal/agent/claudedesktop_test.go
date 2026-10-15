@@ -2,12 +2,15 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/desktopdir"
 	"github.com/yetone/magpie/internal/gateway"
@@ -288,6 +291,120 @@ func TestClaudeDesktopChangedSince(t *testing.T) {
 	}
 }
 
+// #2035 (capiton0): settings the user made in Desktop's third-party window
+// live in magpie's profile. Switching Desktop off magpie and on again
+// brings them back, the gateway's address and key set anew.
+func TestClaudeDesktopOffOnKeepsTheUsersSettings(t *testing.T) {
+	home, p := desktopSandbox(t)
+	os.MkdirAll(p.dir, 0o755)
+	a := claudeDesktop(home)
+	f := a.Field("provider")
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	desktopWrite(t, p.prof, `{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"http://old:1","inferenceGatewayApiKey":"old","inferenceGatewayAuthScheme":"bearer",`+
+		`"disableDeploymentModeChooser":false,"coworkEgressAllowedHosts":["corp.example"],"inferenceModels":["claude-opus-4-7"],"isClaudeCodeForDesktopEnabled":true}`)
+	if err := f.Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p.prof); !os.IsNotExist(err) {
+		t.Fatal("magpie's profile is still there after off")
+	}
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	prof := desktopJSON(t, p.prof)
+	want := map[string]any{
+		"inferenceProvider": "gateway", "inferenceGatewayBaseUrl": gateway.URL(),
+		"inferenceGatewayApiKey": "magpie-claude-desktop", "inferenceGatewayAuthScheme": "bearer",
+		"disableDeploymentModeChooser": false, "coworkEgressAllowedHosts": []any{"corp.example"},
+		"inferenceModels": []any{"claude-opus-4-7"}, "isClaudeCodeForDesktopEnabled": true,
+	}
+	if !reflect.DeepEqual(prof, want) {
+		t.Errorf("profile after off and on:\n%v\nwant\n%v", prof, want)
+	}
+	if f.Get() != "magpie" || a.Check() != "" {
+		t.Errorf("get %q, check %q", f.Get(), a.Check())
+	}
+}
+
+// #2035 (capiton0): a profile the user made in Desktop's window for
+// magpie's gateway, applied when magpie is switched on, starts magpie's
+// profile: their settings (as they posted them) are kept, only the
+// gateway's address, key and auth scheme set. Their own profile is left
+// as it was and applied again when magpie is switched off.
+func TestClaudeDesktopOnKeepsTheUsersOwnGatewayProfile(t *testing.T) {
+	home, p := desktopSandbox(t)
+	const theirs = `{
+  "inferenceGatewayBaseUrl": "` + "%s" + `",
+  "inferenceGatewayApiKey": "magpie",
+  "sshHostAllowlist": ["*"],
+  "chatTabEnabled": true,
+  "chatAdvancedFileAnalysisEnabled": true,
+  "isDesktopExtensionEnabled": true,
+  "modelPrefer1mContext": true,
+  "defaultModelEffort": "max",
+  "autoModeEnabled": true,
+  "toolSearchEnabled": true,
+  "skipWebFetchPreflight": true,
+  "coworkEgressAllowedHosts": ["*"],
+  "disableDeploymentModeChooser": true,
+  "disableDeepLinkRegistration": true,
+  "inferenceProvider": "gateway",
+  "inferenceCredentialKind": "static"
+}`
+	own := filepath.Join(p.library, "5b0d0c6e-1f2a-4c3b-9d4e-0a1b2c3d4e5f.json")
+	body := fmt.Sprintf(theirs, gateway.URL())
+	desktopWrite(t, own, body)
+	desktopWrite(t, p.meta, `{"appliedId":"5b0d0c6e-1f2a-4c3b-9d4e-0a1b2c3d4e5f","entries":[{"id":"5b0d0c6e-1f2a-4c3b-9d4e-0a1b2c3d4e5f","name":"mine"}]}`)
+	a := claudeDesktop(home)
+	f := a.Field("provider")
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	var want map[string]any
+	json.Unmarshal([]byte(body), &want)
+	want["inferenceGatewayApiKey"] = "magpie-claude-desktop"
+	want["inferenceGatewayAuthScheme"] = "bearer"
+	if prof := desktopJSON(t, p.prof); !reflect.DeepEqual(prof, want) {
+		t.Errorf("magpie's profile:\n%v\nwant\n%v", prof, want)
+	}
+	if b, _ := os.ReadFile(own); string(b) != body {
+		t.Errorf("their profile was changed:\n%s", b)
+	}
+	if err := f.Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if id, _ := desktopJSON(t, p.meta)["appliedId"].(string); id != "5b0d0c6e-1f2a-4c3b-9d4e-0a1b2c3d4e5f" {
+		t.Errorf("applied after off: %q", id)
+	}
+	if b, _ := os.ReadFile(own); string(b) != body {
+		t.Errorf("their profile after off:\n%s", b)
+	}
+}
+
+// A profile for somewhere else (another gateway, Bedrock) is not carried
+// into magpie's: its models and settings are for that place.
+func TestClaudeDesktopOnLeavesOtherProfilesOut(t *testing.T) {
+	for name, prof := range map[string]string{
+		"other gateway": `{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://llm.example.com","inferenceModels":["corp-model"],"chatTabEnabled":true}`,
+		"bedrock":       `{"inferenceProvider":"bedrock","inferenceBedrockRegion":"us-east-1","chatTabEnabled":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			home, p := desktopSandbox(t)
+			desktopWrite(t, filepath.Join(p.library, "abc.json"), prof)
+			desktopWrite(t, p.meta, `{"appliedId":"abc","entries":[{"id":"abc","name":"mine"}]}`)
+			if err := claudeDesktop(home).Field("provider").Set("magpie"); err != nil {
+				t.Fatal(err)
+			}
+			got := desktopJSON(t, p.prof)
+			if _, ok := got["chatTabEnabled"]; ok {
+				t.Errorf("magpie's profile took another place's settings: %v", got)
+			}
+		})
+	}
+}
+
 // A file magpie can't read as Desktop writes it is left alone, and so is
 // everything else.
 func TestClaudeDesktopRefusesOddFiles(t *testing.T) {
@@ -353,8 +470,10 @@ func TestClaudeDesktopTiers(t *testing.T) {
 // runs as an MSIX package, its data in
 // %LOCALAPPDATA%\Packages\Claude_<publisher>\LocalCache\Roaming\Claude and
 // nothing in %APPDATA%\Claude. It is detected, and magpie's switch writes
-// the package's folders, which the packaged app reads, not the usual ones
-// it doesn't see.
+// the package's folders, which the packaged app up to 2.x reads. bg5eau on
+// X: 2.31226.1, packaged the same way, reads the real
+// %LOCALAPPDATA%\Claude-3p, so the switch writes the real folders too, and
+// switching off leaves both as they were.
 func TestClaudeDesktopMSIX(t *testing.T) {
 	home, _ := desktopSandbox(t)
 	old := desktopdir.OS
@@ -369,6 +488,11 @@ func TestClaudeDesktopMSIX(t *testing.T) {
 	}
 	os.WriteFile(filepath.Join(data, "Local State"), []byte(`{}`), 0o644)
 	os.MkdirAll(filepath.Join(pkg, "Local", "Claude", "logs"), 0o755)
+	// the newer build's own 3p folder: its settings, which stay
+	desktopWrite(t, filepath.Join(local, "Claude-3p", "claude_desktop_config.json"), `{"preferences":{"x":1}}`)
+	p := desktopPathsOf(filepath.Join(pkg, "Local", "Claude"), filepath.Join(pkg, "Local", "Claude-3p"))
+	r := desktopPathsOf(filepath.Join(local, "Claude"), filepath.Join(local, "Claude-3p"))
+	before, beforeReal := desktopTree(t, p), desktopTree(t, r)
 
 	a := claudeDesktop(home)
 	if !a.Detected() {
@@ -380,16 +504,156 @@ func TestClaudeDesktopMSIX(t *testing.T) {
 	if err := a.Field("provider").Set("magpie"); err != nil {
 		t.Fatal(err)
 	}
-	p := desktopPathsOf(filepath.Join(pkg, "Local", "Claude"), filepath.Join(pkg, "Local", "Claude-3p"))
-	if !desktopWired(p) || a.Field("provider").Get() != magpieID {
-		t.Fatalf("not wired in the package's folders: %v", desktopTree(t, p))
+	if a.Field("provider").Get() != magpieID {
+		t.Fatal("not on magpie")
 	}
-	if m := desktopJSON(t, p.config3p); m["deploymentMode"] != "3p" {
-		t.Errorf("Claude-3p: %v", m)
-	}
-	for _, d := range []string{filepath.Join(roaming, "Claude"), filepath.Join(local, "Claude"), filepath.Join(local, "Claude-3p")} {
-		if _, err := os.Stat(d); err == nil {
-			t.Errorf("%s written, which the packaged Desktop doesn't read", d)
+	for _, q := range []desktopPaths{p, r} {
+		if !desktopWired(q) {
+			t.Fatalf("not wired in %s: %v", q.dir3p, desktopTree(t, q))
 		}
+		for _, f := range []string{q.config, q.config3p} {
+			if m := desktopJSON(t, f); m["deploymentMode"] != "3p" {
+				t.Errorf("%s: %v", f, m)
+			}
+		}
+		if m := desktopJSON(t, q.prof); m["inferenceGatewayBaseUrl"] != gateway.URL() || m["inferenceGatewayAuthScheme"] != "bearer" {
+			t.Errorf("%s: %v", q.prof, m)
+		}
+		if m := desktopJSON(t, q.meta); m["appliedId"] != desktopProfileID {
+			t.Errorf("%s: %v", q.meta, m)
+		}
+	}
+	if m := desktopJSON(t, r.config3p); m["preferences"] == nil {
+		t.Errorf("the real Claude-3p's own settings lost: %v", m)
+	}
+	if c := a.Check(); c != "" {
+		t.Errorf("check: %s", c)
+	}
+	// Desktop's chooser turns the real one back to 1p: the check says so
+	desktopWrite(t, r.config3p, `{"deploymentMode":"1p","preferences":{"x":1}}`)
+	if c := a.Check(); !strings.Contains(c, "no longer 3p") || !strings.Contains(c, r.dir3p) {
+		t.Errorf("check: %q", c)
+	}
+	desktopWrite(t, r.config3p, `{"deploymentMode":"3p","preferences":{"x":1}}`)
+
+	if err := a.Field("provider").Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if got := desktopTree(t, p); !reflect.DeepEqual(got, before) {
+		t.Errorf("package's folders not as they were:\n got %v\nwant %v", got, before)
+	}
+	if got := desktopTree(t, r); !reflect.DeepEqual(got, beforeReal) {
+		t.Errorf("real folders not as they were:\n got %v\nwant %v", got, beforeReal)
+	}
+}
+
+// A packaged Desktop switched on by a magpie that wrote only the
+// package's folders keeps its stash: switching on now writes the real ones
+// too, and off still leaves the package's as they were before magpie.
+func TestClaudeDesktopMSIXStashBefore(t *testing.T) {
+	home, _ := desktopSandbox(t)
+	old := desktopdir.OS
+	desktopdir.OS = "windows"
+	t.Cleanup(func() { desktopdir.OS = old })
+	local := filepath.Join(home, "AppData", "Local")
+	pkg := filepath.Join(local, "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache")
+	desktopWrite(t, filepath.Join(pkg, "Roaming", "Claude", "Local State"), `{}`)
+	p := desktopPathsOf(filepath.Join(pkg, "Local", "Claude"), filepath.Join(pkg, "Local", "Claude-3p"))
+	desktopWrite(t, p.config3p, `{"deploymentMode":"1p"}`)
+	before := desktopTree(t, p)
+	// as the magpie before wrote it: the package's set, the plain keys
+	if err := desktopOn(p); err != nil {
+		t.Fatal(err)
+	}
+	r := desktopPathsOf(filepath.Join(local, "Claude"), filepath.Join(local, "Claude-3p"))
+
+	a := claudeDesktop(home)
+	if err := a.Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if !desktopWired(r) {
+		t.Fatal("real folders not written")
+	}
+	if err := a.Field("provider").Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if got := desktopTree(t, p); !reflect.DeepEqual(got, before) {
+		t.Errorf("package's folders not as they were:\n got %v\nwant %v", got, before)
+	}
+	for _, d := range []string{r.dir, r.dir3p} {
+		if _, err := os.Stat(d); err == nil {
+			t.Errorf("%s left behind", d)
+		}
+	}
+}
+
+// dumplings on Discord: Desktop 2.31226.0 from its MSIX on Windows runs in
+// the real %LOCALAPPDATA%\Claude-3p (its "Local State" there is the newest),
+// and the package's LocalCache copy, which magpie wrote too, is emptied.
+// Desktop is on magpie and the card doesn't say it was changed; the copy
+// Desktop reads turned back to 1p still does, and Reconnect with a tier on
+// one of magpie's models puts the gateway back, not only the tier.
+func TestClaudeDesktopMSIXChecksTheFoldersDesktopRuns(t *testing.T) {
+	home, _ := desktopSandbox(t)
+	old := desktopdir.OS
+	desktopdir.OS = "windows"
+	t.Cleanup(func() { desktopdir.OS = old })
+	if err := provider.Save(provider.Provider{ID: "v", Name: "V", Chat: "http://127.0.0.1:1/v1", Key: "k", Models: []string{"a", "b"}}); err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(home, "AppData", "Local")
+	os.MkdirAll(filepath.Join(home, "AppData", "Roaming"), 0o755)
+	pkg := filepath.Join(local, "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache")
+	pkg3p, real3p := filepath.Join(pkg, "Local", "Claude-3p"), filepath.Join(local, "Claude-3p")
+	desktopWrite(t, filepath.Join(pkg, "Roaming", "Claude", "Local State"), `{}`)
+	desktopWrite(t, filepath.Join(pkg3p, "Local State"), `{}`)
+	desktopWrite(t, filepath.Join(real3p, "Local State"), `{}`)
+	desktopWrite(t, filepath.Join(real3p, "claude_desktop_config.json"), `{"preferences":{"x":1}}`)
+	then := time.Now().Add(-48 * time.Hour)
+	for _, f := range []string{filepath.Join(pkg, "Roaming", "Claude", "Local State"), filepath.Join(pkg3p, "Local State")} {
+		os.Chtimes(f, then, then)
+	}
+	a := claudeDesktop(home)
+	if err := a.Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Field("sonnet").Set("v/a"); err != nil {
+		t.Fatal(err)
+	}
+	if c := a.Check(); c != "" {
+		t.Fatalf("check: %s", c)
+	}
+	// the update leaves the package's Claude-3p empty
+	if err := os.RemoveAll(pkg3p); err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(pkg3p, 0o755)
+	if c := a.Check(); c != "" {
+		t.Errorf("the package's copy Desktop no longer reads: %s", c)
+	}
+	if d := a.Drift(); d != nil && d.Kind == "unwired" {
+		t.Errorf("drift: %+v", d)
+	}
+	// the one Desktop runs in, turned back to 1p, is said
+	r := desktopPathsOf(filepath.Join(local, "Claude"), real3p)
+	desktopWrite(t, r.config3p, `{"deploymentMode":"1p","preferences":{"x":1}}`)
+	if c := a.Check(); !strings.Contains(c, "no longer 3p") || !strings.Contains(c, real3p) {
+		t.Fatalf("check: %q", c)
+	}
+	if d := a.Drift(); d == nil || d.Kind != "unwired" {
+		t.Fatalf("drift: %+v", d)
+	}
+	// Reconnect: the gateway back, with the tier
+	if err := a.Reapply(); err != nil {
+		t.Fatal(err)
+	}
+	if c := a.Check(); c != "" {
+		t.Errorf("after Reconnect: %s", c)
+	}
+	if m := desktopJSON(t, r.config3p); m["deploymentMode"] != "3p" || m["preferences"] == nil {
+		t.Errorf("%s: %v", r.config3p, m)
+	}
+	if got := a.Field("sonnet").Get(); got != "v/a" {
+		t.Errorf("sonnet: %q", got)
 	}
 }

@@ -34,6 +34,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/settings"
@@ -70,6 +71,21 @@ type List struct {
 
 var listMu sync.Mutex
 
+// bunMu is held through each bun command that changes plugins/ (add,
+// update, remove). Two at once read package.json and bun.lock before
+// either writes them, so one's change is lost (#2002, anganing: after an
+// update, the hourly plugin updates and the moved subscriptions' ran
+// together at start). The dependency a git plugin is found by is then
+// gone from package.json, and the plugin can't be loaded.
+var installMu sync.Mutex
+
+// runBun runs a bun command that changes plugins/, one at a time.
+func runBun(ctx context.Context, bun string, args ...string) ([]byte, error) {
+	installMu.Lock()
+	defer installMu.Unlock()
+	return bunCommand(ctx, bun, Dir(), args...).CombinedOutput()
+}
+
 // Dir is the folder magpie installs npm plugins into.
 func Dir() string { return filepath.Join(settings.Dir(), "plugins") }
 
@@ -105,6 +121,9 @@ func lockAuth() func() {
 
 func listPath() string { return filepath.Join(settings.Dir(), "plugins.json") }
 
+// ListPath is plugins.json's path.
+func ListPath() string { return listPath() }
+
 // pluginsList is plugins.json as last read, with the bytes it was parsed
 // from. The file is read every time: an edit that keeps the file's size and
 // time (a swap of two accounts of one length, a replaced file whose time is
@@ -120,7 +139,9 @@ var pluginsList struct {
 // changed; Load gives the mutable copy.
 func list() List {
 	path := listPath()
-	b, err := steady.ReadFile(path)
+	// one a crash left all zero (#1505) is its last good generation: the
+	// plugins installed are unknown, never none
+	b, err := lastgood.Read(path, lastgood.JSON)
 	if err != nil {
 		// Do not cache read failures; a later call will read the file again.
 		return List{}
@@ -188,24 +209,12 @@ func cloneJSON(v any) any {
 }
 
 // writeWhole writes b to p by a rename, so a magpie or the host reading
-// p meanwhile reads the old file or the new one, never one half-written;
-// read back with steady.ReadFile, which waits out the rename on Windows.
+// p meanwhile reads the old file or the new one, never one half-written,
+// and flushed to the disk first, so a machine that goes down meanwhile
+// doesn't leave p all zero (#1505); read back with steady.ReadFile, which
+// waits out the rename on Windows.
 func writeWhole(p string, b []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(p), filepath.Base(p)+".*")
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(b)
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = steady.Rename(f.Name(), p)
-	}
-	if err != nil {
-		os.Remove(f.Name())
-	}
-	return err
+	return steady.WriteFile(p, b, 0o600)
 }
 
 func save(l List) error {
@@ -214,6 +223,9 @@ func save(l List) error {
 		return err
 	}
 	if err := os.MkdirAll(settings.Dir(), 0o700); err != nil {
+		return err
+	}
+	if err := lastgood.Keep(listPath(), lastgood.JSON, 0o600); err != nil {
 		return err
 	}
 	if err := writeWhole(listPath(), append(b, '\n')); err != nil {
@@ -272,10 +284,15 @@ func checkList() {
 }
 
 // IsPath is whether spec names a file or folder rather than a package,
-// as OpenCode tells them apart.
+// as OpenCode tells them apart. A path rooted the way any system roots
+// one counts on every system, since plugins.json travels between
+// machines in a backup or a sync: a leading / or \ (a UNC path among
+// them) on Windows as well, and a drive letter off it (#2229).
 func IsPath(spec string) bool {
-	return strings.HasPrefix(spec, "file://") || strings.HasPrefix(spec, ".") || filepath.IsAbs(spec) || regexp.MustCompile(`^[A-Za-z]:[\\/]`).MatchString(spec)
+	return strings.HasPrefix(spec, "file://") || strings.HasPrefix(spec, ".") || strings.HasPrefix(spec, "/") || strings.HasPrefix(spec, `\`) || filepath.IsAbs(spec) || driveRooted.MatchString(spec)
 }
+
+var driveRooted = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
 
 var pkgName = regexp.MustCompile(`^(@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*$`)
 
@@ -391,7 +408,7 @@ func add(ctx context.Context, spec, version string) (Entry, error) {
 		// installed just now for this, and nothing loads it: taken out again
 		if !IsPath(spec) && !slices.Contains(slices.Collect(maps.Values(was)), Name(spec)) {
 			if bun, berr := Bun(ctx); berr == nil {
-				_ = bunCommand(ctx, bun, Dir(), "remove", "--ignore-scripts", Name(spec)).Run()
+				_, _ = runBun(ctx, bun, "remove", "--ignore-scripts", Name(spec))
 			}
 		}
 		return Entry{}, err
@@ -412,6 +429,8 @@ func add(ctx context.Context, spec, version string) (Entry, error) {
 		return x.Spec == spec || n == name
 	}); i >= 0 {
 		e.Options = l.Plugins[i].Options
+		// whether they turned it off, which an add never changes
+		e.Off = l.Plugins[i].Off
 		// a provider id the user picked it for stays its (another version,
 		// or its package from a git repository in place of npm's)
 		for id, s := range l.Prefer {
@@ -447,6 +466,9 @@ func notPlugin(target string) error {
 	if f, _ := Middleware(target); f != "" {
 		return nil
 	}
+	if f, _ := Agent(target); f != "" {
+		return nil
+	}
 	var pkg struct {
 		Name    string          `json:"name"`
 		Main    string          `json:"main"`
@@ -476,22 +498,33 @@ func notPlugin(target string) error {
 	return errors.New(why)
 }
 
-// Update installs the version of each npm plugin its spec says now
-// (latest, for the most part: npm's newest, asked now, installAt), and
-// fetches each git one again.
+// Update installs npm's newest version (asked now, installAt) of each npm
+// plugin, and fetches each git one again. A plugin pinned to a version
+// that npm has a newer one of is updated too, and unpinned, as its row's
+// Update does: the page counts it in Update all, and the CLI's update
+// says it installs the newest of each (ARNO on Discord: a plugin updated
+// with Update all still said an update was out, pinned where it was). A
+// pinned one already at npm's newest stays as its spec says.
 func Update(ctx context.Context) error {
 	var errs []error
 	for _, e := range Load().Plugins {
 		if !IsPath(e.Spec) {
 			v := ""
-			if !IsGit(e.Spec) && !Pinned(e.Spec) {
+			if !IsGit(e.Spec) {
 				v = newestOf(ctx, Name(e.Spec))
 			}
 			var err error
-			if v != "" {
+			switch {
+			case v != "" && Pinned(e.Spec):
+				if update.Newer(v, Installed(e.Spec)) {
+					_, err = add(ctx, Name(e.Spec), v)
+				} else {
+					err = reinstall(ctx, e.Spec)
+				}
+			case v != "":
 				err = installAt(ctx, Name(e.Spec), v)
-			} else {
-				// pinned, a git one, or npm not answering: as its spec says
+			default:
+				// a git one, or npm not answering: as its spec says
 				err = reinstall(ctx, e.Spec)
 			}
 			if err != nil {
@@ -537,7 +570,7 @@ func Remove(ctx context.Context, name string) error {
 	}
 	if !IsPath(e.Spec) {
 		if bun, err := Bun(ctx); err == nil {
-			_ = bunCommand(ctx, bun, Dir(), "remove", "--ignore-scripts", Name(e.Spec)).Run()
+			_, _ = runBun(ctx, bun, "remove", "--ignore-scripts", Name(e.Spec))
 		}
 	}
 	Restart()
@@ -616,9 +649,10 @@ func SetOptions(name string, opts map[string]any) error {
 
 // ShortName is a package's name without its scope and the words every
 // package of its kind has: model-map for @magpie-community/middleware-model-map,
-// zed for @magpie-community/opencode-zed-auth.
+// zed for @magpie-community/opencode-zed-auth. A plugin added from a folder
+// is named by its path, which on Windows ends after a backslash.
 func ShortName(pkg string) string {
-	if i := strings.LastIndex(pkg, "/"); i >= 0 {
+	if i := strings.LastIndexAny(pkg, `/\`); i >= 0 {
 		pkg = pkg[i+1:]
 	}
 	pkg = strings.TrimPrefix(strings.TrimPrefix(pkg, "middleware-"), "opencode-")
@@ -635,15 +669,44 @@ func install(ctx context.Context, spec string) error {
 	if err := os.MkdirAll(Dir(), 0o755); err != nil {
 		return err
 	}
+	// the package.json made for a first plugin is made under the lock
+	// too: written while another bun add writes its own, it would take
+	// every plugin out of it
+	installMu.Lock()
 	pj := filepath.Join(Dir(), "package.json")
 	if _, err := os.Stat(pj); err != nil {
 		if err := os.WriteFile(pj, []byte("{\n  \"name\": \"magpie-plugins\",\n  \"private\": true\n}\n"), 0o644); err != nil {
+			installMu.Unlock()
 			return err
 		}
 	}
+	defer installMu.Unlock()
+	err = bunAdd(ctx, bun, spec)
+	// a @magpie-community package or version npm doesn't have (a new
+	// one waits for an owner to publish it there) comes from the
+	// community repo's dist branch; one Bun's minimumReleaseAge holds
+	// back stays held, as the user's bunfig asks
+	if name, version, ok := distWanted(spec); ok && err != nil && !minAge.MatchString(err.Error()) {
+		if derr := installDist(ctx, bun, name, version); derr != nil {
+			return fmt.Errorf("%w (and from the community repo's dist branch: %v)", err, derr)
+		}
+		err = nil
+	}
+	if err == nil {
+		pruneDist()
+	}
+	return err
+}
+
+// bunAdd adds spec to plugins/ with bun, its scripts left unrun.
+// installMu held.
+func bunAdd(ctx context.Context, bun, spec string) error {
 	out, err := bunCommand(ctx, bun, Dir(), "add", "--ignore-scripts", spec).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("bun add %s: %v: %s", spec, err, lastLines(string(out), 6))
+		if hint := missingLibs(string(out)); hint != "" {
+			return fmt.Errorf("bun add %s: %s: %w", spec, hint, err)
+		}
+		return fmt.Errorf("bun add %s: %v: %s", spec, cantStart(bun, err), lastLines(string(out), 6))
 	}
 	return nil
 }
@@ -807,9 +870,12 @@ func reinstall(ctx context.Context, spec string) error {
 	if err != nil {
 		return err
 	}
-	out, err := bunCommand(ctx, bun, Dir(), "update", "--ignore-scripts", name).CombinedOutput()
+	out, err := runBun(ctx, bun, "update", "--ignore-scripts", name)
 	if err != nil {
-		return fmt.Errorf("bun update %s: %v: %s", name, err, lastLines(string(out), 6))
+		if hint := missingLibs(string(out)); hint != "" {
+			return fmt.Errorf("bun update %s: %s: %w", name, hint, err)
+		}
+		return fmt.Errorf("bun update %s: %v: %s", name, cantStart(bun, err), lastLines(string(out), 6))
 	}
 	return nil
 }

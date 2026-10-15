@@ -43,13 +43,33 @@ function serve(lang, posts, terminalDefault = "com.apple.Terminal") {
   };
 }
 
+// The Session terminal row wheeled into view as a reader would: rows keep
+// being added above it, so it sits under the window's foot, and a click
+// Playwright scrolls in for is put back (a scroll that isn't the reader's,
+// #1554) and lands on the foot
+async function reach(page) {
+  const view = await page.locator("#view-settings").boundingBox();
+  await page.mouse.move(view.x + view.width / 2, view.y + view.height / 2);
+  const rest = () => page.evaluate(() => new Promise((done) => {
+    const v = document.querySelector("#view-settings");
+    let last = -1;
+    const look = () => { if (v.scrollTop === last) done(); else { last = v.scrollTop; setTimeout(look, 100); } };
+    look();
+  }));
+  for (let i = 0; i < 60; i++) {
+    const b = await page.locator("#sessionTerminalSelect").boundingBox();
+    if (b && b.y > view.y && b.y + b.height < view.y + view.height) return;
+    await page.mouse.wheel(0, b && b.y < view.y ? -40 : 40);
+    await rest();
+  }
+  assert.fail("the Session terminal row never came into view");
+}
+
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const lang of ["en", "zh"]) {
     test(`${engine} ${lang}: session terminal preference`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
-      // tall enough that the row is clear of the page's foot: rows were added above
-      // it, and Playwright scrolling it in closed the menu the first click opened
-      const context = await browser.newContext({ viewport: { width: 900, height: 1000 }, reducedMotion: "reduce" });
+      const context = await browser.newContext({ viewport: { width: 900, height: 700 }, reducedMotion: "reduce" });
       await context.addInitScript(() => Object.defineProperty(navigator, "platform", { get: () => "MacIntel" }));
       const page = await context.newPage();
       const errors = [], posts = [];
@@ -67,6 +87,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator("#prefs").click();
       const row = page.locator("#sessionTerminalRow");
       await row.waitFor({ state: "visible" });
+      await reach(page);
       // the app's own menu, not a native select
       const select = page.locator("#sessionTerminalSelect");
       assert.equal(await page.locator("#sessionTerminalRow select").count(), 0, "no native select");
@@ -88,16 +109,24 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal((await select.textContent()).trim(), lang === "zh" ? "系统默认（Terminal）" : "System default (Terminal)");
       const top = await page.evaluate(() => document.scrollingElement.scrollTop);
 
+      // the page is drawn again once the save is in; a Theme button from
+      // before then still sends the page as it was drawn, the old terminal
+      // with it, so the Theme click below waits for the new buttons, as a
+      // reader can only click what is on the page
+      await page.evaluate(() => document.querySelectorAll("#themeSegs .opt").forEach((b) => { b.dataset.before = "1"; }));
       await choose("Ghostty");
       assert.equal(await page.evaluate(() => document.scrollingElement.scrollTop), top, "the page doesn't move");
       await page.waitForFunction(() => document.querySelector("#sessionTerminalSelect").dataset.value === "com.mitchellh.ghostty");
       assert.equal((await select.textContent()).trim(), "Ghostty");
-      await page.locator("#themeSegs .opt").last().click();
+      await page.waitForFunction(() => !document.querySelector("#themeSegs .opt[data-before]"));
+      // another setting saved (Theme, scrolled away above) keeps the terminal
+      await page.locator("#themeSegs .opt").last().evaluate((b) => b.click());
       await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
       assert.equal(posts.at(-1).sessionTerminal, "com.mitchellh.ghostty");
       await page.reload();
       await page.locator("#prefs").click();
       await row.waitFor({ state: "visible" });
+      await reach(page);
       assert.equal(await select.getAttribute("data-value"), "com.mitchellh.ghostty");
       const savedSystem = page.waitForResponse((response) => response.url().endsWith("/api/settings") && response.request().method() === "POST");
       await choose(lang === "zh" ? "系统默认" : "System default");
@@ -106,6 +135,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.reload();
       await page.locator("#prefs").click();
       await row.waitFor({ state: "visible" });
+      await reach(page);
       assert.equal(await select.getAttribute("data-value"), "system");
       await page.setViewportSize({ width: 520, height: 700 });
       assert.equal(await row.evaluate((element) => element.scrollWidth > element.clientWidth), false);
@@ -116,15 +146,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     test(`${engine} ${lang}: an editor as the default reads as Terminal`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       t.after(() => browser.close());
-      // tall enough that the row is clear of the page's foot: rows were added above
-      // it, and Playwright scrolling it in closed the menu the first click opened
-      const context = await browser.newContext({ viewport: { width: 900, height: 1000 }, reducedMotion: "reduce" });
+      const context = await browser.newContext({ viewport: { width: 900, height: 700 }, reducedMotion: "reduce" });
       await context.addInitScript(() => Object.defineProperty(navigator, "platform", { get: () => "MacIntel" }));
       const page = await context.newPage();
       await page.route("**/*", serve(lang, [], "com.apple.TextEdit"));
       await page.goto("http://magpie.test/");
       await page.locator("#prefs").click();
       await page.locator("#sessionTerminalRow").waitFor({ state: "visible" });
+      await reach(page);
       await page.locator("#sessionTerminalSelect").click();
       assert.deepEqual((await page.locator(".proto-menu .pm-item .pm-name").allTextContents()).map((s) => s.trim()),
         lang === "zh" ? ["系统默认（Terminal）", "Ghostty"] : ["System default (Terminal)", "Ghostty"]);

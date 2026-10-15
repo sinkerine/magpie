@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/yetone/magpie/internal/catalog"
 )
 
 // The APIs are close cousins; everything below is the shape they have
@@ -48,11 +51,33 @@ type Part struct {
 	Images     []Part         // the images the tool returned beside its text
 	Standalone map[string]any // native Responses notification with no call ID
 
-	// thinking
+	// thinking: its signature (Anthropic's, or a Gemini thought's). On a
+	// tool call, and on text, Gemini's thoughtSignature: a tool call's
+	// comes only from Google, as gemini_signature.go carries it, and
+	// text's only from a Gemini API (#1445)
 	Signature string
+	// thinking an upstream sealed, as its API wrote it: Anthropic's
+	// redacted_thinking block, a Responses reasoning item with its id,
+	// summary and encrypted_content. Only that API's builder, encoder and
+	// renderer write it, byte for byte; to any other it is reasoning with
+	// no text, or Text's (#1445). SealedBy is the API (sealAnthropic,
+	// sealResponses).
+	Sealed   json.RawMessage
+	SealedBy string
 
 	// web_search: Text is the query
 	Hits []Hit
+}
+
+// The APIs a Part's Sealed reasoning is in.
+const (
+	sealAnthropic = "anthropic"
+	sealResponses = "responses"
+)
+
+// sealedBy reports whether p is reasoning api sealed.
+func (p Part) sealedBy(api string) bool {
+	return p.Kind == Thinking && p.SealedBy == api && len(p.Sealed) > 0
 }
 
 // Hit is a page a web search found.
@@ -176,14 +201,17 @@ type Request struct {
 	// output: format.go), nil for plain text. Text, a Responses client's,
 	// holds it no more: it is asked for again in the upstream's own words.
 	Format *Format
+	// FormatTold is set when Format was told in the system prompt instead
+	// (inSystem): the client still wants the answer as JSON.
+	FormatTold bool
 	// GeminiCompat is the upstream being Gemini's OpenAI-compatible API
 	// (AI Studio's, or a proxy in front of it on this machine or the LAN),
 	// which gives the model's thoughts only when asked in thinking_config.
 	GeminiCompat bool
 	// OffLevel is the level such an API is asked to think at when the
 	// client turned reasoning off: Gemini 3 can't stop thinking, and thinks
-	// least at minimal, or at its lowest level where it has no minimal
-	// (geminiOffLevel). "" is minimal.
+	// least at minimal, or at its lowest level where it has no minimal or
+	// turned minimal away (geminiLevels). "" is minimal.
 	OffLevel string
 	// Resume is set on a request built to go on with a reply the client
 	// already has part of (continuation.go): its last message is that
@@ -231,6 +259,16 @@ const (
 	KError                      // Text
 	KSearch                     // Text (the query), Hits: a web search run for the model
 	KImage                      // Name (media type), Text (base64): an image the model made
+	// KThinkStart: a new block of reasoning begins (Anthropic's thinking
+	// block, a Responses reasoning item, ID its id): what follows is not
+	// the one before's, even with nothing between them
+	KThinkStart
+	// KSealed: Text is reasoning the upstream sealed, whole as its API
+	// wrote it, Name that API (Part.Sealed): Anthropic's redacted_thinking
+	// block, a Responses reasoning item as it was done
+	KSealed
+	// KTextSig: Text is Gemini's thoughtSignature on the text before it
+	KTextSig
 )
 
 // Event is one thing a streaming reply said.
@@ -251,6 +289,13 @@ type Event struct {
 	Usage            Usage
 	Hits             []Hit
 	SafeguardResults json.RawMessage
+	// StopDetails: Anthropic's stop_details, what its classifier said of
+	// a refusal (#1768), carried to the client as it came
+	StopDetails json.RawMessage
+
+	// Wait: for KError, how long the vendor said to wait before asking
+	// again, when it said; sent on as Retry-After
+	Wait time.Duration
 }
 
 // Usage counts tokens.
@@ -282,6 +327,28 @@ type Usage struct {
 	// (stop_reason, finish_reason, a Responses status): "" when it said
 	// none, as a stream that just stops does (upstreamStop)
 	Stop string `json:"stop,omitempty"`
+	// Tier is the service tier the reply says it ran at (upstreamTier),
+	// "" when it says none
+	Tier string `json:"tier,omitempty"`
+	// Deferred is what the reply counted of earlier requests of its
+	// conversation, which their own replies couldn't (cUsage's
+	// MagpieDeferred): billed with this one, never told as its prompt
+	Deferred *Usage `json:"deferred,omitempty"`
+}
+
+// billed is what the request is billed for: its own count, and what it
+// counted of earlier ones (Deferred).
+func (u Usage) billed() Usage {
+	if d := u.Deferred; d != nil {
+		u.Input += d.Input
+		u.Output += d.Output
+		u.CacheRead += d.CacheRead
+		u.CacheWrite += d.CacheWrite
+		u.CacheWrite1h += d.CacheWrite1h
+		u.Reasoning += d.Reasoning
+		u.Deferred = nil
+	}
+	return u
 }
 
 // prompt is every token the prompt came to, as OpenAI's and Gemini's
@@ -316,6 +383,9 @@ func (u *Usage) add(v Usage) {
 	if v.Upstream != "" {
 		u.Upstream = v.Upstream
 	}
+	if v.Tier != "" {
+		u.Tier = v.Tier
+	}
 	if v.RequestID != "" {
 		u.RequestID = v.RequestID
 	}
@@ -328,6 +398,9 @@ func (u *Usage) add(v Usage) {
 	if v.Stop != "" {
 		u.Stop = v.Stop
 	}
+	if v.Deferred != nil {
+		u.Deferred = v.Deferred
+	}
 }
 
 // Result is a whole reply, for non-streaming clients.
@@ -338,6 +411,7 @@ type Result struct {
 	Stop             string
 	Usage            Usage
 	SafeguardResults json.RawMessage
+	StopDetails      json.RawMessage
 }
 
 // collector assembles a Result from events. Encoders use the same logic to
@@ -345,7 +419,9 @@ type Result struct {
 type collector struct {
 	res  Result
 	args strings.Builder // arguments of the open tool call
-	err  string
+	// fresh: a KThinkStart said the next reasoning is a block of its own
+	fresh bool
+	err   string
 	// the error's status and kind, as its event gave them
 	errStatus int
 	errCode   string
@@ -354,6 +430,18 @@ type collector struct {
 func (c *collector) last(k Kind) *Part {
 	if n := len(c.res.Parts); n > 0 && c.res.Parts[n-1].Kind == k {
 		return &c.res.Parts[n-1]
+	}
+	return nil
+}
+
+// open is the reasoning the next of it goes on: the last part, when it is
+// reasoning not sealed whole, and no new block has begun since.
+func (c *collector) open() *Part {
+	if c.fresh {
+		return nil
+	}
+	if p := c.last(Thinking); p != nil && len(p.Sealed) == 0 {
+		return p
 	}
 	return nil
 }
@@ -373,6 +461,9 @@ func (c *collector) add(ev Event) {
 	if len(ev.SafeguardResults) > 0 {
 		c.res.SafeguardResults = ev.SafeguardResults
 	}
+	if len(ev.StopDetails) > 0 {
+		c.res.StopDetails = ev.StopDetails
+	}
 	switch ev.Kind {
 	case KStart:
 		c.res.ID, c.res.Model = ev.MsgID, ev.Model
@@ -384,16 +475,40 @@ func (c *collector) add(ev Event) {
 			c.closeTool()
 			c.res.Parts = append(c.res.Parts, Part{Kind: Text, Text: ev.Text})
 		}
+	case KThinkStart:
+		c.fresh = true
+		return
 	case KThink:
-		if p := c.last(Thinking); p != nil {
+		if p := c.open(); p != nil {
 			p.Text += ev.Text
 		} else {
 			c.closeTool()
 			c.res.Parts = append(c.res.Parts, Part{Kind: Thinking, Text: ev.Text})
 		}
 	case KSig:
-		if p := c.last(Thinking); p != nil {
+		// a block signed with no text in it (Claude's thinking when its
+		// display is omitted) is a block all the same (#1445)
+		if p := c.open(); p != nil {
 			p.Signature += ev.Text
+		} else if c.fresh {
+			c.closeTool()
+			c.res.Parts = append(c.res.Parts, Part{Kind: Thinking, Signature: ev.Text})
+		}
+	case KSealed:
+		// a Responses item's summary came before it as reasoning of its
+		// own: the item is that reasoning, sealed
+		if p := c.open(); p != nil && ev.Name == sealResponses && p.Signature == "" {
+			p.Sealed, p.SealedBy = json.RawMessage(ev.Text), ev.Name
+		} else {
+			c.closeTool()
+			c.res.Parts = append(c.res.Parts, Part{Kind: Thinking, Sealed: json.RawMessage(ev.Text), SealedBy: ev.Name})
+		}
+	case KTextSig:
+		if p := c.last(Text); p != nil && p.Signature == "" {
+			p.Signature = ev.Text
+		} else {
+			c.closeTool()
+			c.res.Parts = append(c.res.Parts, Part{Kind: Text, Signature: ev.Text})
 		}
 	case KToolStart:
 		c.closeTool()
@@ -414,6 +529,12 @@ func (c *collector) add(ev Event) {
 	case KImage:
 		c.closeTool()
 		c.res.Parts = append(c.res.Parts, Part{Kind: Image, MediaType: ev.Name, Data: ev.Text})
+	}
+	switch ev.Kind {
+	case KStart, KUsage, KError:
+	default:
+		// what began has had its first content, or something else came
+		c.fresh = false
 	}
 }
 
@@ -488,7 +609,7 @@ func stringOrText(raw json.RawMessage) string {
 		return ""
 	}
 	var s string
-	if json.Unmarshal(raw, &s) == nil {
+	if decodeJSON(raw, &s) == nil {
 		return s
 	}
 	var blocks []struct {
@@ -496,7 +617,7 @@ func stringOrText(raw json.RawMessage) string {
 		Text     string `json:"text"`
 		ToolName string `json:"tool_name"`
 	}
-	if json.Unmarshal(raw, &blocks) == nil {
+	if decodeJSON(raw, &blocks) == nil {
 		var b strings.Builder
 		for _, x := range blocks {
 			switch x.Type {
@@ -509,7 +630,7 @@ func stringOrText(raw json.RawMessage) string {
 				if b.Len() > 0 {
 					b.WriteString("\n")
 				}
-				b.WriteString("Tool " + x.ToolName + " is loaded and can be called now.")
+				b.WriteString(toolLoadedText(x.ToolName))
 			}
 		}
 		return b.String()
@@ -533,7 +654,7 @@ func toolOutput(raw json.RawMessage) (string, []Part) {
 		} `json:"source"`
 		ImageURL json.RawMessage `json:"image_url"`
 	}
-	if len(raw) == 0 || raw[0] != '[' || json.Unmarshal(raw, &blocks) != nil {
+	if len(raw) == 0 || raw[0] != '[' || decodeJSON(raw, &blocks) != nil {
 		return text, nil
 	}
 	var images []Part
@@ -547,11 +668,11 @@ func toolOutput(raw json.RawMessage) (string, []Part) {
 			}
 		case "input_image", "image_url":
 			var u string
-			if json.Unmarshal(b.ImageURL, &u) != nil {
+			if decodeJSON(b.ImageURL, &u) != nil {
 				var o struct {
 					URL string `json:"url"`
 				}
-				json.Unmarshal(b.ImageURL, &o)
+				decodeJSON(b.ImageURL, &o)
 				u = o.URL
 			}
 			if u != "" {
@@ -576,7 +697,7 @@ func effortOf(s string) string {
 }
 
 // effortRank orders the reasoning levels agents and vendors name.
-var effortRank = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+var effortRank = catalog.EffortRank
 
 // ByStrength is efforts weakest first, in effortRank's order; a level it
 // doesn't know keeps its place among the others of its kind, after them.
@@ -606,28 +727,7 @@ func fitEffort(want string, levels []string) string {
 		want = "max"
 		levels = slices.DeleteFunc(slices.Clone(levels), func(l string) bool { return l == "ultra" })
 	}
-	if len(levels) == 0 || slices.Contains(levels, want) {
-		return want
-	}
-	at := slices.Index(effortRank, want)
-	if at < 0 {
-		return want
-	}
-	best, dist := want, len(effortRank)
-	for _, l := range levels {
-		i := slices.Index(effortRank, l)
-		if i < 0 || l == "none" {
-			continue
-		}
-		d := i - at
-		if d < 0 {
-			d = -d
-		}
-		if d < dist || d == dist && i > at {
-			best, dist = l, d
-		}
-	}
-	return best
+	return catalog.NearestEffort(want, levels)
 }
 
 // budgetOf is the Anthropic thinking budget for an effort level.

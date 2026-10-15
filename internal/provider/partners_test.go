@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -152,6 +153,10 @@ func TestPartnersFetchedLastIsHeld(t *testing.T) {
 		_, _ = rw.Write([]byte(b))
 	}))
 	t.Cleanup(srv.Close)
+	// runs before srv.Close, which waits for the held fetch: a check that
+	// fails before the release below doesn't leave it held (#1808)
+	let := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(let)
 	t.Setenv("MAGPIE_PARTNERS", srv.URL)
 
 	Partners()
@@ -162,7 +167,7 @@ func TestPartnersFetchedLastIsHeld(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	body.Store(`{"partners":[]}`)
-	go func() { time.Sleep(50 * time.Millisecond); close(release) }()
+	go func() { time.Sleep(50 * time.Millisecond); let() }()
 	fetchPartnersNow()
 	<-served
 	// the earlier fetch has answered; give it the time to store its list
@@ -230,12 +235,20 @@ func TestPartnersDoesNotWait(t *testing.T) {
 		}
 	})
 	t.Setenv("MAGPIE_PARTNERS", srv.URL)
-	start := time.Now()
-	for range 5 {
-		Partners()
-	}
-	if d := time.Since(start); d > time.Second {
-		t.Fatalf("Partners waited %v", d)
+	// The site is held until the test ends, so Partners coming back at all is
+	// Partners not waiting for it (#1617). The deadline only turns a wait
+	// into a FAIL, and is short of the fetch's own 20s.
+	looked := make(chan struct{})
+	go func() {
+		defer close(looked)
+		for range 5 {
+			Partners()
+		}
+	}()
+	select {
+	case <-looked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Partners waited for the held site")
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for asked.Load() == 0 && time.Now().Before(deadline) {
@@ -282,12 +295,30 @@ func TestPartnersNow(t *testing.T) {
 	loadPartners()
 	partnerNext = time.Time{}
 	partnerMu.Unlock()
-	start := time.Now()
-	if ids := partnerIDs(PartnersNow(100 * time.Millisecond)); ids != "acme" {
-		t.Fatalf("PartnersNow while the site hangs = %q, want the kept acme", ids)
+	// The site is held, so PartnersNow coming back at all is its bound ending
+	// the wait (#1617); the floor is that it did wait for the fetch, which a
+	// busy machine only lengthens. The deadline only turns a wait past the
+	// bound into a FAIL, and is short of the fetch's own 20s.
+	type answer struct {
+		ids  string
+		took time.Duration
 	}
-	if d := time.Since(start); d < 100*time.Millisecond || d > 2*time.Second {
-		t.Fatalf("PartnersNow waited %v, want its bound", d)
+	answered := make(chan answer, 1)
+	go func() {
+		start := time.Now()
+		ids := partnerIDs(PartnersNow(100 * time.Millisecond))
+		answered <- answer{ids, time.Since(start)}
+	}()
+	select {
+	case a := <-answered:
+		if a.ids != "acme" {
+			t.Fatalf("PartnersNow while the site hangs = %q, want the kept acme", a.ids)
+		}
+		if a.took < 100*time.Millisecond {
+			t.Fatalf("PartnersNow waited %v, not its 100ms bound", a.took)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("PartnersNow waited past its bound for the held site")
 	}
 }
 

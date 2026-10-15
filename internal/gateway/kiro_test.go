@@ -432,3 +432,35 @@ func TestServeKiroUsageLimit(t *testing.T) {
 		t.Fatalf("%d %s", w.Code, w.Body)
 	}
 }
+
+// Kiro caches a prompt only up to a cachePoint, so the instructions' message
+// and the one being answered are marked, as buildAnthropic marks them
+// (magpie-community/plugins#110: "kiro cli cache 率为 0").
+func TestBuildKiroMarksTheCache(t *testing.T) {
+	r := &Request{
+		System: "Be brief.",
+		Messages: []Message{
+			{Role: "user", Parts: []Part{{Kind: Text, Text: "hi"}}},
+			{Role: "assistant", Parts: []Part{{Kind: Text, Text: "hello"}}},
+			{Role: "user", Parts: []Part{{Kind: Text, Text: "and?"}}},
+		},
+	}
+	b := buildKiroBody(t, r, false)
+	h := b.ConversationState.History
+	if len(h) != 2 || h[0].User.CachePoint == nil || h[0].User.CachePoint.Type != "default" {
+		t.Fatalf("first message = %+v", h[0].User)
+	}
+	if cur := b.ConversationState.CurrentMessage.UserInputMessage; cur.CachePoint == nil || cur.CachePoint.Type != "default" {
+		t.Fatalf("current message = %+v", cur)
+	}
+	raw := string(buildKiro(r, "claude-sonnet-4.5", "", false))
+	if n := strings.Count(raw, `"cachePoint":{"type":"default"}`); n != 2 {
+		t.Fatalf("%d cache points in %s", n, raw)
+	}
+	// with no instructions only the message being answered is marked
+	r.System = ""
+	raw = string(buildKiro(r, "claude-sonnet-4.5", "", false))
+	if n := strings.Count(raw, `"cachePoint"`); n != 1 || !strings.Contains(raw, `"content":"and?","modelId":"claude-sonnet-4.5","origin":"KIRO_CLI","cachePoint":{"type":"default"}`) {
+		t.Fatalf("%d cache points in %s", n, raw)
+	}
+}

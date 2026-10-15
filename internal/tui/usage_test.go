@@ -79,6 +79,9 @@ func TestQuotaLines(t *testing.T) {
 // — never touching a vendor's own balance string (that's quotaLines above).
 func TestFmtCostShowsChosenCurrency(t *testing.T) {
 	home(t)
+	// a currency read in the last second (an earlier run's ¥, -count) is
+	// kept; read this home's
+	costAt = time.Time{}
 
 	if got := fmtCost(usage.Totals{Cost: 1.23}); got != "≈$1.23" {
 		t.Fatalf("default currency: %q", got)
@@ -201,5 +204,56 @@ func TestQuotaLinesCreditsNotSpent(t *testing.T) {
 	}
 	if got := strings.Join(quotaLines(qs, true, false, 200, now), "\n"); !strings.Contains(got, "1.2K credits left · not spent") {
 		t.Errorf("set not to:\n%s", got)
+	}
+}
+
+// The Usage page's headline says how many calls its cost leaves out for
+// having no known price (#1856), not only a "+" after the sum.
+func TestUsagePageSaysCallsUnpriced(t *testing.T) {
+	home(t)
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local)
+	oldClock := usage.Clock
+	usage.Clock = func() time.Time { return now }
+	t.Cleanup(func() { usage.Clock = oldClock })
+	old := usage.LogCalls
+	usage.LogCalls = func(time.Time) []sessions.Call { return nil }
+	t.Cleanup(func() { usage.LogCalls = old })
+	for i := range 3 {
+		usage.Append(usage.Record{Time: now.Add(-time.Duration(i+1) * time.Minute), Agent: "claude", Provider: "relay", Model: "kimi-k3-auto", Input: 500, Output: 50, Status: 200})
+	}
+	m := press(t, model{w: 160, h: 60, page: pageUsage}, "t")
+	if v := m.viewUsage(); !strings.Contains(v, "(3 calls unpriced)") {
+		t.Fatal(v)
+	}
+}
+
+// u on the Usage page shows a window by how much of it is left rather than
+// used, as the app's toggle does, and that choice is Settings' QuotaLeft
+// where the app keeps it: the app and the tray panel change it there, so the
+// TUI starts from it (#122).
+func TestQleftSeededFromSettings(t *testing.T) {
+	home(t)
+	if err := settings.Save(settings.Settings{QuotaLeft: true}); err != nil {
+		t.Fatal(err)
+	}
+	if m := newModel(); !m.qleft {
+		t.Fatal("Settings say left, and the TUI starts showing used")
+	}
+}
+
+// u writes what it picked to Settings, so the pick survives the next start
+// and the app's own toggle and the menu bar follow it.
+func TestQleftWritesBack(t *testing.T) {
+	home(t)
+	if settings.Load().QuotaLeft {
+		t.Fatal("the sandbox's settings start with left chosen")
+	}
+	m := press(t, model{w: 120, h: 40, page: pageUsage}, "u")
+	if !m.qleft || !settings.Load().QuotaLeft {
+		t.Fatalf("after u: qleft %v, Settings %v", m.qleft, settings.Load().QuotaLeft)
+	}
+	m = press(t, m, "u")
+	if m.qleft || settings.Load().QuotaLeft {
+		t.Fatalf("after the second u: qleft %v, Settings %v", m.qleft, settings.Load().QuotaLeft)
 	}
 }

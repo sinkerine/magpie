@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // StartPluginSignIn begins signing in to a plugin's provider (OpenCode's
@@ -19,15 +20,21 @@ import (
 // is. A built-in moved onto its plugin installs the CLI it runs through
 // first, as the built-in's sign-in did.
 func StartPluginSignIn(id string, method int, inputs map[string]string) (SignInState, error) {
-	s := &signInFlow{done: make(chan struct{})}
-	s.st = SignInState{ID: randomToken(9), Agent: PluginID(id), State: "waiting"}
-	var cli agentCLI
-	install := false
-	if Moved(s.st.Agent) {
-		cli, install = missingCLI(s.st.Agent)
-	} else if pluginRunsCLI[id] {
-		cli, install = missingCLI(id)
+	return StartPluginSignInWith(id, method, inputs, SignInOptions{})
+}
+
+// StartPluginSignInWith is StartPluginSignIn through the proxy o picks,
+// else the one the provider's requests go through (#1663).
+func StartPluginSignInWith(id string, method int, inputs map[string]string, o SignInOptions) (SignInState, error) {
+	if settings.AccountDiscoveryOff() {
+		return SignInState{}, errAccountDiscoveryOff
 	}
+	s := &signInFlow{done: make(chan struct{})}
+	if err := s.pickProxy(PluginID(id), o); err != nil {
+		return SignInState{}, err
+	}
+	s.st = SignInState{ID: randomToken(9), Agent: PluginID(id), State: "waiting", Proxy: s.proxy}
+	cli, install := pluginCLI(id)
 	var installing context.Context
 	if install {
 		s.st.State, s.st.Installing = "installing", cli.Name
@@ -66,10 +73,51 @@ func StartPluginSignIn(id string, method int, inputs map[string]string) (SignInS
 // has no shell to run; its CLI is installed first, as a moved one's is.
 var pluginRunsCLI = map[string]bool{"grok": true}
 
+// pluginCLI is the vendor CLI a plugin's sign-in (OpenCode's id) runs
+// through and this machine lacks: a moved built-in's, or one in
+// pluginRunsCLI.
+func pluginCLI(id string) (agentCLI, bool) {
+	if Moved(PluginID(id)) {
+		return missingCLI(PluginID(id))
+	}
+	if pluginRunsCLI[id] {
+		return missingCLI(id)
+	}
+	return agentCLI{}, false
+}
+
+// PluginCLIMissing is the name of the vendor CLI a plugin's sign-in runs
+// through and this machine lacks (Grok Build for Grok's), "" when there is
+// none to install. The command line's sign-in installs it first, as
+// StartPluginSignIn does; without it, `magpie plugin login grok` in Docker
+// said "install Grok Build first: curl … | bash", which the image has no
+// curl to run (#2223).
+func PluginCLIMissing(id string) string {
+	c, ok := pluginCLI(id)
+	if !ok {
+		return ""
+	}
+	return c.Name
+}
+
+// InstallPluginCLI installs the CLI PluginCLIMissing names, with its
+// vendor's installer or, where that can't run, as it installs it.
+func InstallPluginCLI(ctx context.Context, id string) error {
+	c, ok := pluginCLI(id)
+	if !ok {
+		return nil
+	}
+	if err := installCLI(ctx, c); err != nil {
+		return err
+	}
+	forgetAccountCaches()
+	return nil
+}
+
 // pluginBegin asks the plugin for the page to open and waits for the
 // sign-in to finish there, or for the code the page shows.
 func (s *signInFlow) pluginBegin(id string, method int, inputs map[string]string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(s.via(context.Background()), time.Minute)
 	a, err := plugin.Authorize(ctx, id, method, inputs, plugin.NewAccount)
 	cancel()
 	if err != nil {
@@ -165,7 +213,8 @@ func PluginAPIKey(ctx context.Context, id string, method int, inputs map[string]
 	if strings.TrimSpace(key) == "" {
 		return "", errors.New("enter the key")
 	}
-	saved, err := plugin.APIKey(ctx, id, method, inputs, strings.TrimSpace(key), plugin.NewAccount)
+	// through the proxy the provider's requests go through (#1663)
+	saved, err := plugin.APIKey(Via(ctx, PluginID(id)), id, method, inputs, strings.TrimSpace(key), plugin.NewAccount)
 	if err != nil {
 		return "", err
 	}

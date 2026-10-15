@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -169,5 +170,52 @@ func TestTestModelsDraws(t *testing.T) {
 	mu.Unlock()
 	if rs := p.Test(context.Background()); len(rs) != 1 || !rs[0].OK || rs[0].Model != "gpt-6-sol" {
 		t.Fatalf("Test %+v", rs)
+	}
+}
+
+// #1837: an image model whose name doesn't place it on the images API
+// (agnes-image-2.5-flash reads like gemini's -flash image models, which
+// chat) is turned away in chat with the vendor naming the images API; the
+// gateway draws with it there, so its test passes there too, and a chat
+// model the vendor turns away the same way stays failed.
+func TestTestModelsGoesWhereTheVendorPointsIt(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	var mu sync.Mutex
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			rw.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		model, _ := in["model"].(string)
+		mu.Lock()
+		paths = append(paths, model+" "+r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path == "/v1/images/generations" && model == "agnes-image-2.5-flash" {
+			_, _ = rw.Write([]byte(`{"created":1,"data":[{"url":"https://img.example/1.png"}]}`))
+			return
+		}
+		rw.WriteHeader(http.StatusBadRequest)
+		_, _ = rw.Write([]byte(`{"error":{"message":"Model ` + model + ` is an image model. Use /v1/images/generations","type":"invalid_request_error"}}`))
+	}))
+	defer srv.Close()
+	p := Provider{ID: "agnes", Name: "Agnes", Chat: srv.URL + "/v1", Key: "sk-x",
+		Models: []string{"agnes-image-2.5-flash", "agnes-chat"}}
+	rs := p.TestModels(context.Background(), []string{"agnes-image-2.5-flash", "agnes-chat"})
+	if len(rs) != 2 || !rs[0].OK || rs[1].OK {
+		t.Fatalf("results %+v", rs)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	slices.Sort(paths)
+	want := []string{"agnes-chat /v1/chat/completions", "agnes-image-2.5-flash /v1/chat/completions", "agnes-image-2.5-flash /v1/images/generations"}
+	if !slices.Equal(paths, want) {
+		t.Fatalf("asked %v, want %v", paths, want)
 	}
 }

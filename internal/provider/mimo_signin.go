@@ -110,7 +110,7 @@ func mimoAccountGet(ctx context.Context, client *http.Client, u, deviceID string
 func startMiMoSignIn(s *signInFlow) error {
 	base := mimoBaseOf(mimoDefaultRegion)
 	deviceID := mimoDeviceID()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.via(context.Background()))
 	start, stop := context.WithTimeout(ctx, 20*time.Second)
 	defer stop()
 	sid, callback := mimoServiceOf(start, base)
@@ -217,7 +217,9 @@ func mimoSignedInWith(ctx context.Context, p mimoPassed, deviceID string) (strin
 	if err != nil {
 		return "", err
 	}
-	if err := addSideLogin(savedLogin{Agent: MiMoID, User: who, Auth: auth}, "", func(savedLogin) {}); err != nil {
+	if err := keepLogin(ctx, func() error {
+		return addSideLogin(savedLogin{Agent: MiMoID, User: who, Auth: auth}, "", func(savedLogin) {})
+	}); err != nil {
 		return "", err
 	}
 	// signed in again: whatever Xiaomi refused before is over

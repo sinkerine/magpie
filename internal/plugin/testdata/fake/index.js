@@ -87,12 +87,30 @@ export const FakePlugin = async ({ client }) => ({
     if (process.env.FAKE_GROK) cfg.provider[ID].models["grok-4.7"] = { name: "Grok 4.7", provider: { npm: "@ai-sdk/openai" }, limit: { context: 4000, output: 400 } }
     // $FAKE_DEEPSEEK: a DeepSeek model, as Cline's cline-pass/deepseek-v4-pro
     if (process.env.FAKE_DEEPSEEK) cfg.provider[ID].models["deepseek-v4-pro"] = { name: "DeepSeek V4 Pro", limit: { context: 1000, output: 100 } }
+    // $FAKE_SEARCHES: the provider's upstream searches by itself (#2027),
+    // as a plugin in front of Claude's API says
+    if (process.env.FAKE_SEARCHES) cfg.provider[ID].searches = true
+    // $FAKE_DECIDE: the provider serves a decision API too (#1514), asked
+    // at its base /systemone through the loader's fetch: fake-clef is a
+    // decision model it marks, jev-9 one magpie knows by its name.
+    // "models" marks them without saying decide.
+    if (process.env.FAKE_DECIDE) {
+      if (process.env.FAKE_DECIDE !== "models") cfg.provider[ID].decide = true
+      cfg.provider[ID].models["fake-clef"] = { name: "Fake Clef", decides: true, limit: { context: 1000, output: 0 } }
+      cfg.provider[ID].models["jev-9"] = { name: "Jev 9", limit: { context: 1000, output: 0 } }
+    }
     // $FAKE_OFF: a model that stops thinking at none and one that can't,
     // as Factory's plugin has Kimi K3 and GLM-5.3 (#899)
     if (process.env.FAKE_OFF) {
       const levels = (l) => Object.fromEntries(l.map((e) => [e, { reasoningEffort: e }]))
       cfg.provider[ID].models["fake-off"] = { name: "Fake Off", reasoning: true, variants: levels(["none", "low", "high", "max"]), limit: { context: 1000, output: 100 } }
       cfg.provider[ID].models["fake-on"] = { name: "Fake On", reasoning: true, variants: levels(["low", "high", "max"]), limit: { context: 1000, output: 100 } }
+    }
+    // $FAKE_ZEN: a model as opencode-zen-free 0.1.3's config hook writes
+    // it, from models.opencode.ai on 2026-10-11 (#1595, tkhs101): it
+    // takes audio, video and pdf too, at five levels (its api left to ours)
+    if (process.env.FAKE_ZEN) {
+      cfg.provider[ID].models["muse-spark-1.3-contributor-free"] = {"id":"muse-spark-1.3-contributor-free","name":"Muse Spark 1.3 Free","provider":{"npm":"@ai-sdk/openai"},"limit":{"context":1048576,"output":131072},"reasoning":true,"tool_call":true,"attachment":true,"modalities":{"input":["text","image","audio","video","pdf"],"output":["text"]},"cost":{"input":0,"output":0},"variants":{"minimal":{"reasoningEffort":"minimal"},"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"},"xhigh":{"reasoningEffort":"xhigh"}},"free":true}
     }
   },
   auth: {
@@ -108,12 +126,14 @@ export const FakePlugin = async ({ client }) => ({
         ],
         // $FAKE_LOOPBACK: the page comes back to a port here, as Devin's
         // and Kiro's plugins sign in
-        authorize: async (inputs) => process.env.FAKE_LOOPBACK ? loopbackSignIn(inputs) : ({
+        // $FAKE_SIGNIN: the sign-in asks the vendor there, as a device
+        // sign-in asks for its code and trades it for the tokens (#1663)
+        authorize: async (inputs) => process.env.FAKE_LOOPBACK ? loopbackSignIn(inputs) : (process.env.FAKE_SIGNIN && (await fetch(process.env.FAKE_SIGNIN + "/device").catch(() => {})), {
           url: "https://fake.invalid/auth?where=" + inputs.where,
           instructions: "Paste the code",
           method: "code",
           callback: async (code) =>
-            code === "good"
+            (process.env.FAKE_SIGNIN && (await fetch(process.env.FAKE_SIGNIN + "/token").catch(() => {})), code === "good")
               ? { type: "success", refresh: "r-" + (inputs.team ?? "none"), access: "stale", expires: 0, ...fakeWho(inputs.team) }
               : code === "expired"
                 ? { type: "failed", error: "the sign-in page expired" }
@@ -136,6 +156,10 @@ export const FakePlugin = async ({ client }) => ({
         h.set("authorization", "Bearer " + (a.type === "oauth" ? a.access : a.key))
         h.set("x-models", Object.keys(provider.models).sort().join(","))
         h.set("x-body-type", typeof init.body)
+        // where magpie said the agent works, as the plugin read it; its own
+        // headers go on too, as a plugin that sends on what it got sends
+        // them, for the host to take off
+        for (const k of ["x-magpie-work-dir", "x-magpie-work-git"]) if (h.has(k)) h.set("x-saw-" + k.slice(9), h.get(k))
         // $FAKE_H2: the request goes on node:http2 to that origin, as
         // Cursor's plugin runs its chats
         if (process.env.FAKE_H2) return h2(process.env.FAKE_H2, new URL(url).pathname)
@@ -175,8 +199,11 @@ export const FakePlugin = async ({ client }) => ({
         resets: full ? { count: 3, byWindow: true, fiveHour: 2, weekly: 1 } : undefined,
         windows: [
           { name: "5 hours", used: full ? 100 : 25, resetsAt: born + 3600e3, span: 5 * 3600, models: ["fake-claude"] },
-          { name: "Week", used: 10, resetsAt: Math.floor(born / 1000) + 86400, span: 7 * 86400, amount: 120, limit: 1200, unit: "credits" },
-          { name: "Extra", used: 250, display: "$2.50", aside: true },
+          // 80 of its credits are lost in two days, after it resets (#2265)
+          { name: "Week", used: 10, resetsAt: Math.floor(born / 1000) + 86400, span: 7 * 86400, amount: 120, limit: 1200, unit: "credits",
+            runsOutAt: Math.floor(born / 1000) + 2 * 86400, runsOut: 80 },
+          // a run-out the host can't read is not told
+          { name: "Extra", used: 250, display: "$2.50", aside: true, runsOutAt: "not a date", runsOut: "12" },
         ],
       }
     },
@@ -229,6 +256,16 @@ export const FakePlugin = async ({ client }) => ({
       if (p.models["fake-claude"]) Object.assign(p.models["fake-claude"], { rate: 0.5, rateWas: 1 })
       if (p.models["fake-gemini"]) p.models["fake-gemini"].rate = "x0.03"
       if (auth?.key === "few") return { "fake-1": p.models["fake-1"] }
+      // $FAKE_ZEN: a model as opencode-zen-free 0.1.3's models hook lists
+      // it, its capabilities as it gives them (#1595): audio and video in,
+      // thinking with no levels to pick
+      if (process.env.FAKE_ZEN) {
+        p.models["mimo-v2.6-flash-free"] = { ...p.models["fake-1"], id: "mimo-v2.6-flash-free", name: "MiMo V2.6 Flash Free", api: { ...p.models["fake-1"].api, id: "mimo-v2.6-flash-free" }, free: true, variants: {},
+          capabilities: {"temperature":true,"reasoning":true,"attachment":true,"toolcall":true,"input":{"text":true,"image":true,"audio":true,"video":true,"pdf":false},"output":{"text":true,"image":false,"audio":false,"video":false,"pdf":false},"interleaved":{"field":"reasoning_content"}} }
+      }
+      // $FAKE_DECIDE: one more decision model, marked on the list the hook
+      // gives, as a plugin that reads its vendor's list marks one
+      if (process.env.FAKE_DECIDE) p.models["fake-judge"] = { ...p.models["fake-1"], id: "fake-judge", name: "Fake Judge", api: { ...p.models["fake-1"].api, id: "fake-judge" }, free: false, decides: true }
       // $FAKE_FAST=tier: as Cursor's plugin 0.2.x lists a model, once per
       // context size, and from 0.2.2 says fast on the sizes Cursor has a
       // fast variant at (Opus 5.5's 300k, not its 1m); no -fast model

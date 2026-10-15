@@ -2,7 +2,10 @@ package library
 
 import (
 	"bytes"
+	"cmp"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"maps"
 	"os"
@@ -37,11 +40,14 @@ type CarriedSkill struct {
 	Left   []string          `json:"left,omitempty"` // files too big to carry
 }
 
-// A skill's file bigger than maxCarried is left out, and so is every file
-// once the skills come to maxCarriedAll: a backup is for text, not for
-// what a skill downloads beside it.
+// A skill's file bigger than maxCarried is left out, and so are the
+// biggest once the skills come to maxCarriedAll. A skill's own files go
+// with it, its scripts and its templates (a PowerPoint template with its
+// pictures is several MB), but a sync reads at most 64 MiB of a backup
+// (davsync), and a skill's bytes are base64 twice in one (the bundle's
+// JSON, then the sealed envelope's): 32 MiB of files is about 57 MiB.
 const (
-	maxCarried    = 2 << 20
+	maxCarried    = 16 << 20
 	maxCarriedAll = 32 << 20
 )
 
@@ -49,8 +55,10 @@ const (
 func Collect() (*Bundle, error) {
 	mu.Lock()
 	defer mu.Unlock()
-	if _, err := os.Stat(path()); err != nil {
+	if _, err := os.Stat(path()); errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
+	} else if err != nil { // there, but unknown: never carried as no library (#2269)
+		return nil, err
 	}
 	l, err := load()
 	if err != nil {
@@ -58,8 +66,14 @@ func Collect() (*Bundle, error) {
 	}
 	b := &Bundle{Instructions: l.Instructions, Texts: map[string]string{}, Extra: extras(), MCP: []*Server{}, Skills: []*CarriedSkill{}, Icons: l.Icons}
 	b.Instructions.Agents = orNone(b.Instructions.Agents)
+	// a set's own file is this computer's: its text goes, where it is
+	// doesn't
+	b.Instructions.Sets = slices.Clone(b.Instructions.Sets)
+	for i := range b.Instructions.Sets {
+		b.Instructions.Sets[i].File = ""
+	}
 	for _, s := range l.sets() {
-		if text := readText(setPath(s.ID)); text != "" {
+		if text := readText(l.textPath(s.ID)); text != "" {
 			b.Texts[s.ID] = text
 		}
 	}
@@ -74,9 +88,13 @@ func Collect() (*Bundle, error) {
 		c.Agents = orNone(slices.Sorted(slices.Values(s.Agents)))
 		b.MCP = append(b.MCP, &c)
 	}
-	budget := maxCarriedAll
-	for _, s := range sorted(l.Skills, func(s *Skill) string { return s.Name }) {
-		c := readSkill(realDir(skillDir(s.Name)), &budget)
+	skills := sorted(l.Skills, func(s *Skill) string { return s.Name })
+	dirs := []string{}
+	for _, s := range skills {
+		dirs = append(dirs, realDir(skillDir(s.Name)))
+	}
+	for i, c := range readSkills(dirs) {
+		s := skills[i]
 		c.Name, c.Source, c.Agents = s.Name, s.Source, orNone(slices.Sorted(slices.Values(s.Agents)))
 		b.Skills = append(b.Skills, c)
 	}
@@ -94,50 +112,75 @@ func orNone(xs []string) []string {
 	return xs
 }
 
-// readSkill is a skill folder's files, as WalkDir gives them: in order.
-// Links in it, .git and what isn't a plain file stay out.
-func readSkill(dir string, budget *int) *CarriedSkill {
-	c := &CarriedSkill{Files: map[string][]byte{}}
-	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if p != dir && (d.Name() == ".git" || d.Name() == marker) {
-				return filepath.SkipDir
+// readSkills is each skill folder's files. Links in it, .git and what
+// isn't a plain file stay out. What goes is chosen smallest first across
+// every skill, so the text of them all comes before any big file.
+func readSkills(dirs []string) []*CarriedSkill {
+	type file struct {
+		skill  int
+		rel, p string
+		size   int64
+		runs   bool
+	}
+	var files []file
+	out := make([]*CarriedSkill, len(dirs))
+	for i, dir := range dirs {
+		out[i] = &CarriedSkill{Files: map[string][]byte{}}
+		filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
 			}
+			if d.IsDir() {
+				if p != dir && (d.Name() == ".git" || d.Name() == marker) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !d.Type().IsRegular() || d.Name() == marker {
+				return nil
+			}
+			rel, err := filepath.Rel(dir, p)
+			if err != nil {
+				return nil
+			}
+			fi, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			files = append(files, file{i, filepath.ToSlash(rel), p, fi.Size(), fi.Mode().Perm()&0o111 != 0})
 			return nil
-		}
-		if !d.Type().IsRegular() || d.Name() == marker {
-			return nil
-		}
-		rel, err := filepath.Rel(dir, p)
-		if err != nil {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		fi, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		if fi.Size() > maxCarried || int(fi.Size()) > *budget {
-			c.Left = append(c.Left, rel)
-			return nil
-		}
-		data, err := os.ReadFile(p)
-		if err != nil {
-			return nil
-		}
-		*budget -= len(data)
-		c.Files[rel] = data
-		if fi.Mode().Perm()&0o111 != 0 {
-			c.Exec = append(c.Exec, rel)
-		}
-		return nil
+		})
+	}
+	// smallest first, and the same order for the same files every time
+	slices.SortFunc(files, func(a, b file) int {
+		return cmp.Or(cmp.Compare(a.size, b.size), cmp.Compare(a.skill, b.skill), strings.Compare(a.rel, b.rel))
 	})
-	slices.Sort(c.Exec) // WalkDir's order isn't the order of the paths
-	slices.Sort(c.Left)
-	return c
+	budget := int64(maxCarriedAll)
+	for _, f := range files {
+		c := out[f.skill]
+		if f.size > maxCarried || f.size > budget {
+			c.Left = append(c.Left, f.rel)
+			continue
+		}
+		data, err := os.ReadFile(f.p)
+		if err != nil {
+			continue
+		}
+		if n := int64(len(data)); n > maxCarried || n > budget { // grew since
+			c.Left = append(c.Left, f.rel)
+			continue
+		}
+		budget -= int64(len(data))
+		c.Files[f.rel] = data
+		if f.runs {
+			c.Exec = append(c.Exec, f.rel)
+		}
+	}
+	for _, c := range out {
+		slices.Sort(c.Exec)
+		slices.Sort(c.Left)
+	}
+	return out
 }
 
 // check refuses a bundle that would write outside the library: a name
@@ -178,7 +221,7 @@ func (b *Bundle) check() error {
 			return fmt.Errorf("the skill %s twice", s.Name)
 		}
 		seen[s.Name] = true
-		for rel := range s.Files {
+		for _, rel := range slices.Concat(slices.Collect(maps.Keys(s.Files)), s.Left) {
 			if !localFile(rel) {
 				return fmt.Errorf("skill %s: %q is not a file in its folder", s.Name, rel)
 			}
@@ -200,6 +243,12 @@ func (b *Bundle) WithoutSecrets(secret func(string) bool) {
 	for i, s := range b.MCP {
 		c := *s
 		c.Env, c.Headers = blank(s.Env, secret), blank(s.Headers, secret)
+		// an OAuth app's secret is a key too; its client ID isn't
+		if s.OAuth != nil && s.OAuth.ClientSecret != "" {
+			a := *s.OAuth
+			a.ClientSecret = ""
+			c.OAuth = &a
+		}
 		b.MCP[i] = &c
 	}
 }
@@ -232,6 +281,12 @@ func (b *Bundle) WithSecrets(have *Bundle, secret func(string) bool) *Bundle {
 		i := slices.IndexFunc(have.MCP, func(h *Server) bool { return h.Name == s.Name })
 		if i >= 0 {
 			c.Env, c.Headers = filled(s.Env, have.MCP[i].Env, secret), filled(s.Headers, have.MCP[i].Headers, secret)
+			// the same app's secret, kept here
+			if h := have.MCP[i].OAuth; s.OAuth != nil && s.OAuth.ClientSecret == "" && h != nil && h.ClientID == s.OAuth.ClientID {
+				a := *s.OAuth
+				a.ClientSecret = h.ClientSecret
+				c.OAuth = &a
+			}
 		}
 		out.MCP = append(out.MCP, &c)
 	}
@@ -276,8 +331,7 @@ func Put(b *Bundle) (*Result, error) {
 		keep, link := map[string]bool{}, map[string]string{}
 		for _, s := range b.Skills {
 			if cur := l.skill(s.Name); cur != nil && sameSource(cur.Source, s.Source) {
-				budget := maxCarriedAll
-				if have := readSkill(realDir(skillDir(s.Name)), &budget); sameFiles(have, s) {
+				if have := readSkills([]string{realDir(skillDir(s.Name))})[0]; sameFiles(have, s) {
 					keep[s.Name] = true
 					continue
 				}
@@ -291,6 +345,9 @@ func Put(b *Bundle) (*Result, error) {
 				continue
 			}
 			if err := writeSkill(filepath.Join(stage, s.Name), s); err != nil {
+				return fmt.Errorf("skill %s: %w", s.Name, err)
+			}
+			if err := keepLeft(filepath.Join(stage, s.Name), realDir(skillDir(s.Name)), s); err != nil {
 				return fmt.Errorf("skill %s: %w", s.Name, err)
 			}
 		}
@@ -345,14 +402,24 @@ func Put(b *Bundle) (*Result, error) {
 		kept := newBackups()
 		l.kept = kept
 		texts := map[string]string{}
+		// a set linked here to a file of the user's keeps it: the file is
+		// given the text b has for the set, and never emptied for a text
+		// b hasn't
+		files := map[string]string{}
 		for _, s := range l.sets() {
-			texts[setPath(s.ID)] = ""
+			if s.File != "" {
+				files[s.ID] = s.File
+			} else {
+				texts[setPath(s.ID)] = ""
+			}
 		}
 		for id := range extras() {
 			texts[extraPath(id)] = ""
 		}
 		for id, text := range b.Texts {
-			texts[setPath(id)] = text
+			if files[id] == "" {
+				texts[setPath(id)] = text
+			}
 		}
 		for id, text := range b.Extra {
 			texts[extraPath(id)] = text
@@ -370,6 +437,15 @@ func Put(b *Bundle) (*Result, error) {
 		}
 		l.Instructions = Instructions{Agents: slices.Sorted(slices.Values(orNone(b.Instructions.Agents))),
 			Sets: slices.Clone(b.Instructions.Sets), Active: b.Instructions.Active}
+		for i := range l.Instructions.Sets {
+			s := &l.Instructions.Sets[i]
+			s.File = files[s.ID]
+			if text := strings.TrimSpace(b.Texts[s.ID]); s.File != "" && text != "" {
+				if err := l.putText(s.File, text); err != nil {
+					return err
+				}
+			}
+		}
 
 		l.MCP = nil
 		for _, s := range b.MCP {
@@ -406,6 +482,40 @@ func writeSkill(dir string, s *CarriedSkill) error {
 			mode = 0o755
 		}
 		if err := os.WriteFile(p, s.Files[rel], mode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// keepLeft copies into a skill being put (at dir) the files the other
+// computer left out as too big to carry that the skill here has, so it
+// is put with them, not without.
+func keepLeft(dir, here string, s *CarriedSkill) error {
+	for _, rel := range s.Left {
+		if _, ok := s.Files[rel]; ok {
+			continue
+		}
+		from := filepath.Join(here, filepath.FromSlash(rel))
+		fi, err := os.Lstat(from)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		to := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
+			return err
+		}
+		in, err := os.Open(from)
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(to, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fi.Mode().Perm())
+		if err == nil {
+			_, err = io.Copy(out, in)
+			err = errors.Join(err, out.Close())
+		}
+		in.Close()
+		if err != nil {
 			return err
 		}
 	}

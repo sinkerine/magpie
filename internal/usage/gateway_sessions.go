@@ -68,7 +68,7 @@ func GatewaySessionByID(agent, id string, nativeKeys map[string]bool) (GatewaySe
 	if id == "" {
 		return GatewaySession{}, false
 	}
-	agent = AgentOf(agent)
+	agent = ReportedAs(agent)
 	if nativeKeys[agent+"|"+id] {
 		return GatewaySession{}, false
 	}
@@ -96,7 +96,7 @@ var gatewayCache struct {
 // Retain a few window projections, not one copy for every native exclusion set.
 // The log snapshot version also detects rewrites and changes of config directory.
 func gatewayProjection(since time.Time) gatewayProjectionEntry {
-	snapshot := logSnapshotFor(true)
+	snapshot := readLogSnapshot()
 	meta := usagePriceCacheKey(time.Now())
 	gatewayCache.Lock()
 	defer gatewayCache.Unlock()
@@ -104,9 +104,6 @@ func gatewayProjection(since time.Time) gatewayProjectionEntry {
 		if e.version == snapshot.version && e.meta == meta && e.since.Equal(since) {
 			return e
 		}
-	}
-	if snapshot.uncached && len(snapshot.blocks) == 0 {
-		snapshot = readLogSnapshot()
 	}
 	ss, _ := buildGatewaySessions(snapshot, since, nil)
 	e := gatewayProjectionEntry{version: snapshot.version, meta: meta, since: since, sessions: ss, byID: make(map[string]int, len(ss))}
@@ -174,7 +171,7 @@ func gatewayDays(ss []GatewaySession) []GatewayDayUsage {
 }
 
 func buildGatewaySessions(snapshot *logSnapshot, since time.Time, nativeKeys map[string]bool) ([]GatewaySession, []GatewayDayUsage) {
-	priceOf := pricer()
+	priceOf := Pricer()
 	type key struct{ agent, id string }
 	groups := map[key]*GatewaySession{}
 	models := map[key]map[string]*GatewayModel{}
@@ -182,10 +179,10 @@ func buildGatewaySessions(snapshot *logSnapshot, since time.Time, nativeKeys map
 	daily := map[dayKey]*GatewayDayUsage{}
 	perSession := map[key]map[dayKey]*GatewayDayUsage{}
 	snapshot.visit(since, func(r Record) {
-		if r.IsRejected() || r.Session == "" {
+		if r.IsRejected() || r.IsReported() || r.Session == "" {
 			return
 		}
-		a := AgentOf(r.Agent)
+		a := ReportedAs(r.Agent)
 		k := key{a, r.Session}
 		if nativeKeys != nil && nativeKeys[a+"|"+r.Session] {
 			return

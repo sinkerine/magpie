@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -240,6 +241,64 @@ func TestModelNotInPlanRestsTheModelNotTheKey(t *testing.T) {
 	}
 	if strings.Join(seen, ",") != "k-one:deepseek-v4-flash" {
 		t.Fatalf("v4 tried %v; want the first key, straight", seen)
+	}
+}
+
+// The same words said escaped as \uXXXX (a relay whose encoder escapes
+// what isn't ASCII, #1669) are read by the other deciders too: what
+// rests the model alone, and what another provider may answer.
+func TestEscapedWordsReadByTheOtherDeciders(t *testing.T) {
+	unserved := []byte(`{"error":{"code":7,"message":"\u8be5\u6a21\u578b\u4e0d\u652f\u6301\u5f53\u524d\u4ee4\u724c\u8ba1\u5212"}}`)
+	if !modelRefused(403, unserved) {
+		t.Errorf("escaped 模型不支持: modelRefused false; the key would rest for its model")
+	}
+	if !modelRefused(403, []byte(`{"error":{"message":"该模型不支持当前令牌计划"}}`)) {
+		t.Errorf("the same refusal unescaped: modelRefused false")
+	}
+	quota := []byte(`{"error":{"message":"\u989d\u5ea6\u5df2\u7528\u5b8c\uff0c\u8bf7\u660e\u5929\u518d\u8bd5","type":"invalid_request_error"}}`)
+	if !retryable(400, quota) {
+		t.Errorf("escaped 额度已用完: retryable false; the next decision model isn't asked")
+	}
+	if !retryable(400, []byte(`{"error":{"message":"额度已用完，请明天再试","type":"invalid_request_error"}}`)) {
+		t.Errorf("the same refusal unescaped: retryable false")
+	}
+}
+
+// The rest of the deciders whose words are Chinese read them escaped as
+// well: a conversation too long, a retired model or a shape refusal that
+// also says the quota is spent, and a size inferred only when nothing
+// else is said. Each case beside the same words unescaped.
+func TestEscapedWordsReadByEveryDecider(t *testing.T) {
+	for _, esc := range []bool{true, false} {
+		say := func(s string) []byte {
+			if !esc {
+				return []byte(`{"error":{"message":"` + s + `"}}`)
+			}
+			q, _ := json.Marshal(s)
+			// as Python's json.dumps writes it
+			var b strings.Builder
+			for _, r := range string(q) {
+				if r > 127 {
+					fmt.Fprintf(&b, `\u%04x`, r)
+				} else {
+					b.WriteRune(r)
+				}
+			}
+			return []byte(`{"error":{"message":` + b.String() + `}}`)
+		}
+		if !overflowed(400, say("上下文长度超过限制")) {
+			t.Errorf("escaped %v: 上下文长度超过限制 not overflowed", esc)
+		}
+		if modelRetired(410, say("Model m1 has been deprecated, 额度已用完")) {
+			t.Errorf("escaped %v: a retirement that says the quota is spent rests the model alone", esc)
+		}
+		if shapeRefused(400, say("Unknown parameter: 'x'. 额度已用完")) {
+			t.Errorf("escaped %v: a shape refusal that says the quota is spent rests nobody", esc)
+		}
+		p := provider.Provider{ID: "fake", Name: "Fake", Contexts: map[string]int{"m": 100}}
+		if said, ok := tooLongUnsaid(p, "m", 1000, 400, say("该模型不支持当前令牌计划")); ok {
+			t.Errorf("escaped %v: a model the plan doesn't serve told as too long: %s", esc, said)
+		}
 	}
 }
 

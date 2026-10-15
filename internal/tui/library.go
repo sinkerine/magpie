@@ -8,6 +8,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"path"
 	"runtime"
 	"slices"
 	"strings"
@@ -142,8 +143,8 @@ func (m model) updateLibrary(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.openLibAgents(r)
 		case "found-mcp", "found-skill":
 			m.flash, m.flashOK = "i brings "+r.name+" into the library, for magpie to give it to other agents too", true
-			if r.kind == "found-skill" {
-				m.flash += "; d takes it out of every agent"
+			if !r.own {
+				m.flash += "; d takes it out of every agent that has it"
 			}
 		}
 	case "e":
@@ -158,7 +159,7 @@ func (m model) updateLibrary(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.flash, m.flashOK = "fetching "+r.name+" from GitHub again…", true
-		return m, libCmd(func() (*library.Result, error) { return library.UpdateSkill(r.name) }, "updated "+r.name)
+		return m, libCmd(func() (*library.Result, error) { return library.UpdateSkill(r.name, false) }, "updated "+r.name)
 	case "i":
 		if r.own {
 			m.flash, m.flashOK = r.name+" is put there by the agent's app itself, each time it starts: it stays as it is", false
@@ -183,14 +184,23 @@ func (m model) updateLibrary(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			do = library.RemoveSkill
 		case "found-skill":
 			do = library.RemoveFoundSkill
+		case "found-mcp":
+			if r.own {
+				m.flash, m.flashOK = r.name+" is put there by the agent's app itself, each time it starts: it stays as it is", false
+				return m, nil
+			}
+			do = library.RemoveFoundServer
 		default:
 			return m, nil
 		}
 		if m.confirm != "library/"+r.kind+"/"+r.name {
 			m.confirm = "library/" + r.kind + "/" + r.name
 			m.flash, m.flashOK = "press d again to take "+r.name+" out of the library and every agent", false
-			if r.kind == "found-skill" {
+			switch r.kind {
+			case "found-skill":
 				m.flash = "press d again to take " + r.name + " out of every agent that has it, kept with the backups"
+			case "found-mcp":
+				m.flash = "press d again to take " + r.name + " out of every agent that has it, their files kept with the backups"
 			}
 			return m, nil
 		}
@@ -395,7 +405,8 @@ func saveServer(old *library.Server, line string) tea.Cmd {
 		was, done := "", "added "+s.Name+" · ↵ on it gives it to agents"
 		if old != nil {
 			was, done = old.Name, "saved "+s.Name
-			s.Agents, s.Env, s.Headers = old.Agents, old.Env, old.Headers
+			// and its OAuth app, which only the GUI edits
+			s.Agents, s.Env, s.Headers, s.OAuth = old.Agents, old.Env, old.Headers, old.OAuth
 		}
 		return libCmd(func() (*library.Result, error) { return library.SaveServer(was, s) }, done)()
 	}
@@ -446,6 +457,18 @@ func (m *model) openProbe(p *library.Probe) {
 	m.pk.refilter()
 	m.mode = modePick
 	m.back = modeList
+	// skills too big to install on their own, not in the list (#2062)
+	var left []string
+	for _, l := range p.Left {
+		name := p.Source
+		if l.Path != "" {
+			name = path.Base(l.Path)
+		}
+		left = append(left, fmt.Sprintf("%s (%d MB)", name, l.Size>>20))
+	}
+	if len(left) > 0 {
+		m.flash = "too big to install, over 200 MB a skill: " + strings.Join(left, ", ")
+	}
 }
 
 // editedMsg is the shared instructions as the editor left them.
@@ -525,9 +548,25 @@ func (m model) viewLibrary() string {
 	}
 	// the rows around the cursor, as many as fit
 	visible := max(4, m.h-6)
-	start := 0
-	if m.lrow >= visible-2 {
-		start = m.lrow - visible + 3
+	// where the window starts is counted in the lines it draws — counted in
+	// rows alone, a list of several sections drew heads the budget never
+	// paid for, and the row picked fell off the bottom of the page
+	spend := func(from int) int {
+		lines := 0
+		for i := from; i <= m.lrow && lines <= visible; i++ {
+			lines++
+			if i == from || m.lib[i].kind != m.lib[i-1].kind {
+				lines += 2 // the head, and the blank before it
+				if i == 0 {
+					lines-- // the list's first section has no blank above it
+				}
+			}
+		}
+		return lines
+	}
+	start := m.lrow
+	for start > 0 && spend(start-1) <= visible {
+		start--
 	}
 	last, lines := "", 0
 	for i := start; i < len(m.lib) && lines < visible; i++ {

@@ -115,7 +115,7 @@ func TestWorkBuddy(t *testing.T) {
 func TestWorkBuddyEfforts(t *testing.T) {
 	e := buddyModel("workbuddy", "x/y", "Y", 0, 500000, true, []string{"none", "low", "high"})
 	r, _ := e["reasoning"].(map[string]any)
-	if e["maxInputTokens"] != 200000 || e["maxOutputTokens"] != zcodeMaxOutput || e["supportsReasoning"] != true ||
+	if e["maxInputTokens"] != 200000 || e["maxOutputTokens"] != 500000 || e["supportsReasoning"] != true ||
 		r["canDisableThinking"] != true || r["defaultEffort"] != "high" || len(r["supportedEfforts"].([]string)) != 2 {
 		t.Fatalf("%v", e)
 	}
@@ -187,5 +187,64 @@ func TestWorkBuddyKeepsRemoteAddress(t *testing.T) {
 		if m["url"] != gatewayV1()+"/chat/completions" || m["apiKey"] != "magpie-workbuddy" {
 			t.Fatalf("local address not followed: %v", m)
 		}
+	}
+}
+
+// WorkBuddy AI, the international build, reads ~/.workbuddy-ai/models.json
+// (its product.json's dataFolderName), not ~/.workbuddy's (#1494, ysicing):
+// magpie's models go there, as a bare list, under its own key, and the
+// China build's file is left as it was.
+func TestWorkBuddyAIWritesItsOwnFolder(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	t.Setenv("WORKBUDDY_CONFIG_DIR", "")
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	cn := filepath.Join(home, ".workbuddy", "models.json")
+	os.MkdirAll(filepath.Dir(cn), 0o755)
+	os.WriteFile(cn, []byte(`[{"id":"qwen-local","local":true}]`), 0o600)
+	// a folder WorkBuddy has started in, with no models.json: argv.json
+	// and device-id are among what the China build keeps in ~/.workbuddy
+	intl := filepath.Join(home, ".workbuddy-ai", "models.json")
+	os.MkdirAll(filepath.Join(home, ".workbuddy-ai", "logs"), 0o755)
+	os.WriteFile(filepath.Join(home, ".workbuddy-ai", "argv.json"), []byte("{}"), 0o644)
+	os.WriteFile(filepath.Join(home, ".workbuddy-ai", "device-id"), []byte("d"), 0o644)
+
+	a := workbuddyAI(home)
+	if a.ID != "workbuddy-ai" || a.Path != intl {
+		t.Fatalf("agent: %s at %s", a.ID, a.Path)
+	}
+	if !a.Detected() {
+		t.Fatal("not detected")
+	}
+	if err := a.Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	var ms []map[string]any
+	b, _ := os.ReadFile(intl)
+	if err := json.Unmarshal(b, &ms); err != nil {
+		t.Fatalf("not a bare list: %v\n%s", err, b)
+	}
+	if len(ms) != 1 || ms[0]["id"] != "deepseek/pro" || ms[0]["apiKey"] != "magpie-workbuddy-ai" {
+		t.Fatalf("models: %v", ms)
+	}
+	if got := a.Field("provider").Get(); got != "magpie" {
+		t.Fatalf("get: %q", got)
+	}
+	if b, _ := os.ReadFile(cn); string(b) != `[{"id":"qwen-local","local":true}]` {
+		t.Fatalf("China build's file changed: %s", b)
+	}
+	if workbuddy(home).Field("provider").Get() != "" {
+		t.Fatal("WorkBuddy (China) reads as wired")
+	}
+	// WORKBUDDY_CONFIG_DIR is the China build's; the international one
+	// keeps its own folder
+	t.Setenv("WORKBUDDY_CONFIG_DIR", filepath.Join(home, "elsewhere"))
+	if workbuddyAI(home).Path != intl {
+		t.Fatal("WorkBuddy AI followed WORKBUDDY_CONFIG_DIR")
 	}
 }

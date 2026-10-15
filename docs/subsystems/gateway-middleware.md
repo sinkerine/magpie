@@ -9,8 +9,8 @@ A plugin can be gateway middleware: JavaScript that magpie runs inside its gatew
 | Discovery | Find a plugin's middleware file: `magpie.middleware` in its package.json, or a path to a `*.middleware.js` / `.mjs` file | `plugin.Middleware` in [`internal/plugin/middleware.go`](../../internal/plugin/middleware.go) |
 | Bun host | Skip a plugin that is middleware only (no `main`, no `exports`) | `Middleware(...)` check in [`host.go`](../../internal/plugin/host.go) |
 | Load and run | Compile, pool runtimes, call hooks with limits, count calls and failures | [`internal/middleware`](../../internal/middleware): `middleware.go`, `run.go` |
-| Gateway | Run the chain on agents' requests only | `serveAgent` in [`internal/gateway/middleware.go`](../../internal/gateway/middleware.go), called from `gateway.go` and `codex_backend.go` |
-| GUI and CLI | Show each middleware's hooks, calls, µs per call, failures and load error | `middleware.States()`; `pluginEntryJSON.Middleware` in [`internal/gui/plugins.go`](../../internal/gui/plugins.go), `mwLine` in `plugins.js`, `listPlugins` in [`plugins_cli.go`](../../plugins_cli.go) |
+| Gateway | Run the chain on agents' requests only, as one `gwmw.Agent` on the gateway's middleware point; the built-in plugin `middleware` registers it (`middleware.Chain`), and with that plugin off no middleware runs | `serveAgent` in [`internal/gateway/middleware.go`](../../internal/gateway/middleware.go), called from `gateway.go` and `codex_backend.go`; [`internal/gwmw`](../../internal/gwmw/gwmw.go), [`plugins/middleware`](../../plugins/middleware/middleware.go); [Plugin runtime](plugin-runtime.md) |
+| GUI and CLI | Show each middleware's hooks, calls, µs per call, failures and load error | `middleware.States()`; `pluginEntryJSON.Middleware` in [`internal/gui/plugins.go`](../../internal/gui/plugins.go), `mwLine` in `plugins.js`, `listPlugins` in [`plugins_cli.go`](../../internal/cli/plugins_cli.go) |
 | Options | A middleware's `options` in plugins.json, as `ctx.options`; set by name, spec or short name; a package's `magpie.options` is only the editor's example | `SetOptions`, `ShortName` in [`store.go`](../../internal/plugin/store.go); `pluginOptions` in `plugins_cli.go`; `optionsEditor` in `plugins.js` |
 | Kind | Whether a plugin is a provider, middleware or both, shown on every card and row, also for one that is off | `isMiddleware`, `middlewareOnly` in `pluginEntryJSON`; `kind: "middleware"` market entries (`market.json`, the community `registry.json`); `kindChip` in `plugins.js` |
 | Community middleware | Ready-made packages (`@magpie-community/middleware-<name>`), mostly New API's channel settings | `packages/{param-override,model-map,system-prompt,word-guard,think-tags}` in [magpie-community/plugins](https://github.com/magpie-community/plugins), tested with `scripts/middleware.mjs` |
@@ -20,14 +20,14 @@ plugins.json is the source of truth for which middleware is installed and on, in
 
 ## Runtime path
 
-1. `serveAgent` establishes the [gateway session identity and optional recording](gateway-sessions.md), then calls `middleware.Begin` with the request's protocol, model, stream flag, path and agent. With no middleware it calls `serve` directly.
+1. `serveAgent` establishes the [gateway session identity and optional recording](gateway-sessions.md), then calls `Begin` on each registered `gwmw.Agent` (the JS chain's is `middleware.Begin`) with the request's protocol, model, stream flag, path and agent. With no middleware it calls `serve` directly.
 2. `Run.Request` passes the agent's body, in its own API, to each `onRequest` in turn. An object returned is the body the next middleware and the gateway get; `undefined` keeps the bytes as they were. `ctx.reject(status, message)` stops the chain, and the agent gets that error in its API's shape (`writeError`).
 3. `Run.Wrap` wraps the response writer when some middleware has `onEvent` or `onResponse`. An SSE reply is split into events. Each event whose data is a JSON object goes to every `onEvent` that wants its name (`export const events`): an object replaces it, `null` drops it, and `undefined` writes the original bytes. `data: [DONE]` and other non-object data pass by. A whole JSON reply is buffered for `onResponse`, with `ctx.status` set. A reply with a `Content-Encoding` passes as-is.
 4. `Run.End` returns the runtimes to their pools.
 
-Each middleware gets one runtime for the whole request, so its hooks share `ctx.state`. Runtimes come from a per-middleware `sync.Pool` and modules are compiled once per load.
+Each middleware gets one runtime for the whole request, so its hooks share `ctx.state`. Runtimes come from a per-middleware `sync.Pool` and modules are compiled once per load. Compiling a plugin's module (imports kept inside the plugin) is [`internal/jsmod`](../../internal/jsmod/jsmod.go), which agent plugins ([Agent wiring](agent-wiring.md)) share.
 
-Only requests agents send go through `serveAgent`. magpie's own requests (thread titles, the router's classifier, the search and vision stand-ins) call `serve` directly. Middleware sees bodies before redaction, which still applies upstream.
+Only requests agents send go through `serveAgent`. magpie's own requests (thread titles, the router's classifier, the search and vision stand-ins) call `serve` directly. Middleware sees bodies before redaction, which still applies upstream, through the `redact` plugin's masker; masking asked for with no masker serving sends nothing ([Plugin runtime](plugin-runtime.md)).
 
 ## Constraints and failure behavior
 

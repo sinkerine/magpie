@@ -119,10 +119,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           await page.waitForTimeout(600);
         }
         // under way, the card waits for the prompt in its place, then tells
-        // of it, its cache not read yet; done, with what the vendor read
+        // of it, its cache the last request's till read (no "—" flash,
+        // dumplings on Discord: routing-ctx-still); done, what the vendor read
         assert.deepEqual(said, [
-          "97% Codex › 019a-session › #103", "— Codex › 019a-session › #104", "97% Codex › 019a-session › #104",
-          "97% Codex › 019a-session › #104", "— Codex › 019a-session › #105", "97% Codex › 019a-session › #105",
+          "97% Codex › 019a-session › #103", "97% Codex › 019a-session › #104", "97% Codex › 019a-session › #104",
+          "97% Codex › 019a-session › #104", "97% Codex › 019a-session › #105", "97% Codex › 019a-session › #105",
         ]);
         const got = await page.evaluate(() => {
           window.__ro.disconnect();

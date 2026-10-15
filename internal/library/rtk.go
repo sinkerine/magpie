@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -20,6 +19,7 @@ import (
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/proc"
 	"gopkg.in/yaml.v3"
 )
@@ -57,6 +57,9 @@ type rtkSpec struct {
 	// withClaude: the installer gives it to Claude Code too, which is
 	// pointed at a folder thrown away after
 	withClaude bool
+	// env is what the installer is run with besides magpie's own
+	// environment, so it writes where the agent reads
+	env func(a *agent.Agent) []string
 	// blocked says why rtk's installer mustn't be run for the agent as it
 	// is on this machine, "" when it can be
 	blocked func() string
@@ -169,18 +172,44 @@ var rtkSpecs = map[string]rtkSpec{
 		},
 		dir: func(*agent.Agent) string { return filepath.Join(home(), ".copilot") },
 	},
+	// Antigravity CLI (agy): rtk 0.51 on writes a plugin of its own into
+	// Antigravity's global customization folder, ~/.gemini/config, shared
+	// by the CLI and the IDE (src/hooks/init/antigravity.rs): plugin.json,
+	// hooks.json (PreToolUse → rtk hook antigravity) and rules/AGENTS.md,
+	// all in plugins/rtk. agy discovers a plugin there by its plugin.json.
+	// The Antigravity branch reads no patch mode, so --auto-patch isn't
+	// given; rtk's own uninstaller for it ran Claude Code's
+	// (rtk-ai/rtk#3404), so the folder is taken out by magpie.
+	"agy": {
+		flags: []string{"--agent", "antigravity"}, blocked: agyBlocked,
+		has: func(*agent.Agent) bool {
+			return contains(filepath.Join(agyPlugin(), "hooks.json"), "rtk hook antigravity")
+		},
+		files: func(*agent.Agent) []string {
+			d := agyPlugin()
+			return []string{filepath.Join(d, "plugin.json"), filepath.Join(d, "hooks.json"), filepath.Join(d, "rules", "AGENTS.md")}
+		},
+		remove: func(*agent.Agent) error { return os.RemoveAll(agyPlugin()) },
+		dir:    func(*agent.Agent) string { return filepath.Dir(filepath.Dir(agyPlugin())) },
+	},
 	"pi":  extensionSpec("pi"),
 	"omp": extensionSpec("omp"),
+	// Hermes's folder is the agent's (appdir.HermesHome): $HERMES_HOME,
+	// else %LOCALAPPDATA%\hermes on Windows and ~/.hermes elsewhere. rtk
+	// (0.51, src/hooks/init/hermes.rs) knows only $HERMES_HOME and
+	// ~/.hermes, so it is told the folder: on Windows it otherwise writes
+	// its plugin where Hermes doesn't look (新v学员 on Discord).
 	"hermes": {
 		flags: []string{"--agent", "hermes"}, patch: true,
-		has: func(*agent.Agent) bool { return exists(filepath.Join(hermesPlugin(), "plugin.yaml")) },
-		files: func(*agent.Agent) []string {
-			return []string{filepath.Join(home(), ".hermes", "config.yaml"), filepath.Join(hermesPlugin(), "plugin.yaml"), filepath.Join(hermesPlugin(), "__init__.py")}
+		has: func(a *agent.Agent) bool { return exists(filepath.Join(hermesPlugin(a), "plugin.yaml")) },
+		files: func(a *agent.Agent) []string {
+			return []string{filepath.Join(a.Dir, "config.yaml"), filepath.Join(hermesPlugin(a), "plugin.yaml"), filepath.Join(hermesPlugin(a), "__init__.py")}
 		},
-		remove: func(*agent.Agent) error {
-			return errors.Join(os.RemoveAll(hermesPlugin()), dropHermesPlugin(filepath.Join(home(), ".hermes", "config.yaml")))
+		remove: func(a *agent.Agent) error {
+			return errors.Join(os.RemoveAll(hermesPlugin(a)), dropHermesPlugin(filepath.Join(a.Dir, "config.yaml")))
 		},
-		dir: func(*agent.Agent) string { return filepath.Join(home(), ".hermes") },
+		dir: func(a *agent.Agent) string { return a.Dir },
+		env: func(a *agent.Agent) []string { return []string{"HERMES_HOME=" + a.Dir} },
 	},
 }
 
@@ -197,6 +226,12 @@ var rtkSpecs = map[string]rtkSpec{
 // instructions to AGENTS.md, which rewrite nothing).
 var rtkNoHook = map[string]string{
 	"dsh": "RTK has no hook for DeepSeek Harness yet: RTK works by rewriting the shell command an agent is about to run, and dsh's hooks can only allow or deny a command, not change it; rtk init has no --agent dsh either (github.com/rtk-ai/rtk/issues/3847)",
+	// rtk init's agents are claude, cursor, codex, copilot, gemini,
+	// opencode and the rest of rtkSpecs. There is no grok or grok-app,
+	// so a hook written here would have nowhere to go, for Grok Build no
+	// more than for the App that runs it.
+	"grok":     "RTK has no hook for Grok Build yet: rtk init has no Grok agent, so it cannot rewrite the shell commands Grok Build runs",
+	"grok-app": "RTK has no hook for Grok App yet: rtk init has no Grok or Grok App agent, so it cannot rewrite the shell commands Grok App runs",
 }
 
 func opencodePlugin(a *agent.Agent) string {
@@ -229,6 +264,20 @@ func codexBlocked() string {
 		return ""
 	}
 	return fmt.Sprintf("Codex's hook needs RTK 0.50 or newer, and this RTK is %s: older ones only add @RTK.md to AGENTS.md, which rewrites no command. Update RTK (brew upgrade rtk, or its installer again), then switch it on", v)
+}
+
+// agyPlugin is the folder rtk's installer writes its Antigravity plugin to.
+func agyPlugin() string { return filepath.Join(home(), ".gemini", "config", "plugins", "rtk") }
+
+// agyBlocked: rtk installs for Antigravity globally from 0.51.0 on; 0.50
+// knows it only per project and fails rtk init -g --agent antigravity
+// ("Antigravity is project-scoped"), so an older rtk isn't run for it.
+func agyBlocked() string {
+	v := rtkVersion()
+	if v == "" || !older(v, 0, 51) {
+		return ""
+	}
+	return fmt.Sprintf("Antigravity CLI's hook needs RTK 0.51 or newer, and this RTK is %s, which installs it only per project, not for every project. Update RTK (brew upgrade rtk, or its installer again), then switch it on", v)
 }
 
 // older says whether version v is before major.minor.
@@ -270,7 +319,7 @@ var openCodeVersion = func() string {
 	if runtime.GOOS == "windows" {
 		name = "opencode.exe"
 	}
-	bin, err := exec.LookPath("opencode")
+	bin, err := proc.Look("opencode")
 	if err != nil {
 		bin = filepath.Join(home(), ".opencode", "bin", name)
 		if !exists(bin) {
@@ -291,7 +340,7 @@ var openCodeVersion = func() string {
 	return ""
 }
 
-func hermesPlugin() string { return filepath.Join(home(), ".hermes", "plugins", "rtk-rewrite") }
+func hermesPlugin(a *agent.Agent) string { return filepath.Join(a.Dir, "plugins", "rtk-rewrite") }
 
 // extensionSpec is pi's and omp's: an extension of rtk's own, and nothing else.
 func extensionSpec(id string) rtkSpec {
@@ -507,6 +556,10 @@ type RTKView struct {
 	// doesn't know how this rtk was installed
 	Latest  string `json:"latest,omitempty"`
 	Upgrade string `json:"upgrade,omitempty"`
+	// Admin is the folder rtk is in when only an administrator can change
+	// it (winget's for every user, under Program Files): Upgrade asks
+	// Windows for one first
+	Admin string `json:"admin,omitempty"`
 	// Waiting is the package manager this rtk was installed with (winget,
 	// Homebrew) when Latest is out but it has nothing newer than this rtk
 	// yet, WaitingHas what it has: an upgrade through it would change
@@ -542,7 +595,7 @@ var rtkMu sync.Mutex
 // winget could make the link. Found there, it may not be on the PATH the
 // agents get: see rtkReached.
 func rtkPath() string {
-	if p, err := exec.LookPath("rtk"); err == nil {
+	if p, err := proc.Look("rtk"); err == nil {
 		return p
 	}
 	name, dirs := "rtk", []string{filepath.Join(home(), ".local", "bin"), filepath.Join(home(), ".cargo", "bin")}
@@ -592,11 +645,26 @@ func lastLines(s string, n int) string {
 	return strings.Join(ls, " ")
 }
 
-// rtkAgents are the agents on this machine rtk can be given to.
-func rtkAgents() []*agent.Agent {
+// detected is the agents on this machine, as agent.Detected says; a var for
+// tests. Detecting them probes a file or a command for every agent magpie
+// knows of, which is a few hundred milliseconds, so it is asked once per read
+// and not once per pass over the list (see ReadRTK).
+var detected = agent.Detected
+
+// rtkAgents are the agents on this machine rtk can be given to. They are as
+// detected says, so a caller with a list already in hand passes it rather
+// than have them detected again.
+func rtkAgents(agents []*agent.Agent) []*agent.Agent {
+	if agents == nil {
+		agents = detected()
+	}
 	var out []*agent.Agent
-	for _, a := range agent.Detected() {
-		if _, ok := rtkSpecs[a.ID]; ok {
+	for _, a := range agents {
+		sp, ok := rtkSpecs[a.ID]
+		// an uninstall that left the folder behind (#2254) isn't given rtk,
+		// as the library gives it nothing (Targets); one with rtk's hook
+		// still shows, so the hook can be taken out
+		if ok && (!a.CLIMissing() || sp.has(a)) {
 			out = append(out, a)
 		}
 	}
@@ -612,7 +680,9 @@ func ReadRTK() *RTKView {
 			v.Install = shown(c)
 		}
 	}
-	for _, a := range rtkAgents() {
+	// the agents are detected once and the two passes below share them
+	agents := detected()
+	for _, a := range rtkAgents(agents) {
 		sp := rtkSpecs[a.ID]
 		ra := RTKAgent{ID: a.ID, Name: a.Name, Icon: a.Icon, On: sp.has(a)}
 		if sp.blocked != nil {
@@ -620,8 +690,8 @@ func ReadRTK() *RTKView {
 		}
 		v.Agents = append(v.Agents, ra)
 	}
-	for _, a := range agent.Detected() {
-		if why, ok := rtkNoHook[a.ID]; ok {
+	for _, a := range agents {
+		if why, ok := rtkNoHook[a.ID]; ok && !a.CLIMissing() {
 			v.Agents = append(v.Agents, RTKAgent{ID: a.ID, Name: a.Name, Icon: a.Icon, Blocked: why, NoHook: true})
 		}
 	}
@@ -636,7 +706,7 @@ func ReadRTK() *RTKView {
 		v.Version = strings.TrimSpace(strings.TrimPrefix(out, "rtk"))
 	}
 	if c := upgraderOf(v.Path); c != nil {
-		v.Upgrade = shown(c)
+		v.Upgrade, v.Admin = shown(c), rtkAdminFolder(c, v.Path)
 	}
 	v.Gain, v.Days, v.GainErr = rtkGain(v.Path)
 	if runtime.GOOS == "windows" {
@@ -716,11 +786,17 @@ func parseGain(out string) (*RTKGain, []RTKDay, string) {
 // of them keeps its history in that account's AppData, not the user's;
 // "unelevated" runs them with a token that can't write the user's. Either
 // way rtk gain here doesn't count them. "" when Codex doesn't sandbox them.
+// It is parsed again only when config.toml changes: one with a table for
+// each of thousands of projects is ~0.2s of CPU to parse (#1665).
 func codexSandbox() string {
-	raw, err := os.ReadFile(filepath.Join(codexDir(), "config.toml"))
-	if err != nil {
-		return ""
-	}
+	s, _ := filememo.Read("rtk codex sandbox", filepath.Join(codexDir(), "config.toml"), func(raw []byte) (string, error) {
+		return codexSandboxIn(raw), nil
+	})
+	return s
+}
+
+// codexSandboxIn is codexSandbox of config.toml's bytes.
+func codexSandboxIn(raw []byte) string {
 	var c struct {
 		SandboxMode string `toml:"sandbox_mode"`
 		Windows     struct {
@@ -759,7 +835,8 @@ func SetRTK(id string, on bool) (*RTKView, error) {
 	rtkMu.Lock()
 	defer rtkMu.Unlock()
 	var a *agent.Agent
-	for _, x := range rtkAgents() {
+	agents := detected()
+	for _, x := range rtkAgents(agents) {
 		if x.ID == id {
 			a = x
 		}
@@ -828,6 +905,9 @@ func rtkInstall(bin string, a *agent.Agent) error {
 		defer os.RemoveAll(tmp)
 		env = []string{"CLAUDE_CONFIG_DIR=" + tmp}
 	}
+	if sp.env != nil {
+		env = append(env, sp.env(a)...)
+	}
 	out, err := rtkRunEnv(bin, env, args...)
 	if err != nil {
 		return err
@@ -845,15 +925,15 @@ const rtkScript = "https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/maste
 // one, winget on Windows, else rtk's own script; nil when there's no way.
 func rtkInstaller() []string {
 	if runtime.GOOS == "windows" {
-		if _, err := exec.LookPath("winget"); err == nil {
+		if _, err := proc.Look("winget"); err == nil {
 			return []string{"winget", "install", "--id", "rtk-ai.rtk", "--exact", "--silent", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"}
 		}
 		return nil
 	}
-	if _, err := exec.LookPath("brew"); err == nil {
+	if _, err := proc.Look("brew"); err == nil {
 		return []string{"brew", "install", "rtk"}
 	}
-	if _, err := exec.LookPath("curl"); err == nil {
+	if _, err := proc.Look("curl"); err == nil {
 		return []string{"sh", "-c", "curl -fsSL " + rtkScript + " | sh"}
 	}
 	return nil
@@ -870,7 +950,7 @@ func InstallRTK() (*RTKView, error) {
 	if c == nil {
 		return nil, fmt.Errorf("no way to install rtk here — get it from %s", RTKURL)
 	}
-	out, err := runInstaller(c, 5*time.Minute, "HOMEBREW_NO_AUTO_UPDATE=1")
+	out, err := runRTKInstaller(c, 5*time.Minute, "", "HOMEBREW_NO_AUTO_UPDATE=1")
 	if err != nil {
 		return nil, err
 	}

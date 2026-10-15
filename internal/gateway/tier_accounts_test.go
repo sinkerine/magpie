@@ -1,27 +1,34 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/usage"
 )
 
 // tierAccounts signs Codex in to a Plus ChatGPT account, first, with a Pro
 // one saved beside it, against a fake ChatGPT backend whose model lists
 // offer gpt-6-luna's Ultrafast only to the Pro account. It returns the
-// account and service tier each request was tried with, in order.
-func tierAccounts(t *testing.T, proOut *bool) func() []string {
+// account and service tier each request was tried with, in order. With
+// echo set, a reply says the tier it ran at, as OpenAI's API does
+// (service_tier on the response: the one asked, or "default").
+func tierAccounts(t *testing.T, proOut, echo *bool) func() []string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -74,10 +81,14 @@ func tierAccounts(t *testing.T, proOut *bool) func() []string {
 			io.WriteString(w, `{"error":{"message":"You've hit your usage limit"}}`)
 			return
 		}
+		said := ""
+		if echo != nil && *echo {
+			said = `,"service_tier":"` + cmp.Or(q.Tier, "default") + `"`
+		}
 		io.WriteString(w, sse(
 			`data: {"type":"response.created","response":{"id":"r1","model":"gpt-6-luna"}}`,
 			`data: {"type":"response.output_text.delta","delta":"pong"}`,
-			`data: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":7,"output_tokens":1}}}`))
+			`data: {"type":"response.completed","response":{"id":"r1"`+said+`,"usage":{"input_tokens":7,"output_tokens":1}}}`))
 	}))
 	t.Cleanup(up.Close)
 	old := provider.CodexBase
@@ -106,7 +117,7 @@ func tierAccounts(t *testing.T, proOut *bool) func() []string {
 // the nearest its plan offers.
 func TestUltrafastGoesToAnAccountOfferingIt(t *testing.T) {
 	proOut := false
-	tried := tierAccounts(t, &proOut)
+	tried := tierAccounts(t, &proOut, nil)
 	s := New()
 	codex := func(tier string) string {
 		t.Helper()
@@ -136,5 +147,122 @@ func TestUltrafastGoesToAnAccountOfferingIt(t *testing.T) {
 	proOut = false
 	if code, body := post(t, "/v1/responses", `{"model":"codex/gpt-6-luna","input":"ping","service_tier":"ultrafast"}`); code != 200 || !strings.HasPrefix(strings.Join(tried(), ","), "acct-pro:") {
 		t.Errorf("/v1/responses: status %d: %s", code, body)
+	}
+}
+
+// #1784, zhenghaowen0967: OMP, with gpt-6.1-sol switched fast in its
+// picker (fastPicks.omp), asked for Ultrafast and went as priority, the
+// fast mode's rewrite writing over the client's own, faster ask. It goes
+// as Ultrafast to the account that offers it, and as priority to one that
+// doesn't; a request that asked for no tier is sent fast as before.
+func TestFastPickKeepsTheClientsUltrafast(t *testing.T) {
+	proOut := false
+	tried := tierAccounts(t, &proOut, nil)
+	if err := provider.SetFastPick("omp", "codex/gpt-6-luna", true); err != nil {
+		t.Fatal(err)
+	}
+	// at chatgpt.com, where Ultrafast is sent (buildResponses), reaching
+	// the fake backend
+	to, _ := url.Parse(provider.CodexBase)
+	provider.CodexBase = "https://chatgpt.com/backend-api/codex"
+	s := New()
+	s.client = &http.Client{Transport: qoderRoundTrip(func(r *http.Request) (*http.Response, error) {
+		r.URL.Scheme, r.URL.Host = to.Scheme, to.Host
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+	omp := func(tier string) string {
+		t.Helper()
+		r := postFrom(t, s, "omp", "/v1/responses", `{"model":"codex/gpt-6-luna","input":"ping"`+tier+`}`)
+		if len(r.Tries) == 0 || !r.Tries[0].Fast {
+			t.Errorf("%s: not traced as sent fast: %+v", tier, r.Tries)
+		}
+		return strings.Join(tried(), ",")
+	}
+	if got := omp(`,"service_tier":"ultrafast"`); got != "acct-pro:ultrafast" {
+		t.Errorf("ultrafast tried %s", got)
+	}
+	proOut = true
+	if got := omp(`,"service_tier":"ultrafast"`); got != "acct-pro:ultrafast,acct-plus:priority" {
+		t.Errorf("pro out: ultrafast tried %s", got)
+	}
+	proOut = false
+	if got := omp(""); got != "acct-plus:priority" {
+		t.Errorf("no tier asked: tried %s", got)
+	}
+	if b := withFast(provider.Chat, []byte(`{"model":"m","service_tier":"ultrafast"}`)); askedTier(b) != "ultrafast" {
+		t.Errorf("chat: %s", b)
+	}
+}
+
+// #1784: the service tier the client asked for, the one each try went out
+// at and the one the reply said it ran at are in the route, the usage log
+// and its CSV, and the served one only when the reply said one.
+func TestTierRecordedPerTry(t *testing.T) {
+	proOut, echo := true, false
+	tried := tierAccounts(t, &proOut, &echo)
+	to, _ := url.Parse(provider.CodexBase)
+	provider.CodexBase = "https://chatgpt.com/backend-api/codex"
+	s := New()
+	s.client = &http.Client{Transport: qoderRoundTrip(func(r *http.Request) (*http.Response, error) {
+		r.URL.Scheme, r.URL.Host = to.Scheme, to.Host
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+	r := postFrom(t, s, "omp", "/v1/responses", `{"model":"codex/gpt-6-luna","input":"ping","service_tier":"ultrafast"}`)
+	if got := strings.Join(tried(), ","); got != "acct-pro:ultrafast,acct-plus:priority" {
+		t.Fatalf("tried %s", got)
+	}
+	sr := sessionRouteOf(r)
+	if sr.AskedTier != "ultrafast" || len(sr.Tries) != 2 || sr.Tries[0].Tier != "ultrafast" || sr.Tries[1].Tier != "priority" ||
+		sr.Tier != "priority" || sr.TierServed != "" || sr.Tries[1].TierServed != "" {
+		t.Errorf("route: %+v", sr)
+	}
+	recs := usage.Load(time.Time{})
+	if n := len(recs); n == 0 || recs[n-1].TierAsked != "ultrafast" || recs[n-1].TierSent != "priority" || recs[n-1].TierServed != "" {
+		t.Fatalf("usage: %+v", recs)
+	}
+
+	// the reply says the tier it ran at
+	proOut, echo = false, true
+	r = postFrom(t, s, "omp", "/v1/responses", `{"model":"codex/gpt-6-luna","input":"ping","service_tier":"ultrafast"}`)
+	tried()
+	if sr := sessionRouteOf(r); sr.Tier != "ultrafast" || sr.TierServed != "ultrafast" {
+		t.Errorf("route: %+v", sr)
+	}
+	// none asked: none in the log, and the reply's "default" as it said
+	postFrom(t, s, "omp", "/v1/responses", `{"model":"codex/gpt-6-luna","input":"ping"}`)
+	tried()
+	recs = usage.Load(time.Time{})
+	if n := len(recs); n < 3 || recs[n-2].TierAsked != "ultrafast" || recs[n-2].TierSent != "ultrafast" || recs[n-2].TierServed != "ultrafast" ||
+		recs[n-1].TierAsked != "" || recs[n-1].TierSent != "" || recs[n-1].TierServed != "default" {
+		t.Fatalf("usage: %+v", recs)
+	}
+
+	// the CSV's last columns
+	var b strings.Builder
+	if err := usage.WriteCSV(&b, []usage.Row{{Record: recs[0]}}); err != nil {
+		t.Fatal(err)
+	}
+	cells, err := csv.NewReader(strings.NewReader(b.String())).ReadAll()
+	if err != nil || len(cells) != 2 {
+		t.Fatalf("%v %q", err, b.String())
+	}
+	for col, want := range map[string]string{"tier_asked": "ultrafast", "tier_sent": "priority", "tier_served": ""} {
+		if i := slices.Index(usage.CSVHeader, col); i < 0 || cells[1][i] != want {
+			t.Errorf("%s: %v", col, cells)
+		}
+	}
+
+	// Codex's own sign-in, relayed as it sent it, asking the ChatGPT
+	// backend for priority
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"gpt-6-luna","stream":true,"input":"ping","service_tier":"priority"}`))
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	req.Header.Set("chatgpt-account-id", "acct-plus")
+	req.Header.Set("User-Agent", "codex_cli_rs/0.160.1")
+	s.Handler().ServeHTTP(rec, req)
+	tried()
+	recs = usage.Load(time.Time{})
+	if n := len(recs); rec.Code != 200 || recs[n-1].TierAsked != "priority" || recs[n-1].TierSent != "priority" || recs[n-1].TierServed != "priority" {
+		t.Fatalf("codex: %d %+v", rec.Code, recs[len(recs)-1])
 	}
 }

@@ -33,9 +33,11 @@ func (p *paced) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	f := w.(http.Flusher)
 	for i, ev := range p.events {
-		if i > 0 && strings.HasPrefix(ev, "~") { // a gap before it
-			time.Sleep(p.gap)
-			ev = ev[1:]
+		if strings.HasPrefix(ev, "~") { // a gap before it, but the first's
+			if i > 0 {
+				time.Sleep(p.gap)
+			}
+			ev = ev[1:] // (left on the first, it was no event: #1939)
 		}
 		io.WriteString(w, ev+"\n\n")
 		f.Flush()

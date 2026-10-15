@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // A restart to update ends the gateway this process serves, and with it
@@ -149,4 +150,36 @@ func (u *updater) waitFor(gen int) {
 		}
 		return
 	}
+}
+
+// autoTick, with Settings' AutoRestart on (and automatic updates), has a
+// downloaded update restarted into once the gateway is idle (#2096). The
+// wait is waitIdle's, so a restart never cuts a request short; one that
+// ran out (gaveUp) is waited for again on the next tick, and one the user
+// called off isn't, for that version.
+func (u *updater) autoTick(s settings.Settings) {
+	if s.NoAutoUpdate || !s.AutoRestart {
+		return
+	}
+	u.mu.Lock()
+	restart, waiting, skip := u.autoRestart, u.waiting, u.autoSkip
+	u.mu.Unlock()
+	if restart == nil || waiting {
+		return
+	}
+	if j := u.json(); j.State != "ready" || j.Latest == "" || j.Latest == skip {
+		return
+	}
+	u.waitIdle(restart)
+}
+
+// callOff is the user's Cancel of a restart waiting: the wait stops, and
+// AutoRestart leaves the version it was for alone.
+func (u *updater) callOff() {
+	u.mu.Lock()
+	if u.waiting && u.latest != nil {
+		u.autoSkip = u.latest.Version
+	}
+	u.mu.Unlock()
+	u.cancelWait()
 }

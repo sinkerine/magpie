@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/usage"
 )
@@ -44,7 +46,15 @@ func appliedLoad() map[string]applied {
 	return out
 }
 
+// appliedSave writes m as applied.json. It holds what magpie set on every
+// agent, and appliedLoad reads a file that doesn't parse as empty: such a
+// file is copied aside first, and one that can't be copied isn't written
+// over (#2263).
 func appliedSave(m map[string]applied) {
+	if err := lastgood.KeepUnparsed(appliedPath(), lastgood.Into[map[string]applied]); err != nil {
+		log.Printf("applied.json wasn't written over: %v", err)
+		return
+	}
 	b, _ := json.MarshalIndent(m, "", "  ")
 	os.MkdirAll(filepath.Dir(appliedPath()), 0o755)
 	os.WriteFile(appliedPath(), b, 0o600)
@@ -102,6 +112,11 @@ func (a *Agent) Apply(key, v string) error {
 		}
 	}
 	record(a.ID, f.Key, f.Get())
+	// magpie picked in by the user's own hand (magpie model, a pick in
+	// the CLI) connects it again
+	if a.Wired() {
+		forget(a.ID + disconnectedKey)
+	}
 	return nil
 }
 
@@ -115,7 +130,10 @@ type Drift struct {
 	//              nothing of it reached the gateway — it runs on an old
 	//              config, or something outside the file overrides it;
 	//   "unreachable" the config is right, but the address off loopback
-	//              it names the gateway at doesn't answer (#1013).
+	//              it names the gateway at doesn't answer (#1013);
+	//   "proxied"  the config is right, but the agent sends its requests
+	//              for the gateway through a proxy (Addr) that doesn't
+	//              pass them on to it (codex_proxy.go).
 	Kind   string `json:"kind"`
 	Field  string `json:"field"`         // the field it shows on
 	Now    string `json:"now,omitempty"` // what that field says now
@@ -187,11 +205,17 @@ func (a *Agent) Drift() *Drift {
 		if d := a.unreachable(on, vals[on.Key]); d != nil {
 			return d
 		}
+		if d := a.proxied(on, vals[on.Key]); d != nil {
+			return d
+		}
 	}
 	if a.Reached != nil && onMagpie {
 		if at, to, refused := a.Reached(rec.At); !at.IsZero() {
 			switch {
-			case !sameHost(to, gateway.URL()):
+			// a request the gateway saw since, or one to where the config
+			// keeps magpie (Codex's kept address, a reverse proxy, #1985),
+			// came through
+			case !sameHost(to, gateway.URL()) && !sameHost(to, a.pointedAt()) && lastSeen(a.ID).Before(at.Add(-2*time.Second)):
 				return &Drift{Kind: "bypassed", Field: on.Key, Now: vals[on.Key], Want: vals[on.Key],
 					Detail: a.Name + "'s last request (" + at.Format("15:04") + ") went to " + hostOf(to) + ", not magpie — it was started before magpie set it up and still runs on its old config: quit and reopen it"}
 			case refused:
@@ -351,7 +375,11 @@ func (a *Agent) Reapply() error {
 	}
 	vals := a.Values()
 	for _, f := range a.Fields {
-		if v := vals[f.Key]; v != "" && (d != nil && f.Key == d.Field || magpieValue(a, f, v, vals)) {
+		// magpie as the agent's provider too (Claude Desktop's provider
+		// field, beside its tiers on magpie's models), as Wired takes it:
+		// left out, Reconnect set the tiers again and never the gateway
+		// Check found off (dumplings on Discord)
+		if v := vals[f.Key]; v != "" && (d != nil && f.Key == d.Field || v == magpieID || magpieValue(a, f, v, vals)) {
 			if err := a.Apply(f.Key, v); err != nil {
 				return err
 			}
@@ -434,6 +462,18 @@ func (e *NoModelsError) Error() string {
 	return "Add a provider or subscription in magpie first, then connect " + e.Agent
 }
 
+// AllHiddenError is Connect's answer when magpie has models but none of
+// them is left in the agent's lists: the only ones picked for it are gone
+// with their provider, or every one is turned off for it (#1989). Saying
+// it can't be connected sent the user looking at the agent, when its model
+// list is what emptied it. The GUI says it in the reader's language by its
+// code (all_hidden).
+type AllHiddenError struct{ Agent string }
+
+func (e *AllHiddenError) Error() string {
+	return "None of magpie's models is left in " + e.Agent + "'s model list: pick one under Model list → Pick on the Agents page, then connect " + e.Agent
+}
+
 func (a *Agent) Connect() error {
 	_, err := a.ConnectHow()
 	return err
@@ -475,7 +515,36 @@ func (a *Agent) ConnectHow() (Connection, error) {
 	return a.connect()
 }
 
+// disconnectedKey, after an agent's id, marks in the stash an agent the
+// user disconnected: Disconnect sets it, connecting again takes it out.
+const disconnectedKey = ".disconnected"
+
+// Disconnected reports whether the user disconnected the agent and hasn't
+// connected it since.
+func (a *Agent) Disconnected() bool { return stashLoad()[a.ID+disconnectedKey] == "1" }
+
+// noModelLeft says why there is no model of magpie's to connect the agent
+// to: none added yet (NoModelsError), or every one taken out of its lists
+// (AllHiddenError); nil while one is left.
+func (a *Agent) noModelLeft() error {
+	shown, hidden := provider.CatalogFor(a.ListsFor())
+	// nothing to connect it to yet: no provider or subscription added,
+	// which said only that it can't be connected (Tystem on Discord)
+	if len(shown)+len(hidden) == 0 {
+		return &NoModelsError{Agent: a.Name}
+	}
+	// magpie has models, and every one of them is taken out of the
+	// agent's lists (a picked model gone with its provider, one hidden by
+	// hand): saying the agent can't be connected sends the user looking
+	// at the agent, when its model list is what emptied it (#1989)
+	if len(shown) == 0 {
+		return &AllHiddenError{Agent: a.Name}
+	}
+	return nil
+}
+
 func (a *Agent) connect() (Connection, error) {
+	forget(a.ID + disconnectedKey)
 	// what it is on now, for Disconnect to put back what it can't
 	// otherwise (Goose's own model)
 	now := a.Values()
@@ -516,10 +585,8 @@ func (a *Agent) connect() (Connection, error) {
 		}
 	}
 	if f == nil {
-		// nothing to connect it to yet: no provider or subscription added,
-		// which said only that it can't be connected (Tystem on Discord)
-		if shown, hidden := provider.CatalogFor(a.ListsFor()); len(shown)+len(hidden) == 0 {
-			return Connection{}, &NoModelsError{Agent: a.Name}
+		if err := a.noModelLeft(); err != nil {
+			return Connection{}, err
 		}
 		return Connection{}, fmt.Errorf("%s can't be connected to magpie", a.Name)
 	}
@@ -545,7 +612,21 @@ func (a *Agent) connect() (Connection, error) {
 	sameRank, alikeRank := -1, -1
 	for _, o := range opts {
 		if o.Value == magpieID {
-			return Connection{How: "magpie", Field: f.Key, Value: magpieID}, a.Apply(f.Key, magpieID)
+			if err := a.Apply(f.Key, magpieID); err != nil {
+				return Connection{}, err
+			}
+			// an app whose picker gets magpie's models as listed for it
+			// (WorkBuddy, ZCode): with none listed, setting magpie wrote
+			// none, and the agent reads as not connected right after a
+			// connect that said it was (Lumens on Discord). One connected
+			// by its address alone (Cursor Private Inference) is connected
+			// all the same.
+			if !a.Wired() {
+				if err := a.noModelLeft(); err != nil {
+					return Connection{}, err
+				}
+			}
+			return Connection{How: "magpie", Field: f.Key, Value: magpieID}, nil
 		}
 		if o.Ref != "" && o.Group == RoutingGroups && group == "" {
 			group = o.Value
@@ -643,6 +724,10 @@ func (a *Agent) Disconnect() error {
 	if !a.Wired() {
 		return nil
 	}
+	// the user's say, kept till they connect it again: nothing magpie does
+	// by itself (a start's Sync, Codex's account failover) puts magpie back
+	// in, this Disconnect's own writes included (paynezhuang on Discord)
+	stash(map[string]string{a.ID + disconnectedKey: "1"})
 	before, rec := a.Values(), appliedOf(a.ID)
 	if a.Unwire != nil {
 		if err := a.Unwire(); err != nil {
@@ -671,6 +756,11 @@ func (a *Agent) Disconnect() error {
 			if err := f.Set(w); err != nil {
 				return fmt.Errorf("%s: %w", f.Label, err)
 			}
+		}
+	}
+	if a.Restore != nil {
+		if err := a.Restore(); err != nil {
+			return err
 		}
 	}
 	// what it was on through magpie, for switching it on again
@@ -806,12 +896,14 @@ func sameHost(a, b string) bool { return hostOf(a) == hostOf(b) }
 
 // wiringOff checks what magpie wrote into an agent's config to reach the
 // gateway — pairs of key and value, read with get — and says which no longer
-// holds, "" when all do. A URL is quoted; a key's value never is.
+// holds, "" when all do. A URL is quoted; a key's value never is. A URL
+// that reaches magpie another way (reachesMagpie: a reverse proxy, #1985)
+// holds.
 func wiringOff(name, file string, get func(string) (string, bool), kvs ...string) string {
 	for i := 0; i+1 < len(kvs); i += 2 {
 		k, want := kvs[i], kvs[i+1]
 		v, _ := get(k)
-		if v == want {
+		if v == want || v != "" && reachesMagpie(v, want) {
 			continue
 		}
 		where := name + "'s " + k + " (" + filepath.Base(file) + ")"

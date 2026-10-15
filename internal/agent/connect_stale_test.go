@@ -1,12 +1,21 @@
 package agent
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/provider"
 )
+
+// staleOnWindows is why the tests of copies told from the process list
+// don't run on Windows: StaleCopies lists no processes there, only the
+// daemon as last checked (TestCodexStaleOnWindowsIsTheDaemonsLastCheck).
+const staleOnWindows = "Windows lists no processes for StaleCopies; see TestCodexStaleOnWindowsIsTheDaemonsLastCheck"
 
 // Codex writes config.toml itself (a project's trust, a notice seen), so a
 // copy reopened after magpie's change and then writing there was still
@@ -14,6 +23,9 @@ import (
 // CODEX_HOME was counted too (#729). Only magpie's own change counts, for
 // copies of this home's Codex.
 func TestCodexStaleOnlyForMagpiesChange(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip(staleOnWindows)
+	}
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -24,7 +36,7 @@ func TestCodexStaleOnlyForMagpiesChange(t *testing.T) {
 	os.MkdirAll(dir, 0o755)
 	cfg := filepath.Join(dir, "config.toml")
 	list := filepath.Join(dir, "magpie-models.json")
-	conf := "model = \"magpie/gpt-6-luna\"\nmodel_provider = \"magpie\"\nmodel_catalog_json = \"" + list + "\"\n\n" +
+	conf := "model = \"magpie/gpt-6-luna\"\nmodel_provider = \"magpie\"\nmodel_catalog_json = \"" + tomlString(list) + "\"\n\n" +
 		"[model_providers.magpie]\nname = \"magpie\"\nbase_url = \"http://127.0.0.1:3425/v1\"\n"
 	os.WriteFile(cfg, []byte(conf), 0o600)
 	os.WriteFile(list, []byte(`{"models":[{"slug":"magpie/gpt-6-luna"}]}`), 0o644)
@@ -73,6 +85,9 @@ func TestCodexStaleOnlyForMagpiesChange(t *testing.T) {
 // left is told apart, so the row can say which one and how it is reopened,
 // and one app's processes are one copy, not one per process.
 func TestCodexStaleCopiesSayWhichIsLeft(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip(staleOnWindows)
+	}
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -126,5 +141,115 @@ func TestCodexStaleCopiesSayWhichIsLeft(t *testing.T) {
 	}
 	if n := a.Stale(); n != 6 {
 		t.Fatalf("Stale: %d, want 6 (one app, not one per process)", n)
+	}
+}
+
+// lychjck's #1461: the managed daemon keeps a long-lived helper next to it
+// (codex app-server daemon pid-update-loop) that a daemon restart doesn't
+// end and that reads no list. It matches the codex startsWith pattern and
+// no --managed-daemon, so it was counted as a "cli" copy from before
+// magpie's change: "A Codex in a terminal" that doesn't exist, forever,
+// and only killing the process cleared the row. A daemon helper is no
+// copy to reopen.
+func TestCodexDaemonHelperIsNoStaleCopy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip(staleOnWindows)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	t.Setenv("CODEX_HOME", "")
+	dir := filepath.Join(home, ".codex")
+	os.MkdirAll(dir, 0o755)
+	cfg := filepath.Join(dir, "config.toml")
+	os.WriteFile(cfg, []byte("model = \"gpt-6.1-sol\"\nopenai_base_url = \"http://127.0.0.1:3425/backend-api/codex\"\n"), 0o600)
+	then := time.Now().Add(-2 * time.Hour)
+	os.Chtimes(cfg, then, then)
+
+	was := running
+	t.Cleanup(func() { running = was })
+	running = func(string) []runningProc {
+		return []runningProc{
+			// the helper, from before magpie's change
+			{3 * time.Hour, "/opt/homebrew/bin/codex app-server daemon pid-update-loop"},
+		}
+	}
+	if got := codex(home).StaleCopies(); len(got) != 0 {
+		t.Fatalf("the daemon's helper counted a stale copy: %+v, want none", got)
+	}
+	// a terminal Codex from before is still one
+	running = func(string) []runningProc {
+		return []runningProc{
+			{3 * time.Hour, "/opt/homebrew/bin/codex"},
+		}
+	}
+	if n := codex(home).Stale(); n != 1 {
+		t.Fatalf("a terminal codex: %d stale, want 1", n)
+	}
+}
+
+// On Windows, where listing processes is a PowerShell run, the Codex row's
+// stale copy is the daemon as KeepCodexDaemonCurrent last found it (#1388):
+// behind magpie's change, until it is restarted, while the check is
+// recent. Elsewhere the same last check is kept for the row, beside the
+// process list.
+func TestCodexStaleOnWindowsIsTheDaemonsLastCheck(t *testing.T) {
+	home, _ := codexHome(t, "", "")
+	dir := filepath.Join(home, ".codex")
+	cfg, list := filepath.Join(dir, "config.toml"), filepath.Join(dir, "magpie-models.json")
+	os.WriteFile(cfg, []byte("model_provider = \"magpie\"\nmodel_catalog_json = \""+tomlString(list)+"\"\n"), 0o600)
+	os.WriteFile(list, []byte(`{"models":[{"slug":"magpie/a"}]}`), 0o644)
+	wasKeep, wasRunning := keepCodexDaemon, running
+	t.Cleanup(func() {
+		keepCodexDaemon, running = wasKeep, wasRunning
+		codexDaemonSeen.Lock()
+		codexDaemonSeen.at, codexDaemonSeen.check = time.Time{}, provider.CodexDaemonCheck{}
+		codexDaemonSeen.Unlock()
+	})
+	running = func(string) []runningProc { return nil }
+	since := time.Now().Add(-3 * time.Hour)
+	answer := provider.CodexDaemonCheck{}
+	keepCodexDaemon = func(context.Context, string, time.Time) provider.CodexDaemonCheck { return answer }
+	// the copies the row shows: on Windows StaleCopies itself
+	copies := func() []StaleCopy {
+		if runtime.GOOS == "windows" {
+			return codex(home).StaleCopies()
+		}
+		return codexDaemonBehind()
+	}
+
+	if got := copies(); len(got) != 0 {
+		t.Fatalf("never checked: %+v, want none", got)
+	}
+	codexDaemonCheck(cfg)
+	if got := copies(); len(got) != 0 {
+		t.Fatalf("a daemon on magpie's list: %+v, want none", got)
+	}
+	answer = provider.CodexDaemonCheck{Behind: true, Attached: 1, Since: since}
+	codexDaemonCheck(cfg)
+	if got := copies(); len(got) != 1 || got[0].Kind != "daemon" || !got[0].Since.Equal(since) {
+		t.Fatalf("a daemon behind: %+v, want the daemon since %v", got, since)
+	}
+	// restarted by the user from the row
+	CodexDaemonRestarted()
+	if got := copies(); len(got) != 0 {
+		t.Fatalf("restarted: %+v, want none", got)
+	}
+	// restarted by magpie, no session on it
+	answer = provider.CodexDaemonCheck{Behind: true, Restarted: true, Since: since}
+	codexDaemonCheck(cfg)
+	if got := copies(); len(got) != 0 {
+		t.Fatalf("restarted by magpie: %+v, want none", got)
+	}
+	// a check from longer ago than the loop looks says nothing now
+	answer = provider.CodexDaemonCheck{Behind: true, Attached: 1, Since: since}
+	codexDaemonCheck(cfg)
+	codexDaemonSeen.Lock()
+	codexDaemonSeen.at = time.Now().Add(-4 * codexDaemonEvery)
+	codexDaemonSeen.Unlock()
+	if got := copies(); len(got) != 0 {
+		t.Fatalf("an old check: %+v, want none", got)
 	}
 }

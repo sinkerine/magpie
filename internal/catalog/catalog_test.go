@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -54,6 +55,99 @@ func TestProviderReadsTemperatureCapability(t *testing.T) {
 	}
 	if got := byID["gpt-5.5"].Efforts; len(got) != 2 || got[0] != "low" {
 		t.Fatalf("efforts: %v", got)
+	}
+}
+
+func TestToggleAddsOffLevelForVerifiedProviders(t *testing.T) {
+	// This trimmed fixture retains every provider row for the tested model IDs
+	// from models.dev/api.json fetched 2026-10-09 (SHA-256 of the full response:
+	// 31cd8dd78d79706d444bb7f781f0edda422e8ce098fc4da66d154b4848850654), so
+	// EffortsOf sees the real votes.
+	body, err := os.ReadFile(filepath.Join("testdata", "models.dev-2026-10-09.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCatalog(t, string(body))
+
+	tests := []struct {
+		provider string
+		model    string
+		want     string
+	}{
+		{"deepseek", "deepseek-flash", "none,low,high,max"},
+		{"deepseek", "deepseek-v4-pro", "none,low,high,max"},
+		{"deepseek", "deepseek-v4-flash", "none,low,high,max"},
+		{"deepseek", "deepseek-v4-flash-vision-exp", "none,low,high,max"},
+		{"kimi-code-plan-global", "k3", "none,low,high,max"},
+		{"kimi-code-plan-global", "kimi-for-coding", "none,low,high,max"},
+		{"kimi-code-plan-cn", "k3", "none,low,high,max"},
+		{"kimi-code-plan-cn", "kimi-for-coding", "none,low,high,max"},
+	}
+	for _, tc := range tests {
+		var found bool
+		for _, model := range Provider(tc.provider) {
+			if model.ID != tc.model {
+				continue
+			}
+			found = true
+			if got := strings.Join(model.Efforts, ","); got != tc.want {
+				t.Errorf("Provider(%q) model %q efforts = %q, want %q", tc.provider, tc.model, got, tc.want)
+			}
+			break
+		}
+		if !found {
+			t.Fatalf("Provider(%q) does not list %q", tc.provider, tc.model)
+		}
+		if got, ok := ListedBy([]string{tc.provider}, tc.model); !ok || strings.Join(got, ",") != tc.want {
+			t.Errorf("ListedBy([%q], %q) = %v, %v; want %q, true", tc.provider, tc.model, got, ok, tc.want)
+		}
+	}
+
+	// The real catalog also lists deepseek-flash through 302ai. Its unchanged
+	// levels keep the aggregate on low/high/max even though DeepSeek itself has
+	// the verified off level.
+	if got := strings.Join(EffortsOf("deepseek-flash"), ","); got != "low,high,max" {
+		t.Errorf("EffortsOf(%q) = %q, want low,high,max", "deepseek-flash", got)
+	}
+	for _, id := range []string{"k3", "kimi-for-coding"} {
+		if got := strings.Join(EffortsOf(id), ","); got != "low,high,max" {
+			t.Errorf("EffortsOf(%q) = %q, want low,high,max", id, got)
+		}
+	}
+	if got, ok := ListedByBorrowed([]string{"deepseek"}, "deepseek-v4-pro"); !ok || strings.Join(got, ",") != "low,high,max" {
+		t.Errorf("ListedByBorrowed(%q) = %v, %v; want low,high,max, true", "deepseek-v4-pro", got, ok)
+	}
+	if got, ok := KinEfforts([]string{"deepseek"}, "deepseek-v5-flash-vision-exp"); !ok || strings.Join(got, ",") != "low,high,max" {
+		t.Errorf("KinEfforts(%q) = %v, %v; want low,high,max, true", "deepseek-v5-flash-vision-exp", got, ok)
+	}
+
+	for _, tc := range []struct {
+		provider string
+		model    string
+		want     string
+	}{
+		{"302ai", "deepseek-flash", "low,high,max"},
+		{"kimi-code-plan-global", "k3-256k", "low,high,max"},
+		{"kimi-code-plan-cn", "k3-256k", "low,high,max"},
+		{"kimi-code-plan-global", "kimi-for-coding-highspeed", ""},
+		{"kimi-code-plan-cn", "kimi-for-coding-highspeed", ""},
+		{"anthropic", "claude-sonnet-5", "low,medium,high,xhigh,max"},
+		{"amazon-bedrock", "us.anthropic.claude-sonnet-5", "low,medium,high,xhigh,max"},
+	} {
+		var found bool
+		for _, model := range Provider(tc.provider) {
+			if model.ID != tc.model {
+				continue
+			}
+			found = true
+			if got := strings.Join(model.Efforts, ","); got != tc.want {
+				t.Errorf("Provider(%q) model %q efforts = %q, want %q", tc.provider, tc.model, got, tc.want)
+			}
+			break
+		}
+		if !found {
+			t.Fatalf("Provider(%q) does not list %q", tc.provider, tc.model)
+		}
 	}
 }
 
@@ -233,6 +327,65 @@ func TestListedBy(t *testing.T) {
 	}
 }
 
+// A model listed as thinking with no levels yet takes those of the newest
+// of its family released by then (gpt-6.1-sol's from gpt-6-sol, not from
+// the later gpt-7-sol), and a model the catalog doesn't list those of the
+// newest of the same name but for its version. A family that takes a
+// thinking switch alone gives none (#214), a budgeted model is left alone,
+// and one that doesn't think takes none.
+func TestFamilyLevels(t *testing.T) {
+	writeCatalog(t, `{
+	  "openai": {"models": {
+	    "gpt-6.1-sol": {"id":"gpt-6.1-sol","family":"gpt-sol","reasoning":true,"release_date":"2026-09-29"},
+	    "gpt-6-sol": {"id":"gpt-6-sol","family":"gpt-sol","reasoning":true,"release_date":"2026-09-22","reasoning_options":[{"type":"effort","values":["none","low","medium","high","xhigh","max"]}]},
+	    "gpt-5.6-sol": {"id":"gpt-5.6-sol","family":"gpt-sol","reasoning":true,"release_date":"2026-07-09","reasoning_options":[{"type":"effort","values":["none","low","medium","high"]}]},
+	    "gpt-7-sol": {"id":"gpt-7-sol","family":"gpt-sol","reasoning":true,"release_date":"2027-01-01","reasoning_options":[{"type":"effort","values":["low","max"]}]},
+	    "gpt-4.1": {"id":"gpt-4.1","family":"gpt","release_date":"2025-04-14"}}},
+	  "xiaomi": {"models": {
+	    "mimo-v2.6-flash": {"id":"mimo-v2.6-flash","family":"mimo","reasoning":true,"release_date":"2026-09-22","reasoning_options":[{"type":"toggle"}]},
+	    "mimo-v2.5": {"id":"mimo-v2.5","family":"mimo","reasoning":true,"release_date":"2026-04-22"}}},
+	  "anthropic": {"models": {
+	    "claude-sonnet-4-5": {"id":"claude-sonnet-4-5","family":"claude-sonnet","reasoning":true,"reasoning_options":[{"type":"budget_tokens"}]},
+	    "claude-sonnet-4": {"id":"claude-sonnet-4","family":"claude-sonnet","reasoning":true,"reasoning_options":[{"type":"effort","values":["low","high"]}]}}}
+	}`)
+	makers := []string{"anthropic", "openai", "xiaomi"}
+	for _, c := range []struct {
+		id, want string
+		ok       bool
+	}{
+		{"gpt-6.1-sol", "none,low,medium,high,xhigh,max", true},
+		{"openai/GPT-6.1-Sol", "none,low,medium,high,xhigh,max", true},
+		{"gpt-4.1", "", true},
+		{"mimo-v2.6-flash", "", true},
+		{"claude-sonnet-4-5", "", false},
+	} {
+		got, ok := ListedBy(makers, c.id)
+		if strings.Join(got, ",") != c.want || ok != c.ok {
+			t.Errorf("ListedBy(%q) = %v, %v; want %q, %v", c.id, got, ok, c.want, c.ok)
+		}
+	}
+	for _, m := range Provider("openai") {
+		if m.ID == "gpt-6.1-sol" && (strings.Join(m.Efforts, ",") != "none,low,medium,high,xhigh,max" || !m.Reasoning) {
+			t.Errorf("Provider(openai)'s gpt-6.1-sol: %v, reasoning %v", m.Efforts, m.Reasoning)
+		}
+	}
+	for _, c := range []struct {
+		id, want string
+		ok       bool
+	}{
+		{"gpt-7.1-sol", "low,max", true},
+		{"relay/gpt-7.1-sol", "low,max", true},
+		{"mimo-v2.7-flash", "", true},
+		{"gpt-7.1-terra", "", false},
+		{"sol", "", false},
+	} {
+		got, ok := KinEfforts(makers, c.id)
+		if strings.Join(got, ",") != c.want || ok != c.ok {
+			t.Errorf("KinEfforts(%q) = %v, %v; want %q, %v", c.id, got, ok, c.want, c.ok)
+		}
+	}
+}
+
 func TestFetchedImageCapabilityOverridesCatalog(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -257,5 +410,32 @@ func TestFetchedImageCapabilityOverridesCatalog(t *testing.T) {
 		got[1].ImageInput == nil || *got[1].ImageInput || got[1].Images ||
 		got[2].ImageInput == nil || !*got[2].ImageInput || !got[2].Images {
 		t.Fatalf("source precedence: %+v", got)
+	}
+}
+
+// A list's modalities keep every kind it names, input and output, not
+// image alone; a model the list says nothing of takes the catalog's (#1595).
+func TestFetchedModalitiesKeepEveryKind(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"data":[
+			{"id":"omni","modalities":{"input":["text","image","audio","video","pdf"],"output":["text","audio"]}},
+			{"id":"unknown"}
+		]}`))
+	}))
+	defer server.Close()
+	live, err := Fetch(context.Background(), server.URL, "", false, nil)
+	if err != nil || len(live) != 2 {
+		t.Fatalf("fetched models: %+v, %v", live, err)
+	}
+	known := []Model{{ID: "unknown", ImageInput: imageInput([]string{"text", "pdf"}), InputModalities: []string{"text", "pdf"}, OutputModalities: []string{"text"}}}
+	got := Decorate(live, known)
+	if !reflect.DeepEqual(got[0].InputModalities, []string{"text", "image", "audio", "video", "pdf"}) ||
+		!reflect.DeepEqual(got[0].OutputModalities, []string{"text", "audio"}) {
+		t.Errorf("omni: in %v out %v", got[0].InputModalities, got[0].OutputModalities)
+	}
+	if !reflect.DeepEqual(got[1].InputModalities, []string{"text", "pdf"}) ||
+		!reflect.DeepEqual(got[1].OutputModalities, []string{"text"}) {
+		t.Errorf("unknown: in %v out %v", got[1].InputModalities, got[1].OutputModalities)
 	}
 }

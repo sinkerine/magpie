@@ -11,8 +11,15 @@ package gateway
 // session; within a turn only — while the agent sends tool results back,
 // until the user speaks again; never; or, by default, worked out from the
 // conversation itself: within a turn always, and across turns while what
-// the vendor said it read from its cache the last time is worth keeping
-// and not yet gone cold.
+// the vendor said it read from its cache the last time, or wrote to it, is
+// worth keeping and not yet gone cold. Written counts as read: a first
+// turn reads nothing and writes the whole prompt, which the next turn
+// reads if it stays (vilicvane on Discord: the second turn moved, and the
+// cache just built was thrown away). A vendor that keeps a prompt cached
+// without reporting it — OpenAI's automatic prefix cache, Gemini — says
+// neither of a turn that read nothing, and what its cache holds then is
+// the prompt that turn was sent: that counts as written too, so its next
+// turn stays rather than building the cache afresh elsewhere.
 //
 // Who answered is kept on disk as well (affinity.json, next to the
 // providers), so a restart — an update's included — doesn't hand a
@@ -37,8 +44,9 @@ import (
 )
 
 const (
-	// cacheWorth is how many tokens read from the vendor's cache make a
-	// conversation worth keeping where it is across turns.
+	// cacheWorth is how many tokens read from the vendor's cache, or
+	// written to it — or, from a vendor that reports neither, sent — make
+	// a conversation worth keeping where it is across turns.
 	cacheWorth = 1024
 	// cacheCold is how long a vendor keeps a prompt cached without it being
 	// read: five minutes at Anthropic and at OpenAI, the shortest there is.
@@ -52,29 +60,32 @@ const (
 // Affinity is what the trace tells of a request's conversation and whether
 // it stayed with who answered it last.
 type Affinity struct {
-	Mode      string    `json:"mode"`             // the provider's or group's: "", session, turn, off
-	Turn      int       `json:"turn"`             // the user's turns in the conversation so far
-	Within    bool      `json:"within,omitempty"` // the agent sending tool results back: mid-turn
-	Last      string    `json:"last,omitempty"`   // who answered the conversation last
-	LastTurn  int       `json:"lastTurn,omitempty"`
-	At        time.Time `json:"at,omitempty"`        // when
-	CacheRead int       `json:"cacheRead,omitempty"` // tokens that answer read from the vendor's cache
-	Kept      bool      `json:"kept,omitempty"`      // Last was put first for it
+	Mode       string    `json:"mode"`             // the provider's or group's: "", session, turn, off
+	Turn       int       `json:"turn"`             // the user's turns in the conversation so far
+	Within     bool      `json:"within,omitempty"` // the agent sending tool results back: mid-turn
+	Last       string    `json:"last,omitempty"`   // who answered the conversation last
+	LastTurn   int       `json:"lastTurn,omitempty"`
+	At         time.Time `json:"at,omitempty"`         // when
+	CacheRead  int       `json:"cacheRead,omitempty"`  // tokens that answer read from the vendor's cache
+	CacheWrite int       `json:"cacheWrite,omitempty"` // and wrote to it, or was sent where none is
+	Kept       bool      `json:"kept,omitempty"`       // Last was put first for it
 	// Why it was kept — "session", "turn", "cache" — or not: "off", "first"
 	// (nobody has answered it yet), "new-turn", "no-cache" (the vendor
-	// read too little from its cache to keep), "cold" (too long ago),
-	// "resting", "spent", "gone" (no longer one to route to).
+	// read and wrote too little of its cache to keep, or was sent too
+	// little for a cache it keeps without saying so), "cold" (too long
+	// ago), "resting", "spent", "gone" (no longer one to route to).
 	Why string `json:"why"`
 }
 
 type stick struct {
-	rest      string
-	who       string // the key or account, however many were on
-	model     string // the model it answered as: a group may have several on one account
-	effort    string // the effort the group's member it answered as is fixed at
-	turn      int
-	at        time.Time
-	cacheRead int
+	rest       string
+	who        string // the key or account, however many were on
+	model      string // the model it answered as: a group may have several on one account
+	effort     string // the effort the group's member it answered as is fixed at
+	turn       int
+	at         time.Time
+	cacheRead  int
+	cacheWrite int
 }
 
 var sticks = struct {
@@ -104,6 +115,9 @@ type savedStick struct {
 	Turn      int       `json:"turn,omitempty"`
 	At        time.Time `json:"at"`
 	CacheRead int       `json:"cacheRead,omitempty"`
+	// CacheWrite is absent from a file written before it was kept, and
+	// reads as 0: such a stick is judged by what was read, as it was then
+	CacheWrite int `json:"cacheWrite,omitempty"`
 }
 
 func sticksPath() string { return filepath.Join(filepath.Dir(provider.Path()), "affinity.json") }
@@ -126,7 +140,7 @@ func stickOf(key string) (stick, bool) {
 		return stick{}, false
 	}
 	var saved map[string]savedStick
-	if json.Unmarshal(b, &saved) != nil {
+	if decodeJSON(b, &saved) != nil {
 		return stick{}, false
 	}
 	for k, v := range saved {
@@ -136,7 +150,7 @@ func stickOf(key string) (stick, bool) {
 		if st, ok := sticks.m[k]; ok && !st.at.Before(v.At) {
 			continue
 		}
-		sticks.m[k] = stick{rest: v.Rest, who: v.Who, model: v.Model, effort: v.Effort, turn: v.Turn, at: v.At, cacheRead: v.CacheRead}
+		sticks.m[k] = stick{rest: v.Rest, who: v.Who, model: v.Model, effort: v.Effort, turn: v.Turn, at: v.At, cacheRead: v.CacheRead, cacheWrite: v.CacheWrite}
 	}
 	st, ok := sticks.m[key]
 	return st, ok
@@ -156,7 +170,7 @@ func saveSticks() {
 	sticks.Lock()
 	for k, st := range sticks.m {
 		if now.Sub(st.at) <= stickKeep {
-			ks = append(ks, kept{k, savedStick{st.rest, st.who, st.model, st.effort, st.turn, st.at, st.cacheRead}})
+			ks = append(ks, kept{k, savedStick{st.rest, st.who, st.model, st.effort, st.turn, st.at, st.cacheRead, st.cacheWrite}})
 		}
 	}
 	sticks.Unlock()
@@ -207,26 +221,129 @@ func turnOf(from provider.Protocol, body []byte) (turn int, within bool) {
 // turnIn is turnOf for a request already parsed. The last of the user's
 // messages tells whether the turn goes on: an agent may put its own notes
 // after it (Claude Code a system message after the tool results).
+//
+// A turn begins with what the user said (userSaid) or an image or file of
+// theirs. A user message the agent wrote alone — a task notification, a
+// todo nudge, an agent list, Codex's context — begins none: after an
+// answer it carries the turn on, and right after the user's own message
+// it leaves that as it was.
 func turnIn(req *Request) (turn int, within bool) {
+	answered := false
 	for _, m := range req.Messages {
+		if m.Role == "assistant" {
+			answered = true
+		}
 		if m.Role != "user" {
 			continue
 		}
-		text, result := false, false
+		said, result := userSaid(m) != "", false
 		for _, p := range m.Parts {
 			switch p.Kind {
-			case Text, Image, File:
-				text = true
+			case Image, File:
+				said = true
 			case ToolResult:
 				result = true
 			}
 		}
-		if text && !result {
+		switch {
+		case result:
+			within = true
+		case said:
 			turn++
+			within = false
+		case answered:
+			within = turn > 0
 		}
-		within = result
+		answered = false
 	}
 	return turn, within
+}
+
+// strictKeep is, for a conversation that stays strictly where it is
+// (provider.AffinityStrict, #1797), the account that answered it brought
+// back when the plan left it out at a usage cap: the cap set on it keeps
+// new conversations off it, and one already on it goes on there, up to
+// the vendor's own limit. One left out only as it won't spend its credits
+// isn't brought back, the user's own setting, and the conversation doesn't
+// move either: held is it, for the request to be refused as held. Neither
+// for another mode, nor for a conversation nobody has answered yet.
+func strictKeep(scope, mode string, in http.Header, body []byte, cs []candidate, pl planned) ([]candidate, planned, []Weighed) {
+	if mode != provider.AffinityStrict {
+		return cs, pl, nil
+	}
+	sticks.Lock()
+	st, had := stickOf(scope + "|" + conversationID(in, body))
+	sticks.Unlock()
+	if !had || time.Since(st.at) > stickKeep || slices.ContainsFunc(cs, func(c candidate) bool { return c.who() == st.who }) {
+		return cs, pl, nil
+	}
+	// the left's line for c, as it was left out
+	leftAt := func(c candidate) int {
+		return slices.IndexFunc(pl.left, func(w Weighed) bool {
+			return w.ID == c.rest && w.Model == c.model && w.Fixed == c.effort && w.Capped > 0
+		})
+	}
+	var back []candidate
+	var order []Weighed
+	for _, c := range pl.capped {
+		if c.who() != st.who {
+			continue
+		}
+		i := leftAt(c)
+		if i < 0 {
+			continue
+		}
+		w := pl.left[i]
+		w.Unlisted, w.Capped, w.CapBack = false, 0, nil
+		pl.left = slices.Delete(slices.Clone(pl.left), i, i+1)
+		back, order = append(back, c), append(order, w)
+	}
+	if len(back) > 0 {
+		pl.capped = slices.DeleteFunc(slices.Clone(pl.capped), func(c candidate) bool { return c.who() == st.who })
+		return append(back, cs...), planned{order: append(order, pl.order...), left: pl.left, held: pl.held, capped: pl.capped}, nil
+	}
+	var held []Weighed
+	for _, c := range pl.held {
+		if c.who() != st.who {
+			continue
+		}
+		if i := slices.IndexFunc(pl.left, func(w Weighed) bool { return w.ID == c.rest && w.NoCredits }); i >= 0 {
+			held = append(held, pl.left[i])
+		}
+	}
+	if len(held) > 0 {
+		// only its own reset, should it spend one by itself, brings it back
+		pl.held = slices.DeleteFunc(slices.Clone(pl.held), func(c candidate) bool { return c.who() != st.who })
+		return nil, planned{order: nil, left: pl.left, held: pl.held, capped: pl.capped}, held[:1]
+	}
+	return cs, pl, nil
+}
+
+// strictOnly leaves of cs, for a conversation kept strictly, the key or
+// account cs[at] alone: first as it answered, then its other models a
+// group has on it, which a rule may still pick between. Nobody else is
+// asked, nor a reset spent elsewhere: its error is the agent's.
+func strictOnly(cs []candidate, pl planned, at int) ([]candidate, planned) {
+	who := cs[at].who()
+	keep := []int{at}
+	for i, c := range cs {
+		if i != at && c.who() == who {
+			keep = append(keep, i)
+		}
+	}
+	out := make([]candidate, 0, len(keep))
+	order := make([]Weighed, 0, len(keep))
+	for _, i := range keep {
+		out = append(out, cs[i])
+		if i < len(pl.order) {
+			w := pl.order[i]
+			w.Turn = false
+			order = append(order, w)
+		}
+	}
+	pl.order = order
+	pl.held = slices.DeleteFunc(slices.Clone(pl.held), func(c candidate) bool { return c.who() != who })
+	return out, pl
 }
 
 // affine puts first whoever answered the conversation last, while its
@@ -242,7 +359,7 @@ func affine(scope, mode string, rotate bool, in http.Header, from provider.Proto
 		had = false
 	}
 	if had {
-		a.Last, a.LastTurn, a.At, a.CacheRead = st.rest, st.turn, st.at, st.cacheRead
+		a.Last, a.LastTurn, a.At, a.CacheRead, a.CacheWrite = st.rest, st.turn, st.at, st.cacheRead, st.cacheWrite
 	}
 	// the account and the model that answered: a group with Opus and
 	// Sonnet both on one Claude account, a rule sending the turn to Opus,
@@ -267,6 +384,10 @@ func affine(scope, mode string, rotate bool, in http.Header, from provider.Proto
 		a.Why = "first"
 	case at < 0:
 		a.Why = "gone"
+	case mode == provider.AffinityStrict:
+		// whatever it is — resting, all but used up, past its cap
+		// (strictKeep) — it is the one asked (#1797)
+		a.Why = "strict"
 	case pl.order[at].Rest != nil:
 		a.Why = "resting"
 	case at > 0 && pl.order[at].Known && pl.order[at].Used >= provider.SpentShareOf(cs[at].p.Routing):
@@ -280,7 +401,9 @@ func affine(scope, mode string, rotate bool, in http.Header, from provider.Proto
 		a.Why = "turn"
 	case mode == provider.AffinityTurn, rotate:
 		a.Why = "new-turn"
-	case st.cacheRead < cacheWorth:
+	case st.cacheRead+st.cacheWrite < cacheWorth:
+		// what it wrote counts with what it read: the cache a first turn
+		// built is there for the next to read
 		a.Why = "no-cache"
 	case time.Since(st.at) > cacheCold:
 		a.Why = "cold"
@@ -299,6 +422,12 @@ func affine(scope, mode string, rotate bool, in http.Header, from provider.Proto
 		for j := range pl.order {
 			pl.order[j].Turn = false // kept, whoever's turn it was
 		}
+	case "strict":
+		a.Kept = true
+		if at > 0 {
+			weightedKept(cs[0], cs[at])
+		}
+		cs, pl = strictOnly(cs, pl, at)
 	case "new-turn":
 		if rotate {
 			cs, pl = after(cs, pl, at)
@@ -330,10 +459,12 @@ func leastHeld(scope, key string, cs []candidate, pl planned) ([]candidate, plan
 		return cs, pl
 	}
 	if strings.HasPrefix(scope, provider.GroupPrefix) {
-		if _, ms, ok := provider.FindGroup(scope); ok {
+		if g, ms, ok := provider.FindGroup(scope); ok {
 			for _, m := range ms {
-				if len(m.Path) > 1 {
-					return cs, pl // a group in the group: its own routing orders its models (#576)
+				// a group in the group, or a provider routed its own way:
+				// its own routing orders its models or keys (#576)
+				if len(m.Path) > 1 || ownRouting(m.Provider, g) {
+					return cs, pl
 				}
 			}
 		}
@@ -398,11 +529,21 @@ func after(cs []candidate, pl planned, at int) ([]candidate, planned) {
 }
 
 // answered remembers who answered a conversation, and what it read from
-// the vendor's cache doing so.
-func answered(key string, c candidate, turn, cacheRead int) {
+// the vendor's cache and wrote to it doing so — u. A vendor that keeps a
+// prompt cached without reporting it — OpenAI's automatic prefix cache,
+// Gemini — says neither of a turn that read none: what its cache holds
+// then is the prompt that turn was sent, and that stands for the write, so
+// the next turn stays to read it rather than moving as no-cache and
+// building it afresh elsewhere. A reply that reports no usage at all
+// (Input 0) counts as no cache, as it did.
+func answered(key string, c candidate, turn int, u Usage) {
+	cacheRead, cacheWrite := u.CacheRead, u.CacheWrite
+	if cacheRead == 0 && cacheWrite == 0 {
+		cacheWrite = u.Input
+	}
 	now := time.Now()
 	sticks.Lock()
-	sticks.m[key] = stick{rest: c.rest, who: c.who(), model: c.model, effort: c.effort, turn: turn, at: now, cacheRead: cacheRead}
+	sticks.m[key] = stick{rest: c.rest, who: c.who(), model: c.model, effort: c.effort, turn: turn, at: now, cacheRead: cacheRead, cacheWrite: cacheWrite}
 	delete(sticks.opening, key)
 	if len(sticks.m) > 4096 {
 		for k, st := range sticks.m {
@@ -487,7 +628,7 @@ func seals(body []byte, kinds ...string) [][sha256.Size]byte {
 	var q struct {
 		Input []sealedItem `json:"input"`
 	}
-	if json.Unmarshal(body, &q) != nil {
+	if decodeJSON(body, &q) != nil {
 		return nil
 	}
 	var out [][sha256.Size]byte
@@ -544,17 +685,17 @@ func withoutRefused(key, who string, body []byte) ([]byte, bool) {
 		return nil, false
 	}
 	var q map[string]json.RawMessage
-	if json.Unmarshal(body, &q) != nil {
+	if decodeJSON(body, &q) != nil {
 		return nil, false
 	}
 	var items []json.RawMessage
-	if json.Unmarshal(q["input"], &items) != nil {
+	if decodeJSON(q["input"], &items) != nil {
 		return nil, false
 	}
 	kept := items[:0:0]
 	for _, it := range items {
 		var t sealedItem
-		if json.Unmarshal(it, &t) == nil && sealedKinds[t.Type] && t.Enc != "" && r.seals[sha256.Sum256([]byte(t.Enc))] {
+		if decodeJSON(it, &t) == nil && sealedKinds[t.Type] && t.Enc != "" && r.seals[sha256.Sum256([]byte(t.Enc))] {
 			continue
 		}
 		kept = append(kept, it)
@@ -583,7 +724,7 @@ func withoutCompaction(body []byte) ([]byte, bool) {
 	var q struct {
 		Input []sealedItem `json:"input"`
 	}
-	if json.Unmarshal(body, &q) != nil {
+	if decodeJSON(body, &q) != nil {
 		return nil, false
 	}
 	for _, it := range q.Input {
@@ -598,11 +739,11 @@ func withoutCompaction(body []byte) ([]byte, bool) {
 // types.
 func withoutKinds(body []byte, kinds ...string) ([]byte, bool) {
 	var q map[string]json.RawMessage
-	if json.Unmarshal(body, &q) != nil {
+	if decodeJSON(body, &q) != nil {
 		return nil, false
 	}
 	var items []json.RawMessage
-	if json.Unmarshal(q["input"], &items) != nil {
+	if decodeJSON(q["input"], &items) != nil {
 		return nil, false
 	}
 	kept := items[:0:0]
@@ -610,7 +751,7 @@ func withoutKinds(body []byte, kinds ...string) ([]byte, bool) {
 		var t struct {
 			Type string `json:"type"`
 		}
-		if json.Unmarshal(it, &t) == nil && slices.Contains(kinds, t.Type) {
+		if decodeJSON(it, &t) == nil && slices.Contains(kinds, t.Type) {
 			continue
 		}
 		kept = append(kept, it)

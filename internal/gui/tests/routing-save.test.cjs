@@ -8,6 +8,10 @@
 // provider's Routing page row had alone, is beside Routing in the editor
 // too. Accounts and keys alike; nothing is sent, redrawn or scrolled before
 // the Save. In English and Chinese, Chromium and WebKit.
+//
+// The routings besides Smart are the built-in plugin rotation's
+// (plugins/rotation): switched off, the editor offers Smart alone, at a
+// phone's width too.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -28,13 +32,13 @@ const relay = {
   keyList: [1, 2].map((i) => ({ id: `key-${i}`, name: `Key ${i}`, masked: `sk-…000${i}`, active: i === 1, on: true })),
 };
 
-function serve(lang, posts) {
+function serve(lang, posts, off = []) {
   const state = { agents: [], profiles: [], settings: { lang, theme: "light" } };
   const providers = { providers: [sub, relay], presets: [], excluded: [], gateway: { running: true, window: true } };
   return async (route) => {
     const url = new URL(route.request().url());
     const json = (data) => route.fulfill({ json: data });
-    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:${JSON.stringify(lang)},theme:"light",web:true};` });
+    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:${JSON.stringify(lang)},theme:"light",web:true,featuresOff:${JSON.stringify(off)}};` });
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (url.pathname === "/api/state") return json(state);
     if (url.pathname === "/api/providers") return json(providers);
@@ -131,5 +135,33 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual(errors, []);
       });
     }
+    test(`${engine} ${lang}: with the routing strategies off, the editor offers Smart alone`, async (t) => {
+      const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" }));
+      t.after(() => browser.close());
+      for (const width of [900, 420]) {
+        for (const p of [sub, relay]) {
+          const where = `${width}px ${p.name}`;
+          const page = await (await browser.newContext({ viewport: { width, height: 720 }, reducedMotion: "reduce" })).newPage();
+          page.setDefaultTimeout(5000);
+          const errors = [];
+          page.on("pageerror", (e) => errors.push(e.message));
+          await page.route("**/*", serve(lang, [], ["rotation"]));
+          await page.goto("http://magpie.test/?view=providers");
+          await page.locator(".row.provider", { hasText: p.name }).first().click();
+          await page.locator(".editor .accts").first().waitFor();
+          const field = page.locator(".editor label", { hasText: new RegExp(`^${L.routing}$`) }).locator("xpath=following-sibling::div[1]");
+          const shown = await field.locator(".segs").first().evaluate((box) => [...box.querySelectorAll(".opt")].filter((b) => getComputedStyle(b).display !== "none").map((b) => b.textContent));
+          assert.deepEqual(shown, [zh ? "智能" : "Smart"], `${where}: Smart alone`);
+          assert.match(await field.locator(".segs .opt").first().getAttribute("class"), /\bon\b/, `${where}: Smart picked`);
+          assert.ok(await page.evaluate(() => document.scrollingElement.scrollWidth <= innerWidth + 1), `${where}: fits`);
+          // on again, every routing is back
+          await page.evaluate(() => applyFeatures([{ id: "rotation", on: true }]));
+          const back = await field.locator(".segs").first().evaluate((box) => [...box.querySelectorAll(".opt")].filter((b) => getComputedStyle(b).display !== "none").length);
+          assert.equal(back, p.account ? 5 : 6, `${where}: every routing back`);
+          assert.deepEqual(errors, [], where);
+          await page.context().close();
+        }
+      }
+    });
   }
 }

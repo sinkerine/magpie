@@ -121,6 +121,14 @@ func TestProviderSaveKeepsVolcengineSecret(t *testing.T) {
 		t.Errorf("presets: %v", pre)
 	}
 
+	// an editor opened before the access key was given (in another window,
+	// or before a sync brought it) sends the ID blank and no Secret: both
+	// are kept, as only Remove drops them (#1821)
+	post(`{` + base + `,"accessKeyID":""}`)
+	if p, _ = provider.Find("volcengine"); p.AccessKeyID != "AK-2" || p.SecretAccessKey != "SK-2" {
+		t.Errorf("blank ID: ak=%q sk=%q, want AK-2/SK-2", p.AccessKeyID, p.SecretAccessKey)
+	}
+
 	// Remove clears both, and the editor still asks for them
 	post(`{` + base + `,"accessKeyID":"","clearAccessKey":true}`)
 	if p, _ = provider.Find("volcengine"); p.AccessKeyID != "" || p.SecretAccessKey != "" || p.Key != "ark-key" {

@@ -6,7 +6,8 @@
 // "Updated 3 minutes ago" — or, standing in for a reading that failed just
 // now, "As of … — couldn't be read just now", windows' cards too. The menu
 // bar panel's Balances show the same amounts and the "As of". A balance of
-// one amount reads as it did. No left-border accent. English and Chinese,
+// one amount reads as it did. One the reply hadn't is "—" and says why on
+// hover (#1993). No left-border accent. English and Chinese,
 // Chromium and WebKit; no backend, the API is faked here.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
@@ -18,7 +19,7 @@ const assets = path.resolve(__dirname, "../assets");
 const ago = (min) => new Date(Date.now() - min * 6e4).toISOString();
 const quotas = () => [
   { provider: "relay", name: "My Relay", icon: "generic", windows: [], balance: "$2.00 · Today $2.50 · Used 95%", readAt: ago(3),
-    balanceParts: [{ text: "$2.00" }, { label: "Today", text: "$2.50" }, { label: "Used", text: "95%", percent: 95 }] },
+    balanceParts: [{ text: "$2.00" }, { label: "Today", text: "$2.50" }, { label: "Used", text: "95%", percent: 95 }, { label: "Week", text: "—", error: "Week: max() of the balance path has nothing to take it of" }] },
   { provider: "other", name: "Other Relay", icon: "generic", windows: [], balance: "$4.20", readAt: ago(120), asOf: ago(120) },
   { provider: "plain", name: "Plain", icon: "generic", windows: [], balance: "¥9.00", readAt: ago(0) },
   { provider: "kimi", name: "Kimi", icon: "kimi-color", asOf: ago(45), windows: [{ name: "Weekly", used: 30 }] },
@@ -79,8 +80,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const page = await open("usage", "http://magpie.test/?view=usage", { width: 900, height: 700 });
       const relay = page.locator(".subscription-card", { hasText: "My Relay" });
       await relay.locator(".bal-part").first().waitFor();
-      assert.deepEqual(await relay.locator(".bal-part > span").allTextContents(), [w.balance, "Today", "Used"]);
-      assert.deepEqual(await relay.locator(".bal-part > b").allTextContents(), ["$2.00", "$2.50", "95%"]);
+      assert.deepEqual(await relay.locator(".bal-part > span").allTextContents(), [w.balance, "Today", "Used", "Week"]);
+      assert.deepEqual(await relay.locator(".bal-part > b").allTextContents(), ["$2.00", "$2.50", "95%", "—"]);
+      // an amount the reply hadn't is "—", and says why on hover (#1993)
+      assert.equal(await relay.locator(".bal-part").nth(3).getAttribute("title"), "Week: max() of the balance path has nothing to take it of");
+      assert.equal(await relay.locator(".bal-part").nth(2).getAttribute("title"), null);
       assert.equal(await relay.locator(".bal-part.lead").count(), 1, "the first is the one that counts");
       const [lead, rest] = await relay.locator(".bal-part > b").evaluateAll((es) => es.slice(0, 2).map((e) => parseFloat(getComputedStyle(e).fontSize)));
       assert(lead > rest, `the first larger: ${lead} ${rest}`);
@@ -114,8 +118,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const card = panel.locator(".pq-card.bal", { hasText: "My Relay" });
       await card.locator(".pq-amt").waitFor();
       assert.equal(await card.locator(".pq-amt").textContent(), "$2.00");
-      assert.deepEqual(await card.locator(".pq-bp > span").allTextContents(), ["Today", "Used"]);
-      assert.deepEqual(await card.locator(".pq-bp > b").allTextContents(), ["$2.50", "95%"]);
+      assert.deepEqual(await card.locator(".pq-bp > span").allTextContents(), ["Today", "Used", "Week"]);
+      assert.deepEqual(await card.locator(".pq-bp > b").allTextContents(), ["$2.50", "95%", "—"]);
+      assert.equal(await card.locator(".pq-bp").nth(2).getAttribute("title"), "Week: max() of the balance path has nothing to take it of");
       assert.equal(await width(card.locator(".quota-track.full i")), 95);
       const stale = panel.locator(".pq-card.bal", { hasText: "Other Relay" });
       assert(await stale.evaluate((e) => e.classList.contains("stale")));

@@ -28,6 +28,26 @@ func TestGatewayConversationAPI(t *testing.T) {
 		mux.ServeHTTP(w, httptest.NewRequest(method, path, strings.NewReader(body)))
 		return w
 	}
+	type manageList struct {
+		Sessions []struct {
+			sessions.Session
+			Gateway bool `json:"gateway"`
+		} `json:"sessions"`
+		Recording bool `json:"recording"`
+		Recorded  bool `json:"recorded"`
+	}
+	manage := func() (manageList, string) {
+		w := request("GET", "/api/sessions/manage?agent=opencode", "")
+		var list manageList
+		if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+			t.Fatal(err)
+		}
+		return list, w.Body.String()
+	}
+	// The Sessions page offers to delete kept text only when some is kept.
+	if list, body := manage(); list.Recorded {
+		t.Fatalf("nothing kept yet, but recorded: %s", body)
+	}
 	if w := request("POST", "/api/sessions/recording", `{"on":true}`); w.Code != 200 || !settings.Load().GatewayConversations {
 		t.Fatalf("consent: %d %s", w.Code, w.Body)
 	}
@@ -35,18 +55,11 @@ func TestGatewayConversationAPI(t *testing.T) {
 	if err := sessions.SaveGatewayTurn(sessions.GatewayTurn{Agent: "opencode", Session: "remote-only", Time: time.Now(), Input: []sessions.Part{{Role: "user", Kind: "text", Text: "remote question"}}}); err != nil {
 		t.Fatal(err)
 	}
-	w := request("GET", "/api/sessions/manage?agent=opencode", "")
-	var list struct {
-		Sessions  []sessions.Session `json:"sessions"`
-		Recording bool               `json:"recording"`
+	list, body := manage()
+	if !list.Recording || !list.Recorded || len(list.Sessions) != 1 || !list.Sessions[0].Gateway || !list.Sessions[0].Transcript || !list.Sessions[0].ReadOnly || list.Sessions[0].Resume != "" {
+		t.Fatalf("listing: %s", body)
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
-		t.Fatal(err)
-	}
-	if !list.Recording || len(list.Sessions) != 1 || !list.Sessions[0].Transcript || !list.Sessions[0].ReadOnly || list.Sessions[0].Resume != "" {
-		t.Fatalf("listing: %s", w.Body)
-	}
-	w = request("GET", "/api/sessions/transcript?agent=opencode&id=remote-only", "")
+	w := request("GET", "/api/sessions/transcript?agent=opencode&id=remote-only", "")
 	var tr sessions.Transcript
 	if err := json.Unmarshal(w.Body.Bytes(), &tr); err != nil {
 		t.Fatal(err)
@@ -63,6 +76,9 @@ func TestGatewayConversationAPI(t *testing.T) {
 	w = request("GET", "/api/sessions/transcript?agent=opencode&id=remote-only", "")
 	if strings.Contains(w.Body.String(), "remote question") || settings.Load().GatewayConversations {
 		t.Fatal("clear retained content or consent")
+	}
+	if list, body := manage(); list.Recorded || list.Recording {
+		t.Fatalf("cleared, but still recorded: %s", body)
 	}
 	if _, ok := usage.GatewaySessionByID("opencode", "remote-only", nil); !ok {
 		t.Fatal("clear removed usage")

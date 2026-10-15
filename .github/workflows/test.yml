@@ -62,13 +62,21 @@ jobs:
         run: go vet -tags "${{ steps.tags.outputs.tags }}" ./...
 
       - uses: oven-sh/setup-bun@v2
-        if: runner.os == 'Linux'
         with:
           bun-version: 1.4.2
 
       - name: Test
         if: runner.os != 'Windows'
         run: go test -tags "${{ steps.tags.outputs.tags }}" ./...
+
+      # Windows skips the Test step above, so the two plugin stderr tests run
+      # here. The end-to-end one needs bun on PATH; without it it skips.
+      - name: Plugin stderr tests (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          bun --version
+          go test -v -count=1 ./internal/plugin/ -run '^(TestHostStartsPastAnOverlongStderrLine|TestDrainStderrKeepsTheChildGoing)$'
 
       - name: Production plugin flow
         if: runner.os == 'Linux'
@@ -116,10 +124,11 @@ jobs:
         run: go test -v -count=1 ./internal/usage -run '^(TestWindows|TestLogChange|TestLogFileInfoPreservesIdentity$|TestUsageSameSizeAndMtimeRewrite$|TestLogGrowingRewriteThenAppend$|TestUsagePageCacheAfterUncachedQuery$)'
 
       # Install tests keep their files in t.TempDir; exercise real Windows
-      # executable and held-handle rename/rollback behavior.
+      # executable and held-handle rename/rollback behavior, and the trial
+      # start before the install (#2272).
       - name: Windows update install
         if: runner.os == 'Windows'
-        run: go test -v -count=1 -timeout 2m ./internal/update -run '^(TestInstallBinary|TestMoveAside)'
+        run: go test -v -count=1 -timeout 2m ./internal/update -run '^(TestInstallBinary|TestMoveAside|TestTrialStart)'
 
       # These tests use temporary paths, without the Unix HOME assumptions
       # of the full suite. Run the native link-kind and sharing-error checks,

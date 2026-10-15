@@ -57,7 +57,7 @@ func TestOpenCodeClientHeaders(t *testing.T) {
 	}
 	send("zen/kimi-k2.6", "")
 	send("zen/kimi-k2.6", "")
-	send("zen/kimi-k2.6", "ses_0f9e921e8001MExXod3RWVP3aU") // OpenCode's own goes as it is
+	send("zen/kimi-k2.6", "ses_ecc5d8f28ffe9Cy14V8Em7lI2u") // the agent's own session id names the session, and the header itself stays behind
 	send("other/kimi-k2.6", "")
 
 	zen, other := got["opencode.ai"], got["other.test"]
@@ -66,12 +66,22 @@ func TestOpenCodeClientHeaders(t *testing.T) {
 	}
 	id := regexp.MustCompile(`^(ses|msg)_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
 	for i, r := range zen {
-		if ua := r.h.Get("User-Agent"); ua != "opencode/"+provider.OpenCodeVersion {
+		if ua := r.h.Get("User-Agent"); ua != provider.OpenCodeUserAgent {
 			t.Errorf("zen %d: User-Agent %q", i, ua)
 		}
 		if !id.MatchString(r.h.Get("x-opencode-session")) || !id.MatchString(r.h.Get("x-opencode-request")) ||
 			!strings.HasPrefix(r.h.Get("x-opencode-session"), "ses_") || !strings.HasPrefix(r.h.Get("x-opencode-request"), "msg_") {
 			t.Errorf("zen %d: session %q request %q", i, r.h.Get("x-opencode-session"), r.h.Get("x-opencode-request"))
+		}
+		if v := r.h.Get("x-opencode-session-id"); v != r.h.Get("x-opencode-session") {
+			t.Errorf("zen %d: x-opencode-session-id %q, x-opencode-session %q", i, v, r.h.Get("x-opencode-session"))
+		}
+		// OpenCode 1.19.0 sends Zen neither, and Zen's free tier answers 403
+		// FreeTierError to a request carrying x-session-affinity
+		for _, h := range []string{"x-session-affinity", "X-Session-Id"} {
+			if v := r.h.Get(h); v != "" {
+				t.Errorf("zen %d: %s %q went to Zen", i, h, v)
+			}
 		}
 		if r.h.Get("x-opencode-client") != "cli" || r.h.Get("x-opencode-project") != "global" {
 			t.Errorf("zen %d: client %q project %q", i, r.h.Get("x-opencode-client"), r.h.Get("x-opencode-project"))
@@ -88,7 +98,7 @@ func TestOpenCodeClientHeaders(t *testing.T) {
 		t.Errorf("session %q %q, request %q %q", zen[0].h.Get("x-opencode-session"), zen[1].h.Get("x-opencode-session"),
 			zen[0].h.Get("x-opencode-request"), zen[1].h.Get("x-opencode-request"))
 	}
-	if s := zen[2].h.Get("x-opencode-session"); s != "ses_0f9e921e8001MExXod3RWVP3aU" {
+	if s := zen[2].h.Get("x-opencode-session"); s != "ses_ecc5d8f28ffe9Cy14V8Em7lI2u" {
 		t.Errorf("OpenCode's own session became %q", s)
 	}
 	for k := range other[0].h {

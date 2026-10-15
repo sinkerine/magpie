@@ -4,6 +4,7 @@ const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 const { fixture } = require("./fixtures/caller-keys.cjs");
+const { openPart } = require("./reader.cjs");
 
 async function palette(page, selectors) {
   return page.evaluate((selectors) => {
@@ -119,11 +120,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.mouse.move(500, 400);
         await page.mouse.wheel(0, -5000);
         for (const choice of ["Dark", "Light", "System"]) {
-          await page.locator("#setTab-general").click();
+          await openPart(page, "general");
           await page.locator("#themeSegs").getByRole("button", { name: choice, exact: true }).click();
           await page.waitForFunction((want) => (document.documentElement.dataset.theme || "system") === want, choice.toLowerCase());
           await page.waitForFunction(() => !document.documentElement.classList.contains("theming"));
-          await page.locator("#setTab-network").click();
+          await openPart(page, "network");
           const { colors: c, elements: e } = await palette(page, { card: "#lanList", key: "#lanList .lan-url" });
           assert.equal(e.card.bg, c.card);
           assert.equal(e.key.color, c["fg-2"]);

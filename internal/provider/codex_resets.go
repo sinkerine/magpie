@@ -171,9 +171,9 @@ func codexResets(ctx context.Context, base, token, accountID string, count int) 
 }
 
 // ResetOutcome is what spending a reset did: Code is the vendor's word for
-// it (reset, nothing_to_reset, no_credit, already_redeemed; for Claude
-// already_used, not_limited, cooldown, ineligible, unavailable too) and
-// Windows how many windows started again.
+// it (reset, nothing_to_reset, no_credit, already_redeemed) and Windows
+// how many windows started again. Claude's resets are gone (9bf6d4352,
+// #1972); "already_used" below was their word and no longer comes.
 type ResetOutcome struct {
 	Code    string `json:"code"`
 	Windows int    `json:"windows"`
@@ -201,8 +201,14 @@ func (o ResetOutcome) Text() string {
 // user (the one Codex is signed in to when ""), starting its current
 // usage windows again: the one that runs out first, so none that would
 // last longer goes before it. It can't be undone: callers ask first. The
-// account's usage is read afresh after.
+// account's usage is read afresh after, and the use is kept as one made by
+// hand (ResetsUsed).
 func UseCodexReset(ctx context.Context, user string) (ResetOutcome, error) {
+	return useCodexReset(ctx, user, ResetUsedByHand)
+}
+
+// useCodexReset is UseCodexReset, the use kept as made for why.
+func useCodexReset(ctx context.Context, user, why string) (ResetOutcome, error) {
 	user, tok, accountID, err := codexUserToken(ViaLogin(ctx, "codex", user), user)
 	if err != nil {
 		return ResetOutcome{}, err
@@ -226,6 +232,7 @@ func UseCodexReset(ctx context.Context, user string) (ResetOutcome, error) {
 	StaleAllowance("codex", user)
 	if out.Code == "reset" {
 		renewedNow("codex", user)
+		noteResetUsed(user, why, out)
 	}
 	subscriptionUsageCache.Lock()
 	subscriptionUsageCache.at = time.Time{}

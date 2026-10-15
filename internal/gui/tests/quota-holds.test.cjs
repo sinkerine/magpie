@@ -4,7 +4,9 @@
 // the share used — "≈ N tokens · ≈ $X" under its reset, in every language,
 // at a phone's width too, and in its tooltip how it was reckoned and that
 // it reads low if the account is used elsewhere. A window the server didn't
-// reckon says nothing, and one with no API price says no cost.
+// reckon says "not enough data", muted, with why in its tooltip (#2045),
+// one it gives no reason for says nothing, and one with no API price says
+// no cost.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -18,10 +20,13 @@ const quotas = [
   { provider: "claude", name: "Claude Code", icon: "claude-color", plan: "max", user: "dee@example.com", windows: [
     { name: "5 hours", used: 20, resetsAt: soon(2), holds: holds(12345678, 85.4321, 20) },
     { name: "7 days", used: 40, resetsAt: soon(70), holds: holds(234567890, 1234.5, 40) },
-    { name: "7 days · Fable", used: 3, resetsAt: soon(70) },
+    { name: "7 days · Fable", used: 3, resetsAt: soon(70), holdsWhy: "low" },
+    { name: "7 days · Sonnet", used: 30, resetsAt: soon(70), holdsWhy: "credits" },
+    { name: "7 days · Haiku", used: 30, resetsAt: soon(70), holdsWhy: "some reason this GUI doesn't know" },
   ] },
   { provider: "kiro", name: "Kiro", icon: "kiro-color", plan: "Pro", user: "kay@example.com", windows: [
     { name: "Weekly", used: 25, holds: holds(40000, 0, 25, false) },
+    { name: "Credits", used: 30, holdsWhy: "clock" },
   ] },
 ];
 function serve(lang) {
@@ -48,19 +53,19 @@ function serve(lang) {
 }
 
 const want = {
-  en: { line: "Whole ≈ 12M tokens", low: "reads low" },
-  zh: { line: "整窗 ≈ 1234.6 万 tokens", low: "偏低" },
-  "zh-TW": { line: "整窗 ≈ 1234.6 萬 tokens", low: "偏低" },
-  ja: { line: "枠全体 ≈ 12M トークン", low: "低め" },
-  de: { line: "Gesamt ≈ 12M Tokens", low: "zu niedrig" },
+  en: { line: "Whole ≈ 12M tokens", low: "reads low", none: "Whole: not enough data", under: "Under 5%", credits: "credits", clock: "reset time" },
+  zh: { line: "整窗 ≈ 1234.6 万 tokens", low: "偏低", none: "整窗：数据不足", under: "不到 5%", credits: "积分", clock: "重置时间" },
+  "zh-TW": { line: "整窗 ≈ 1234.6 萬 tokens", low: "偏低", none: "整窗：資料不足", under: "不到 5%", credits: "積分", clock: "重置時間" },
+  ja: { line: "枠全体 ≈ 12M トークン", low: "低め", none: "枠全体：データ不足", under: "5% 未満", credits: "クレジット", clock: "リセット時刻" },
+  de: { line: "Gesamt ≈ 12M Tokens", low: "zu niedrig", none: "Gesamt: zu wenig Daten", under: "Weniger als 5 %", credits: "Guthaben", clock: "Rücksetzzeit" },
 };
 
 for (const [name, engine] of [["webkit", webkit], ["chromium", chromium]]) {
-  test(`${name}: a window's whole, under its reset, whole at 360 and 440px in every language`, async () => {
+  test(`${name}: a window's whole, or not enough data and why, under its reset, whole at 360 to 1100px in every language`, async () => {
     const browser = await engine.launch();
     try {
       for (const lang of Object.keys(want)) {
-        for (const width of [360, 440, 1000]) {
+        for (const width of [360, 420, 440, 1000, 1100]) {
           const page = await (await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: "reduce" })).newPage();
           page.setDefaultTimeout(5000);
           await page.route("**/*", serve(lang));
@@ -80,12 +85,31 @@ for (const [name, engine] of [["webkit", webkit], ["chromium", chromium]]) {
                   inCard: b.left >= card.left - 1 && b.right <= card.right + 1,
                 };
               }),
+              unknown: [...document.querySelectorAll(".quota-holds-why")].map((l) => {
+                const card = l.closest(".subscription-card").getBoundingClientRect(), b = l.getBoundingClientRect(), cs = getComputedStyle(l);
+                return {
+                  text: l.textContent, title: l.title, window: l.closest(".quota").querySelector(".quota-labels > span").textContent,
+                  inReset: !!l.closest(".quota-reset"), cut: l.scrollWidth > l.clientWidth + 1, inCard: b.left >= card.left - 1 && b.right <= card.right + 1,
+                  muted: Number(cs.opacity) < 1 && cs.color === getComputedStyle(l.closest(".quota-reset")).color,
+                };
+              }),
               pageScroll: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
             };
           });
           const at = `${lang} ${width}px`;
-          assert.equal(got.count, 4, at);
-          assert.equal(got.lines.length, 3, `${at}: the Fable week, too little used, says nothing: ${JSON.stringify(got.lines)}`);
+          assert.equal(got.count, 7, at);
+          assert.equal(got.lines.length, 3, `${at}: only the windows reckoned tell a whole: ${JSON.stringify(got.lines)}`);
+          // the ones not reckoned say so, and why; one with a reason this
+          // GUI doesn't know says nothing
+          assert.deepEqual(got.unknown.map((l) => l.text), [want[lang].none, want[lang].none, want[lang].none], `${at}: ${JSON.stringify(got.unknown)}`);
+          const [fable, sonnet, credits] = got.unknown;
+          assert.ok(fable.title.includes(want[lang].under), `${at}: ${fable.title}`);
+          assert.ok(sonnet.title.includes(want[lang].credits), `${at}: ${sonnet.title}`);
+          assert.ok(credits.title.includes(want[lang].clock), `${at}: ${credits.title}`);
+          for (const l of got.unknown) {
+            assert.ok(l.inReset && !l.cut && l.inCard && l.muted, `${at}: ${JSON.stringify(l)}`);
+            assert.equal(l.title.split("\n").length, 2, at);
+          }
           const [five, week, kiro] = got.lines;
           assert.equal(five.text, want[lang].line + " · ≈ $85.43", at);
           assert.match(week.text, /≈ \$1235$/, at);

@@ -71,7 +71,7 @@ func TestReadBalancePath(t *testing.T) {
 			t.Errorf("%q: %q %v, want %q", path, got, err, want)
 		}
 	}
-	for _, path := range []string{";", "5h: windowLimits.hour.used; $credits.monthlyCredits", "week:"} {
+	for _, path := range []string{";", "5h: windowLimits.hour.used; week: windowLimits.weekly.used / 0", "week:"} {
 		if got, err := readBalancePath(cc, path); err == nil {
 			t.Errorf("%q: read %q, want an error", path, got)
 		}
@@ -80,6 +80,86 @@ func TestReadBalancePath(t *testing.T) {
 		if got, err := readBalancePath(body, path); err == nil {
 			t.Errorf("%q: read %q, want an error", path, got)
 		}
+	}
+}
+
+// A relay's subscriptions are a list: a balance path sums, or takes the
+// max of, every item's or those that match (#1993, RicardoWYP's
+// /api/subscription/self, as pasted), and one amount of several that the
+// reply hasn't (a second subscription that isn't there, a weekly cap of 0)
+// is "—" while the others still show.
+func TestBalancePathLists(t *testing.T) {
+	one := []byte(`{
+  "data": {
+    "subscriptions": [
+      { "subscription": { "status": "active", "amount_total": 50000000, "amount_used": 31593277, "weekly_amount_total": 0, "weekly_amount_used": 0 } }
+    ],
+    "all_subscriptions": [ { "subscription": { "status": "expired", "...": "..." } } ]
+  }
+}`)
+	two := []byte(`{"data":{"subscriptions":[
+  {"subscription":{"status":"active","amount_total":50000000,"amount_used":31593277,"weekly_amount_total":0,"weekly_amount_used":0}},
+  {"subscription":{"status":"active","amount_total":"10000000","amount_used":5000000,"weekly_amount_total":4000000,"weekly_amount_used":1000000}},
+  {"subscription":{"status":"expired","amount_total":90000000,"amount_used":90000000,"weekly_amount_total":1000000,"weekly_amount_used":1000000}}]}}`)
+	const (
+		used  = "sum(data.subscriptions[subscription.status=active].subscription.amount_used) / sum(data.subscriptions[subscription.status=active].subscription.amount_total) %"
+		week  = "max(data.subscriptions[subscription.status=active].subscription.weekly_amount_used / data.subscriptions[subscription.status=active].subscription.weekly_amount_total) %"
+		count = "count(data.subscriptions.*.subscription[status='active'])"
+	)
+	for _, c := range []struct {
+		body []byte
+		path string
+		want string
+	}{
+		{one, used, "63.2%"},
+		{two, used, "61%"},
+		{one, "$ sum(data.subscriptions.*.subscription.amount_used) / 500000", "$63.19"},
+		{two, "max(data.subscriptions.*.subscription.amount_used)", "90000000.00"},
+		{two, "min(data.subscriptions.*.subscription.amount_used)", "5000000.00"},
+		{two, "count(data.subscriptions[subscription.status!=active])", "1.00"},
+		{one, "sum(data.all_subscriptions.*.subscription.amount_used)", "0.00"},
+		{two, week, "25%"},
+		{two, count, "2.00"},
+		{two, "sum(data.subscriptions.*.subscription[status=active].amount_total) / 1000000", "60.00"},
+		{two, "max(data.subscriptions.*.subscription.weekly_amount_used / data.subscriptions.*.subscription.weekly_amount_total) %", "100%"},
+		{two, "sum(data.subscriptions[subscription.status=active].subscription.amount_used) * 2 / 1000000", "73.19"},
+		// all of a list's items, as they are
+		{[]byte(`[{"left":1},{"left":2.5}]`), "sum(*.left)", "3.50"},
+		{[]byte(`{"a":{"x":{"n":1},"y":{"n":4}}}`), "max(a.*.n)", "4.00"},
+		// one amount the reply hasn't is "—", the others still show
+		{one, "used: " + used + "; week: " + week, "used 63.2% · week —"},
+		{one, "first: data.subscriptions.0.subscription.amount_used; second: data.subscriptions.1.subscription.amount_used", "first 31593277.00 · second —"},
+		{one, "all: data.subscriptions.0.subscription.amount_used + data.subscriptions.1.subscription.amount_used; used: " + used, "all — · used 63.2%"},
+	} {
+		if got, err := readBalancePath(c.body, c.path); err != nil || got != c.want {
+			t.Errorf("%q: %q %v, want %q", c.path, got, err, c.want)
+		}
+	}
+	for _, path := range []string{
+		// several values where one is wanted: a sum, not a guess
+		"data.subscriptions.*.subscription.amount_used",
+		"data.subscriptions[subscription.status=active].subscription.amount_used / 2",
+		"data.subscriptions.*.subscription.amount_used %",
+		// a max of nothing, a list beside one of another length
+		"max(data.all_subscriptions.*.subscription.amount_used)",
+		// one alone that can't be read still fails, as does every one of several
+		week,
+		"week: " + week + "; second: data.subscriptions.1.subscription.amount_used",
+		"sum(data.subscriptions.*.subscription.amount_used",
+		"sum(data.subscriptions[status.amount_used)",
+		"sum(data.subscriptions[status].amount_used)",
+	} {
+		if got, err := readBalancePath(one, path); err == nil {
+			t.Errorf("%q: read %q, want an error", path, got)
+		}
+	}
+	if got, err := readBalancePath(two, "sum(data.subscriptions.*.subscription.amount_used + data.subscriptions[subscription.status=active].subscription.amount_total)"); err == nil {
+		t.Errorf("lists of 3 and 2 put together: read %q, want an error", got)
+	}
+	// the card's amount says why it is "—"
+	parts, err := readBalanceParts(one, "used: "+used+"; week: "+week)
+	if err != nil || len(parts) != 2 || parts[1].Text != "—" || !strings.Contains(parts[1].Error, "nothing to take it of") || parts[0].Error != "" {
+		t.Errorf("parts: %+v %v", parts, err)
 	}
 }
 
@@ -92,6 +172,8 @@ func TestBalanceSourceByHost(t *testing.T) {
 		"https://api.commandcode.ai/provider/v1": "https://api.commandcode.ai/alpha/billing/credits",
 		"https://api.stepfun.com/step_plan/v1":   "https://api.stepfun.com/v1/accounts",
 		"https://api.stepfun.ai/v1":              "https://api.stepfun.ai/v1/accounts",
+		"https://ollama.com/v1":                  "https://ollama.com/api/balance",
+		"http://localhost:11434/v1":              "",
 		"https://relay.example.com/v1":           "",
 		"https://api.deepseek.com.evil/":         "",
 	} {
@@ -267,6 +349,34 @@ func TestKeyUsageWithAccessToken(t *testing.T) {
 		t.Fatalf("ok %v, err %v, asked %v", ok, err, asked)
 	}
 	if want := srv.URL + "/api/user/self (Balance field $data.quota / 500000)"; !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "takes the API key, not the access token") {
+		t.Fatalf("err = %v", err)
+	}
+	// the key alone still asks it
+	p.BalanceToken = ""
+	if _, _, err := Balance(context.Background(), p); !asked || err == nil {
+		t.Fatalf("without the token: asked %v, err %v", asked, err)
+	}
+}
+
+// A login token beside sub2api's /v1/usage, which takes only the key, is
+// never sent there either: the panel's query for the account is named in
+// its place, as new-api's is above.
+func TestSub2APIKeyUsageWithLoginToken(t *testing.T) {
+	asked := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = true
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid API key"}`))
+	}))
+	defer srv.Close()
+	p := Provider{ID: "panel", Chat: srv.URL, Key: "sk-two",
+		BalanceToken: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzIn0.sig",
+		BalanceURL:   srv.URL + "/v1/usage"}
+	_, ok, err := Balance(context.Background(), p)
+	if !ok || err == nil || asked {
+		t.Fatalf("ok %v, err %v, asked %v", ok, err, asked)
+	}
+	if want := srv.URL + "/api/v1/user/profile (Balance field $data.balance)"; !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "takes the API key, not the login token") {
 		t.Fatalf("err = %v", err)
 	}
 	// the key alone still asks it
@@ -483,5 +593,61 @@ func TestSiliconFlowRetiredBalanceQuery(t *testing.T) {
 		if got, _, err := Balance(context.Background(), p); err != nil || !strings.HasSuffix(got, "88.88") {
 			t.Errorf("%s 200: %q %v", c.base, got, err)
 		}
+	}
+}
+
+// A key usage query that takes only "Authorization: Bearer <key>"
+// (lx_78654 on Discord: a header of "Bearer {token}" went as written, and
+// the vendor said "Authorization header format must be 'Bearer {token}'").
+// The key is put in for each of its names, and the key pasted as the
+// balance token goes as a Bearer too, not bare as an access token.
+func TestBalanceKeyAsBearer(t *testing.T) {
+	const key = "sk-tt-1"
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") != "Bearer "+key {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"code":"INVALID_AUTH_HEADER","message":"Authorization header format must be 'Bearer {token}'"}`))
+			return
+		}
+		w.Write([]byte(`{"data":{"remain":8.5}}`))
+	}))
+	defer srv.Close()
+	base := Provider{ID: "relay", Chat: srv.URL + "/v1", Key: key, BalanceURL: srv.URL + "/key/usage", BalancePath: "$data.remain"}
+	for _, c := range []struct {
+		name    string
+		headers map[string]string
+		token   string
+	}{
+		{name: "no header"},
+		{name: "{token}", headers: map[string]string{"Authorization": "Bearer {token}"}},
+		{name: "{key}", headers: map[string]string{"Authorization": "Bearer {key}"}},
+		{name: "{API_KEY}", headers: map[string]string{"authorization": "Bearer {API_KEY}"}},
+		{name: "{{apikey}}", headers: map[string]string{"Authorization": "Bearer {{apikey}}"}},
+		{name: "${API_KEY}", headers: map[string]string{"Authorization": "Bearer ${API_KEY}"}},
+		{name: "key as token", token: key},
+		{name: "Bearer key as token", token: "Bearer " + key},
+	} {
+		p := base
+		p.Headers, p.BalanceToken = c.headers, c.token
+		got = nil
+		if amount, ok, err := Balance(context.Background(), p); err != nil || !ok || amount != "$8.50" {
+			t.Errorf("%s: balance = %q %v %v, sent %q", c.name, amount, ok, err, got)
+		}
+	}
+	// the key in the URL is escaped there, under any of its names
+	p := base
+	p.BalanceURL = srv.URL + "/key/usage?k={TOKEN}"
+	p.Key = "sk-tt 1"
+	if u := withBalanceKey(p.BalanceURL, p.Key, true); !strings.HasSuffix(u, "?k=sk-tt+1") {
+		t.Fatalf("url = %q", u)
+	}
+	// a token of the account's own, not the key, still goes as it is
+	p = base
+	p.BalanceToken = "tok"
+	got = nil
+	if _, _, err := Balance(context.Background(), p); err == nil || len(got) != 1 || got[0] != "tok" {
+		t.Fatalf("an access token went as %q (%v)", got, err)
 	}
 }

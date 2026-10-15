@@ -180,6 +180,41 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     assert.deepEqual(errors, []);
   });
 
+  // sub2api's /v1/usage takes the key alone too (#2217): a login token
+  // beside it is said, with the panel's profile the one way offered, and
+  // a saved "$remaining" gives way to its field
+  test(engine + ": a login token on sub2api's /v1/usage is moved to /api/v1/user/profile", async (t) => {
+    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+    const context = await browser.newContext({ viewport: { width: 440, height: 760 }, reducedMotion: "reduce" });
+    const page = await context.newPage();
+    page.setDefaultTimeout(5000);
+    const errors = [], posted = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+    await page.route("**/*", server(posted, { provider: { ...relay, balanceURL: "https://relay.example.com/v1/usage", balancePath: "$remaining" } }));
+    t.after(() => browser.close());
+
+    await page.goto("http://magpie.test/?view=providers");
+    await page.locator(".row.provider", { hasText: "Relay" }).click();
+    const fix = page.locator(".editor .bal-fix");
+    await fix.waitFor();
+    assert(await fix.evaluate((e) => e.classList.contains("warn")), "the saved token beside /v1/usage is a warning");
+    assert.match(await fix.textContent(), /…\/v1\/usage takes the API key, not this token/);
+    assert.equal(await fix.getByRole("button").count(), 1, "only sub2api's account query is offered");
+    await fix.getByRole("button", { name: "Use https://relay.example.com/api/v1/user/profile", exact: true }).click();
+    assert.equal(await page.locator(".editor .bal-url").inputValue(), "https://relay.example.com/api/v1/user/profile");
+    assert.equal(await page.locator(".editor .bal-path").inputValue(), "$data.balance", "the key query's field gives way");
+    assert.equal(await fix.textContent(), "");
+
+    const said = await page.evaluate(() => quotaError("the Balance URL https://relay.example.com/v1/usage takes the API key, not the login token: set it to https://relay.example.com/api/v1/user/profile (Balance field $data.balance) for the account's balance, or remove the token for the key's own"));
+    assert.equal(said, "The Balance URL …/v1/usage takes the API key, not the login token — set it to …/api/v1/user/profile in the provider's settings");
+    const missing = await page.evaluate(() => [
+      "…/v1/usage takes the API key, not this token: for the account's balance, a sub2api panel uses /api/v1/user/profile.",
+      "The Balance URL …/v1/usage takes the API key, not the login token — set it to …/api/v1/user/profile in the provider's settings",
+    ].filter((k) => !I18N.zh[k] || !I18N["zh-TW"][k] || !I18N.ja[k] || !I18N.de[k]));
+    assert.deepEqual(missing, [], "every new string has its translations");
+    assert.deepEqual(errors, []);
+  });
+
   for (const lang of ["en", "zh", "ja", "de"]) {
     for (const width of [900, 440]) {
       test(`${engine}: Sub2API balance shortcut saves the profile endpoint (${lang}, ${width}px)`, async (t) => {

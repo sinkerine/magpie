@@ -99,7 +99,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       };
       // the titles the three cards' resets should carry, dates as the page says them
       const want = async (page) => {
-        const [wa, wb, wc] = await page.evaluate((ds) => ds.map((d) => new Date(d).toLocaleString()), [a, b, c]);
+        const [wa, wb, wc] = await page.evaluate((ds) => ds.map((d) => new Date(d).toLocaleString(intlLang())), [a, b, c]);
         return {
           codex: [w.nth(1, wa), w.nth(2, wc), w.never(3)],
           team: [w.five(wa), w.week(wb), w.five(wc)],

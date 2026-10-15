@@ -58,13 +58,22 @@ func CheckProxy(proxy string) error {
 	}
 	u, err := netproxy.Parse(proxy)
 	if err != nil || u.Host == "" {
-		return fmt.Errorf("a proxy is an address like http://127.0.0.1:7890 or socks5://127.0.0.1:1080, not %q", proxy)
+		return fmt.Errorf("a proxy is an address like http://127.0.0.1:7890 or socks5://127.0.0.1:1080%s", notProxy(proxy))
 	}
 	switch u.Scheme {
 	case "http", "https", "socks5", "socks5h":
 		return nil
 	}
-	return fmt.Errorf("a proxy is http://, https://, socks5:// or socks5h://, not %q", proxy)
+	return fmt.Errorf("a proxy is http://, https://, socks5:// or socks5h://%s", notProxy(proxy))
+}
+
+// notProxy is ", not <proxy>" for CheckProxy's error, the proxy's user
+// and password left out (#1886); "" when nothing of it can be shown.
+func notProxy(proxy string) string {
+	if r := netproxy.Redact(proxy); r != "" {
+		return fmt.Sprintf(", not %q", r)
+	}
+	return ""
 }
 
 // mirrorOf is the mirror downloads under ctx go through: WithMirror's,

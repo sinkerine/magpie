@@ -91,7 +91,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const title = (await key.getAttribute("title")).split("\n");
       assert.equal(title[2], w.latest, title.join(" | "));
       assert.deepEqual(title.slice(3).map((l) => l.replace(/ · .*/, "")), ["72%", "↻ 100%", "35%"]);
-      assert.equal(await claude.locator(".quota-curve button").count(), 0, "no control on the card");
+      assert.equal(await claude.locator(".quota-curve button:not(.qc-range)").count(), 0, "only the account's cycle picker on the card");
       assert.deepEqual(errors, []);
     });
   }

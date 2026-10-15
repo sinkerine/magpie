@@ -98,7 +98,7 @@ func TestClaudeDesktopAliases(t *testing.T) {
 			t.Errorf("Desktop would drop %q", list.Data[i].ID)
 		}
 	}
-	if row == nil || row.DisplayName != "m1" || row.Description != "" {
+	if row == nil || row.DisplayName != "m1 · Fake" || row.Description != "" {
 		t.Fatalf("Claude Desktop by its User-Agent: %s", rec.Body)
 	}
 	for _, asked := range []string{alias, alias + "[1m]"} {

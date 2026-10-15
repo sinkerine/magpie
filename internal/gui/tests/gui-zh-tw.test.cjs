@@ -9,13 +9,13 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
+const { strings } = require("./strings.cjs");
 const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
 
 test("zh-TW has every zh string, with its placeholders and tags, in Traditional", async () => {
-  const src = await fs.readFile(path.join(assets, "i18n.js"), "utf8");
-  const I18N = new Function(src.slice(0, src.indexOf("\n};") + 3) + "; return I18N;")();
+  const { I18N } = strings(); // i18n.js's and the plugins'
   const zh = Object.keys(I18N.zh), tw = I18N["zh-TW"];
   assert.deepEqual(zh.filter((k) => !(k in tw)), [], "missing in zh-TW");
   assert.deepEqual(Object.keys(tw).filter((k) => !(k in I18N.zh)), [], "zh-TW only");
@@ -77,38 +77,41 @@ for (const [name, engine] of [["webkit", webkit], ["chromium", chromium]]) {
         assert.ok(got.offered.includes("zh-TW:繁體中文") && got.offered.includes("zh:简体中文"), got.offered.join());
         if (want === "zh-TW") {
           assert.equal(got.lang, "zh-TW");
-          assert.deepEqual(got.nav, ["Agent", "供應商", "閘道", "路由", "用量"]);
+          assert.deepEqual(got.nav, ["Agent", "會話", "資源庫", "供應商", "路由"]);
           assert.deepEqual(got.units, ["1.33 億", "6.8 萬"]);
         }
         if (want === "zh") assert.deepEqual(got.units, ["1.33 亿", "6.8 万"]);
         await page.close();
       }
-      // Settings → Language holds six choices now: on a wide window they sit
-      // on one line, and on a narrow one they wrap inside the row rather
-      // than pushing the page sideways or cutting a name short
+      // Settings → Language is one menu button showing the language picked
+      // (1ooogle on X): it fits its row on a wide and a narrow window, and
+      // its menu lists all six, none cut short
       for (const width of [1000, 440]) {
         const page = await (await browser.newContext({ locale: "zh-TW", viewport: { width, height: 760 } })).newPage();
         page.setDefaultTimeout(5000);
         await page.route("**/*", serve("zh-TW"));
         await page.goto("http://magpie.test/");
         await page.locator("#prefs").click();
-        await page.locator("#langSegs .opt").first().waitFor();
+        await page.locator("#langPick span").first().waitFor();
         const fit = await page.evaluate(() => {
-          const segs = document.querySelector("#langSegs"), row = segs.parentElement.getBoundingClientRect(), box = segs.getBoundingClientRect();
+          const b = document.querySelector("#langPick"), row = b.closest(".row").getBoundingClientRect(), box = b.getBoundingClientRect();
           return {
             inside: box.left >= row.left && box.right <= row.right + 0.5,
             sideways: document.documentElement.scrollWidth > innerWidth,
-            cut: [...segs.querySelectorAll(".opt")].filter((o) => o.scrollWidth > o.clientWidth + 1).map((o) => o.textContent),
-            names: [...segs.querySelectorAll(".opt")].map((o) => o.textContent),
-            lines: new Set([...segs.querySelectorAll(".opt")].map((o) => Math.round(o.getBoundingClientRect().top))).size,
+            shown: b.textContent,
+            cut: b.querySelector("span").scrollWidth > b.querySelector("span").clientWidth + 1,
             units: !document.querySelector("#unitsRow").hidden,
           };
         });
-        assert.deepEqual(fit.names, ["跟隨系統", "English", "简体中文", "繁體中文", "日本語", "Deutsch"]);
-        assert.ok(fit.inside && !fit.sideways, `${width}px: ${JSON.stringify(fit)}`);
-        assert.deepEqual(fit.cut, [], `${width}px`);
-        if (width === 1000) assert.equal(fit.lines, 1);
+        assert.equal(fit.shown, "繁體中文");
+        assert.ok(fit.inside && !fit.sideways && !fit.cut, `${width}px: ${JSON.stringify(fit)}`);
         assert.ok(fit.units, "Number units (萬 / 億) is offered in Traditional Chinese too");
+        await page.locator("#langPick").click();
+        const items = page.locator(".proto-menu .pm-item");
+        await items.first().waitFor();
+        const menu = await items.evaluateAll((bs) => bs.map((b) => { const n = b.querySelector(".pm-name"); return { name: n.textContent, cut: n.scrollWidth > n.clientWidth + 1, inside: b.getBoundingClientRect().right <= innerWidth }; }));
+        assert.deepEqual(menu.map((m) => m.name), ["跟隨系統", "English", "简体中文", "繁體中文", "日本語", "Deutsch"]);
+        assert.ok(menu.every((m) => !m.cut && m.inside), `${width}px menu: ${JSON.stringify(menu)}`);
         await page.close();
       }
     } finally { await browser.close(); }

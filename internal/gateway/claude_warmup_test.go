@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/testenv"
@@ -110,7 +113,7 @@ func TestClaudeUsageRunsClaudeCode(t *testing.T) {
 	testenv.Program(t, filepath.Join(dir, "claude"), script)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "leaked")
-	got, err := claudeUsage(context.Background())
+	got, err := claudeUsage(context.Background(), "")
 	if err != nil || got != text {
 		t.Fatalf("usage %q %v", got, err)
 	}
@@ -130,7 +133,7 @@ func TestClaudeUsageSendsItsRequest(t *testing.T) {
 	for _, k := range []string{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER"} {
 		t.Setenv(k, "")
 	}
-	if _, err := claudeUsage(context.Background()); err != nil {
+	if _, err := claudeUsage(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(log)
@@ -146,11 +149,31 @@ func TestClaudeUsageSendsItsRequest(t *testing.T) {
 		t.Errorf("warm-up lacks CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:\n%s", b)
 	}
 	t.Setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-	if _, err := claudeUsage(context.Background()); err != nil {
+	if _, err := claudeUsage(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(log); !strings.Contains(string(b), "traffic:1\n") {
 		t.Errorf("/usage run dropped the user's CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:\n%s", b)
+	}
+}
+
+func TestClaudeUsageRunsInSavedAccountDirectory(t *testing.T) {
+	log := fakeWarmClaude(t, `{"type":"result","is_error":false,"result":"Current session: 17% used"}`, 0)
+	t.Setenv("CLAUDE_CONFIG_DIR", "/the/users/own")
+	t.Setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/another/account")
+	got, err := claudeUsage(context.Background(), "/saved/account")
+	if err != nil || got != "Current session: 17% used" {
+		t.Fatalf("usage %q %v", got, err)
+	}
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "dir:/saved/account\n") || !strings.Contains(string(b), "[-p][/usage]") {
+		t.Fatalf("saved account's /usage ran in the wrong directory:\n%s", b)
+	}
+	if os.Getenv("CLAUDE_CONFIG_DIR") != "/the/users/own" || os.Getenv("CLAUDE_SECURESTORAGE_CONFIG_DIR") != "/another/account" {
+		t.Fatal("reading saved usage changed the caller's account directory")
 	}
 }
 
@@ -165,7 +188,7 @@ func TestClaudeVerboseOutput(t *testing.T) {
 		{"type": "result", "subtype": "success", "is_error": false, "result": text},
 	})
 	fakeWarmClaude(t, string(b), 0)
-	got, err := claudeUsage(context.Background())
+	got, err := claudeUsage(context.Background(), "")
 	if err != nil || got != text {
 		t.Fatalf("usage %q %v", got, err)
 	}
@@ -176,5 +199,72 @@ func TestClaudeVerboseOutput(t *testing.T) {
 	fakeWarmClaude(t, string(b), 1)
 	if err := warmClaude(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "Please run /login") || strings.Contains(err.Error(), "init") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// heng91 on #1894: claude processes in Task Manager with no Claude session
+// open. A test or /usage run of Claude Code that outlives its time is
+// killed, and what it started goes with it: npm's claude.cmd is cmd.exe
+// running node, and only cmd.exe was killed. A script stands in, which
+// starts a child and hangs; once the run is given up on, the child is gone.
+func TestClaudeRunEndsWhatItStarted(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script stands in for Claude Code")
+	}
+	for _, run := range []struct {
+		name string
+		f    func(ctx context.Context) error
+	}{
+		{"test", func(ctx context.Context) error { return askClaude(ctx, "", "haiku") }},
+		{"usage", func(ctx context.Context) error { _, err := claudeUsage(ctx, ""); return err }},
+	} {
+		t.Run(run.name, func(t *testing.T) {
+			dir := t.TempDir()
+			pidFile := filepath.Join(dir, "child")
+			testenv.Program(t, filepath.Join(dir, "claude"), "#!/bin/sh\nsleep 300 </dev/null >/dev/null 2>&1 &\necho $! > "+pidFile+"\nsleep 300\n")
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			var pid int
+			t.Cleanup(func() {
+				if pid > 0 {
+					if p, err := os.FindProcess(pid); err == nil {
+						p.Kill()
+					}
+				}
+			})
+			// given up on once it has started its child, however busy the
+			// machine: a timeout that came first had nothing to leave behind
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			go func() {
+				for ctx.Err() == nil {
+					if b, _ := os.ReadFile(pidFile); strings.HasSuffix(string(b), "\n") {
+						cancel()
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}()
+			if err := run.f(ctx); err == nil {
+				t.Fatal("a run that never answered passed")
+			}
+			b, err := os.ReadFile(pidFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+			if pid <= 0 {
+				t.Fatalf("pid %q", b)
+			}
+			// gone, or a zombie waiting for init to reap it
+			for end := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+				out, _ := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+				if st := strings.TrimSpace(string(out)); st == "" || strings.HasPrefix(st, "Z") {
+					break
+				}
+				if time.Now().After(end) {
+					t.Fatalf("what Claude Code started is still running (%d)", pid)
+				}
+			}
+		})
 	}
 }

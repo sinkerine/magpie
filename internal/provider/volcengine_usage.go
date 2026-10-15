@@ -89,7 +89,9 @@ func volcRegion(host string) string {
 
 // volcPlanQuotas is a card for each Volcengine Ark plan a provider in use
 // is on and has the account's AccessKey ID and Secret for: one for each
-// access key and plan, named for the first such provider.
+// access key and plan, named for the first such provider. A plan no
+// provider on it has the access key for is a card that says so
+// (accessKeyCard, #1821): it was left out with nothing said.
 func volcPlanQuotas(ctx context.Context) []SubscriptionQuota {
 	type job struct {
 		p                    Provider
@@ -97,16 +99,34 @@ func volcPlanQuotas(ctx context.Context) []SubscriptionQuota {
 	}
 	seen := map[string]bool{}
 	var jobs []job
+	keyed := map[string]bool{} // the plans a provider has the access key for
+	var keyless []job
 	for _, p := range All() {
-		if p.Hidden || p.Off || p.AccessKeyID == "" || p.SecretAccessKey == "" {
+		if p.Hidden || p.Off {
 			continue
 		}
 		action, plan, region, ok := volcPlanOf(p)
-		if !ok || seen[p.AccessKeyID+" "+action] || !wantsCard(ctx, p.ID, "") {
+		if !ok {
+			continue
+		}
+		if p.AccessKeyID == "" || p.SecretAccessKey == "" {
+			keyless = append(keyless, job{p, action, plan, region})
+			continue
+		}
+		keyed[action] = true
+		if seen[p.AccessKeyID+" "+action] || !wantsCard(ctx, p.ID, "") {
 			continue
 		}
 		seen[p.AccessKeyID+" "+action] = true
 		jobs = append(jobs, job{p, action, plan, region})
+	}
+	var missing []SubscriptionQuota
+	for _, j := range keyless {
+		if keyed[j.action] || seen["none "+j.action] || !wantsCard(ctx, j.p.ID, "") {
+			continue
+		}
+		seen["none "+j.action] = true
+		missing = append(missing, accessKeyCard(j.p, j.plan))
 	}
 	out := make([]SubscriptionQuota, len(jobs))
 	var wg sync.WaitGroup
@@ -120,7 +140,7 @@ func volcPlanQuotas(ctx context.Context) []SubscriptionQuota {
 		}()
 	}
 	wg.Wait()
-	return out
+	return append(out, missing...)
 }
 
 // volcPlanQuota is p's plan as a card, read with its access key.

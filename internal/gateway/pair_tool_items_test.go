@@ -108,3 +108,79 @@ func TestResponsesRelayAnswersALoneCall(t *testing.T) {
 		t.Fatalf("the lone call went unanswered: %s", f.got)
 	}
 }
+
+// A client left with a call no result answers is mended on the way into
+// Responses as it is into Chat and Messages, and as the Responses relay
+// mends its own: the OpenAI Responses API refuses the lone call with 400
+// "No tool output found for function call <id>", and the refusal went back
+// to a Chat or Messages client as it came.
+func TestTranslatedToResponsesAnswersALoneCall(t *testing.T) {
+	f := &fake{t: t, reply: sse(`data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}`)}
+	setup(t, provider.Responses, f)
+	chat := `{"model":"fake/m1","stream":true,"messages":[` +
+		`{"role":"user","content":"run it"},` +
+		`{"role":"assistant","tool_calls":[{"id":"call_a","type":"function","function":{"name":"echo","arguments":"{}"}}]},` +
+		`{"role":"user","content":"go on"}]}`
+	if code, out := post(t, "/v1/chat/completions", chat); code != 200 {
+		t.Fatalf("status %d: %s", code, out)
+	}
+	in := inputOf(t, f.got)
+	answered := false
+	for _, it := range in {
+		if it["type"] == "function_call_output" && it["call_id"] == "call_a" {
+			answered = true
+		}
+	}
+	if !answered {
+		t.Fatalf("a Chat client's lone call went unanswered into Responses: %s", f.got)
+	}
+
+	f = &fake{t: t, reply: sse(`data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}`)}
+	setup(t, provider.Responses, f)
+	messages := `{"model":"fake/m1","stream":true,"max_tokens":16,"messages":[` +
+		`{"role":"user","content":"run it"},` +
+		`{"role":"assistant","content":[{"type":"tool_use","id":"call_a","name":"echo","input":{}}]},` +
+		`{"role":"user","content":"go on"}]}`
+	if code, out := post(t, "/v1/messages", messages); code != 200 {
+		t.Fatalf("status %d: %s", code, out)
+	}
+	in = inputOf(t, f.got)
+	answered = false
+	for _, it := range in {
+		if it["type"] == "function_call_output" && it["call_id"] == "call_a" {
+			answered = true
+		}
+	}
+	if !answered {
+		t.Fatalf("a Messages client's lone call went unanswered into Responses: %s", f.got)
+	}
+}
+
+// A well-formed exchange a Chat client sent goes into Responses as it was
+// built: no second answer of its own and no synthetic one beside a call
+// the input answers.
+func TestTranslatedToResponsesKeepsAPairedExchange(t *testing.T) {
+	f := &fake{t: t, reply: sse(`data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}`)}
+	setup(t, provider.Responses, f)
+	chat := `{"model":"fake/m1","stream":true,"messages":[` +
+		`{"role":"user","content":"run it"},` +
+		`{"role":"assistant","tool_calls":[{"id":"call_a","type":"function","function":{"name":"echo","arguments":"{}"}}]},` +
+		`{"role":"tool","tool_call_id":"call_a","content":"ok"},` +
+		`{"role":"user","content":"go on"}]}`
+	if code, out := post(t, "/v1/chat/completions", chat); code != 200 {
+		t.Fatalf("status %d: %s", code, out)
+	}
+	in := inputOf(t, f.got)
+	outputs := 0
+	for _, it := range in {
+		if it["type"] == "function_call_output" {
+			outputs++
+			if it["call_id"] != "call_a" || it["output"] != "ok" {
+				t.Fatalf("the client's answer was changed: %v", it)
+			}
+		}
+	}
+	if outputs != 1 {
+		t.Fatalf("%d outputs for a paired exchange: %s", outputs, f.got)
+	}
+}

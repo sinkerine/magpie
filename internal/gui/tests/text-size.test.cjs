@@ -140,8 +140,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal((await page.locator("#textSizeRow .name").textContent()).trim(), name);
         assert.deepEqual((await segs.allTextContents()).map((s) => s.trim()), ["100%", "110%", "125%", "150%"]);
         assert.equal(await segs.nth(0).evaluate((b) => b.classList.contains("on")), true, "100% starts picked");
-        const sub = await page.locator("#textSizeSub").textContent();
-        assert(sub.includes(mod === "Meta" ? "⌘0" : "Ctrl+0"), sub);
+        // the name alone (1ooogle on X), the keys in the choices' tooltip
+        assert.equal(await page.locator("#textSizeRow .sub").count(), 0);
+        const tip = await page.locator("#textSizeSegs").getAttribute("title");
+        assert(tip.includes(mod === "Meta" ? "⌘0" : "Ctrl+0"), tip);
 
         // scrolled a little (a real wheel), picking 125% moves nothing
         await page.locator("#textSizeSegs").hover();

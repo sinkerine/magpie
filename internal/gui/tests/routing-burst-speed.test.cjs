@@ -81,15 +81,38 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       const story = async (i) => {
         const row = page.locator(".rt-req").nth(i);
-        // Taller metric rows need the list scrolled first, with real input
-        // so the page's script-scroll protection keeps the same position.
-        const rb = await row.boundingBox(), lb = await page.locator(".rt-reqs").boundingBox();
-        if (rb.y + rb.height > lb.y + lb.height) {
-          await page.locator(".rt-reqs").hover();
-          await page.mouse.wheel(0, rb.y + rb.height - lb.y - lb.height + 6);
+        // Taller metric rows need the list, and the view under it, scrolled
+        // first, with real input so the page's script-scroll protection
+        // keeps the same position. The wheel turns over a point already in
+        // sight: hover() would scroll the list into view by script, which
+        // the day's click holds back, and only a wheel within 50 ms of that
+        // gives it back, so on a loaded machine the click then scrolled the
+        // row into view and moved the page.
+        for (let n = 0; n < 4; n++) {
+          const [rb, lb, vb, high] = await row.evaluate((e) => [...[e, e.closest(".rt-reqs"), e.closest(".view")].map((x) => x.getBoundingClientRect().toJSON()), innerHeight]);
+          const bottom = Math.min(lb.bottom, vb.bottom, high);
+          if (rb.bottom <= bottom) break;
+          // a row below the list's end scrolls the list, over its part in
+          // sight; a list ending below the window scrolls the view, over
+          // its head
+          if (rb.bottom > lb.bottom) await page.mouse.move(lb.x + lb.width / 2, (Math.max(lb.top, vb.top) + bottom) / 2);
+          else await page.mouse.move(vb.x + vb.width / 2, vb.top + 8);
+          await page.mouse.wheel(0, rb.bottom - bottom + 6);
           await page.waitForTimeout(200);
         }
-        const was = await row.evaluate((e) => e.getBoundingClientRect().top);
+        // measure once the page holds still: the day's rows arriving grow the
+        // page above the list, and the day button's click is kept in place by
+        // scrolling the view, which can land after the last row is in
+        const was = await row.evaluate(async (e) => {
+          let last = NaN;
+          for (let i = 0; i < 60; i++) {
+            await new Promise((r) => requestAnimationFrame(r));
+            const top = e.getBoundingClientRect().top;
+            if (top === last) return top;
+            last = top;
+          }
+          return last;
+        });
         const scrolled = await page.evaluate(() => [scrollX, scrollY, document.scrollingElement.scrollTop]);
         await row.click();
         await page.waitForTimeout(300);

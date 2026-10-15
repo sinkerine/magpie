@@ -42,6 +42,8 @@ async function serve(route) {
   if (url.pathname === "/api/usage/quotas" || url.pathname === "/api/usage/quotas/history" || url.pathname === "/api/agents/install") return json([]);
   if (url.pathname === "/api/whatsnew") return json({});
   if (url.pathname === "/api/upstream") return json({ vendors: [], providers: {} });
+  // the sidebar's gateway line, when no page has read the providers
+  if (url.pathname === "/api/providers") return json({ providers: [], gateway: { url: "http://127.0.0.1:3425", running: true } });
   assert(!url.pathname.startsWith("/api/"), "Unexpected API: " + url.pathname);
   const file = path.join(assets, url.pathname === "/" ? "index.html" : url.pathname);
   const contentType = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" }[path.extname(file)];
@@ -61,6 +63,9 @@ async function scrolled(page, selector) {
 async function scrollMenu(page, selector, gesture) {
   const box = page.locator(selector);
   assert(await box.evaluate(e => e.scrollHeight > e.clientHeight), "the fixture must overflow");
+  // the menu's opening come to rest first: a click on its scrollbar's track
+  // while it still moved landed nowhere, now and then (both engines)
+  await page.evaluate(() => Promise.all(document.getAnimations().map(a => a.finished.catch(() => {}))));
   const r = await box.boundingBox();
   if (gesture === "wheel") {
     await page.mouse.move(r.x + r.width / 2, r.y + r.height / 2);

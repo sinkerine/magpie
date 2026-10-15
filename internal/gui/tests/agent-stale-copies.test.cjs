@@ -138,3 +138,57 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     }
   }
 }
+
+// luci on Discord (Codex 0.162): every new codex showed Codex's own models
+// after Codex was wired in, since the daemon they attach to had the list
+// from before. magpie restarts it itself while no codex session is on it;
+// with one on, the daemon's line has a Restart, which restarts it, and
+// the row as it is after takes the line away. Only the daemon's line has
+// it. Every language, both widths.
+const restarted = { en: "Codex's background service restarted", zh: "Codex 的后台服务已重启", "zh-TW": "Codex 的後臺服務已重啟", ja: "Codex のバックグラウンドサービスを再起動しました", de: "Hintergrunddienst von Codex neu gestartet" };
+const restartSays = { en: "Restart", zh: "重启", "zh-TW": "重啟", ja: "再起動", de: "Neu starten" };
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    for (const width of [980, 440]) {
+      test(`${engine} ${lang} ${width}px: the daemon's line restarts it`, async (t) => {
+        const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+        t.after(() => browser.close());
+        const page = await browser.newPage({ viewport: { width, height: 800 } });
+        page.setDefaultTimeout(5000);
+        const errors = [];
+        page.on("pageerror", (e) => errors.push(e.message));
+        let agent = { ...codex, stale: 2, staleCopies: [{ kind: "app", since: days(3) }, { kind: "daemon", since: days(1) }] };
+        const asked = [];
+        const fake = serve(lang);
+        await page.route("**/*", async (route) => {
+          const url = new URL(route.request().url());
+          if (url.pathname === "/api/codex/daemon/restart") {
+            asked.push(route.request().method());
+            agent = { ...agent, stale: 1, staleCopies: [agent.staleCopies[0]] };
+            return route.fulfill({ json: { providers: [], presets: [], excluded: [], gateway: { running: true, window: true } } });
+          }
+          if (url.pathname === "/api/state") return route.fulfill({ json: { agents: [agent], profiles: [], settings: { lang, theme: "light" } } });
+          return fake(route);
+        });
+        await page.goto("http://magpie.test/?view=agents");
+        await page.locator(`${row} .ag-conn`).waitFor();
+        await page.locator(`${row} .ag-link`).click();
+        const copies = page.locator(`${row} .ag-stale-copy`);
+        await copies.first().waitFor();
+        assert.equal(await copies.nth(0).locator("button").count(), 0, "the app's line has no Restart");
+        const go = copies.nth(1).locator("button");
+        assert.equal((await go.textContent()).trim(), restartSays[lang]);
+        // in the line, inside the window
+        const box = await go.boundingBox();
+        assert.ok(box.x + box.width <= width, "past the window");
+        await go.click();
+        await page.waitForFunction((r) => document.querySelectorAll(r + " .ag-stale-copy").length === 1, row);
+        assert.deepEqual(asked, ["POST"]);
+        assert.equal(await page.locator("#status").textContent(), restarted[lang]);
+        assert.equal(await page.locator(`${row} .ag-stale-copy button`).count(), 0);
+        if (process.env.ARTIFACT_DIR) await page.locator(row).screenshot({ path: path.join(process.env.ARTIFACT_DIR, `daemon-restart-${engine}-${lang}-${width}.png`) });
+        assert.deepEqual(errors, []);
+      });
+    }
+  }
+}

@@ -7,13 +7,13 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
+const { strings } = require("./strings.cjs");
 const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
 
 test("de has every zh string, with its placeholders and tags", async () => {
-  const src = await fs.readFile(path.join(assets, "i18n.js"), "utf8");
-  const I18N = new Function(src.slice(0, src.indexOf("\n};") + 3) + "; return I18N;")();
+  const { I18N } = strings(); // i18n.js's and the plugins'
   const zh = Object.keys(I18N.zh), de = I18N.de;
   assert.deepEqual(zh.filter((k) => !(k in de)), [], "missing in de");
   assert.deepEqual(Object.keys(de).filter((k) => !(k in I18N.zh)), [], "de only");
@@ -62,7 +62,7 @@ for (const [name, engine] of [["webkit", webkit], ["chromium", chromium]]) {
         assert.ok(got.offered.includes("de:Deutsch"));
         if (want === "de") {
           assert.equal(got.lang, "de-DE");
-          assert.deepEqual(got.nav, ["Agenten", "Anbieter", "Zugangspunkt", "Weiterleitung", "Nutzung"]);
+          assert.deepEqual(got.nav, ["Agenten", "Sitzungen", "Bibliothek", "Anbieter", "Weiterleitung"]);
         }
         await page.close();
       }

@@ -16,16 +16,18 @@ package provider
 //
 // A group's member may be another group ("group/<id>"): to the group it is
 // one member, which a rule can put first like a model; its models are its
-// own group's, ordered by its own routing and rules. A group can't be in
-// itself, however deep: SaveGroup refuses the loop, and one written into
-// providers.json by hand is cut where it closes.
+// own group's, ordered by its own routing, rules and Sink. A group can't
+// be in itself, however deep: SaveGroup refuses the loop, and one written
+// into providers.json by hand is cut where it closes.
 
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/settings"
@@ -44,13 +46,20 @@ func GroupIDOf(ref string) (string, bool) {
 // Affinities are how long a conversation stays with the key or account that
 // answered it: "" auto, as long as what the vendor cached of it is worth
 // keeping; for the whole session; within a turn only, free to move when
-// the user speaks again; or never.
-var Affinities = []string{"", AffinitySession, AffinityTurn, AffinityOff}
+// the user speaks again; never; or strictly: for the whole session, never
+// moved to another key or account however it answers (#1797).
+var Affinities = []string{"", AffinitySession, AffinityTurn, AffinityOff, AffinityStrict}
 
 const (
 	AffinitySession = "session"
 	AffinityTurn    = "turn"
 	AffinityOff     = "off"
+	// AffinityStrict keeps a conversation on the key or account that
+	// answered it whatever happens: resting, all but used up or past the
+	// usage cap set on it, it is still the one asked, and its error goes
+	// to the agent rather than the conversation to another. A usage cap
+	// still keeps new conversations off it.
+	AffinityStrict = "strict"
 )
 
 // EffortAuto is a group whose classifier picks each turn's reasoning
@@ -58,8 +67,11 @@ const (
 const EffortAuto = "auto"
 
 // Ruled reports whether the group decides anything as a user's turn
-// begins: a rule to put a member first, or the turn's effort.
-func (g Group) Ruled() bool { return len(g.Rules) > 0 || g.Effort == EffortAuto }
+// begins: a rule to put a member first, or the turn's effort. A pause
+// rule decides nothing then (PausedOut is looked at on every request).
+func (g Group) Ruled() bool {
+	return slices.ContainsFunc(g.Rules, func(r Rule) bool { return !r.Pause }) || g.Effort == EffortAuto
+}
 
 // Manual is a group's routing when the user picks which member it uses,
 // as CC Switch has one provider on at a time (#317): every request goes to
@@ -104,11 +116,32 @@ func (g Group) Live() Group {
 	return g
 }
 
-// Group is a routing group.
+// PatienceOff, PatienceDefault and PatienceLongest are a group's
+// Patience: none, the seconds a group waits that hasn't set it, and the
+// most it may.
+const (
+	PatienceOff     = -1
+	PatienceDefault = 60
+	PatienceLongest = 240
+)
+
+// Waits is how long a request to the group may be kept for its members to
+// come back (Patience), 0 for not at all.
+func (g Group) Waits() time.Duration {
+	switch {
+	case g.Patience < 0:
+		return 0
+	case g.Patience == 0:
+		return PatienceDefault * time.Second
+	}
+	return time.Duration(min(g.Patience, PatienceLongest)) * time.Second
+}
+
 // ContextSmallest is a group's Context when agents are told the window of
 // its smallest member.
 const ContextSmallest = -1
 
+// Group is a routing group.
 type Group struct {
 	ID      string   `json:"id"`
 	Name    string   `json:"name"`
@@ -134,6 +167,14 @@ type Group struct {
 	// waits as long as it takes. The last one left is always waited for,
 	// and the slow one doesn't rest.
 	FirstToken int `json:"firstToken,omitempty"`
+	// Patience is how many seconds more a request may be kept, once every
+	// member has failed and nothing of a reply has been sent, for the
+	// members that failed in a way that passes —
+	// busy, overloaded, rate limited for a moment — to be asked again
+	// after a pause, in turn, until one answers (#1418). 0 is
+	// PatienceDefault; PatienceOff gives the agent the last one's error
+	// once each has been asked.
+	Patience int `json:"patience,omitempty"`
 	// Off are the members switched off: kept where they are in the
 	// order, with their rules, but sent nothing until switched on again,
 	// so trying a group without one doesn't mean taking it out.
@@ -174,9 +215,22 @@ type Group struct {
 	// beside Members, not in their ids, so a version before it still
 	// routes to them, only not fast.
 	Fast []string `json:"fast,omitempty"`
+	// Weights are the members' shares (as Members spells them) when the
+	// group routes by weight (Weighted, #1910): one weighing 3 takes three
+	// requests for every one a member weighing 1 takes. One not in it
+	// weighs 1. Kept while the group routes otherwise, for when it is by
+	// weight again.
+	Weights map[string]int `json:"weights,omitempty"`
 	// Family is a tag the group goes by in which agents are shown it
 	// (settings' Visible), with its id.
 	Family string `json:"family,omitempty"`
+	// Unlists keeps the models the group names, or its patterns match,
+	// out of the lists agents and the gateway's model list show (#1783):
+	// they are offered through the group alone, as a provider kept for
+	// routing groups offers its own (Provider.Unlisted), and a request
+	// naming one is still served. A group in it keeps its own, as it
+	// says. Not while the group is switched off.
+	Unlists bool `json:"unlists,omitempty"`
 	// Auto is set on a group magpie found: one model served by several
 	// providers. It is derived, never stored.
 	Auto bool `json:"auto,omitempty"`
@@ -257,7 +311,10 @@ func groupsIn(entries []Entry) []Group {
 			}
 			g = withoutRemoved(g, have)
 		}
-		out = append(out, withMatches(entries, g))
+		out = append(out, withMatches(entries, g.own()))
+	}
+	if !served(f.Groups) { // plugins/groups is off: the user's own aren't served
+		out = slices.DeleteFunc(out, func(g Group) bool { return !g.Auto })
 	}
 	if f.NoAutoGroups {
 		return orderedGroups(out, f.GroupOrder)
@@ -303,6 +360,39 @@ func withoutRemoved(g Group, have map[string]bool) Group {
 	g.Members = kept
 	g.Off = slices.DeleteFunc(slices.Clone(g.Off), gone)
 	g.Fast = slices.DeleteFunc(slices.Clone(g.Fast), gone)
+	g.Weights = renamedWeights(g.Weights, func(m string) string {
+		if gone(m) {
+			return ""
+		}
+		return m
+	})
+	return g
+}
+
+// own is the group with lists of its own. f.Groups is the providers.json
+// every look-up shares while a request holds the catalog (heldOf), so a
+// caller changing its group in place — the TUI deleting a rule, SaveGroup
+// cleaning one — would change it for every reader in that while, and keep
+// the change there when the save failed.
+func (g Group) own() Group {
+	g.Members = slices.Clone(g.Members)
+	g.Match = slices.Clone(g.Match)
+	g.Matched = slices.Clone(g.Matched)
+	g.Off = slices.Clone(g.Off)
+	g.Levels = slices.Clone(g.Levels)
+	g.Fast = slices.Clone(g.Fast)
+	g.Weights = maps.Clone(g.Weights)
+	g.Rules = slices.Clone(g.Rules)
+	for i, r := range g.Rules {
+		g.Rules[i].Agents = slices.Clone(r.Agents)
+		g.Rules[i].Folders = slices.Clone(r.Folders)
+		g.Rules[i].ExceptFolders = slices.Clone(r.ExceptFolders)
+		if r.Time != nil {
+			w := *r.Time
+			w.Days = slices.Clone(w.Days)
+			g.Rules[i].Time = &w
+		}
+	}
 	return g
 }
 
@@ -524,7 +614,11 @@ func GroupFor(id string) (string, bool) {
 	if id == "" || strings.Contains(id, "/") {
 		return "", false
 	}
-	all := Groups()
+	return groupForIn(Groups(), id)
+}
+
+// groupForIn is GroupFor over the groups all, read once for many ids.
+func groupForIn(all []Group, id string) (string, bool) {
 	k := Slug(sameModel(id))
 	for _, gid := range []string{strings.ToLower(id), k, "auto-" + k} {
 		if g, ok := groupOf(all, gid); ok {
@@ -611,6 +705,11 @@ func groupOf(all []Group, id string) (Group, bool) {
 // member — and a group that would be in itself is cut there. A manual
 // group has only the member picked (see Manual), however deep.
 func membersIn(entries []Entry, all []Group, g Group) []Member {
+	return membersOff(entries, all, g, disabledNow())
+}
+
+// membersOff is membersIn less the models off reports.
+func membersOff(entries []Entry, all []Group, g Group, off func(pid, model string) bool) []Member {
 	var out []Member
 	seen := map[string]bool{}
 	var walk func(g Group, path []string, via []Group, in []string)
@@ -631,6 +730,9 @@ func membersIn(entries []Entry, all []Group, g Group) []Member {
 			if !ok || seen[key] {
 				continue
 			}
+			if off(p.ID, m) {
+				continue // the user turned it off (#1867): a group never reaches it
+			}
 			seen[key] = true
 			out = append(out, Member{ID: at[0], Path: at, Via: via, Provider: p, Model: m, Effort: effort, Fast: g.IsFast(id)})
 		}
@@ -647,8 +749,9 @@ func membersIn(entries []Entry, all []Group, g Group) []Member {
 // levels the members have in common, as before, but for those fixed at
 // an effort of their own, which take whatever the agent asks, and those
 // whose levels nothing magpie reads knows (levelsUnknown), which are
-// sent it as asked, and those that think with no levels to pick from,
-// which are sent it as asked up to high (the gateway's fitFor). With
+// sent it as asked, those that think with no levels to pick from,
+// which are sent it as asked up to high (the gateway's fitFor), and those
+// known not to think, which are sent no reasoning ask (Quiet). With
 // every member fixed, the group offers the levels they are fixed at, so
 // that an agent still asks it to reason. A group that names its own
 // levels (Group.Levels) offers those, and so does a group in it for its
@@ -661,8 +764,8 @@ func groupEntries(entries []Entry) []Entry {
 			continue
 		}
 		ms := membersIn(entries, all, g)
-		if len(ms) == 0 {
-			continue
+		if len(ms) == 0 || DecisionGroup(ms) {
+			continue // a decision group answers System One, no agent's conversation
 		}
 		e := Entry{ID: GroupPrefix + g.ID, Model: ms[0].Model, Name: g.Name, Provider: ms[0].Provider, Group: g.ID, Named: !g.Auto}
 		var fixed []string // the efforts members are fixed at
@@ -674,7 +777,6 @@ func groupEntries(entries []Entry) []Entry {
 		// gateway sends max to the members that have no ultra
 		ultra := false
 		chatgpt := false // a ChatGPT account answers for a member
-		smallest := 0    // the smallest window a member is known to have
 		for i, m := range ms {
 			chatgpt = chatgpt || m.Provider.Account != nil && m.Provider.Account.Agent == "codex"
 			if !slices.ContainsFunc(ms[:i], func(o Member) bool { return o.Provider.ID == m.Provider.ID }) {
@@ -683,11 +785,11 @@ func groupEntries(entries []Entry) []Entry {
 			var efforts []string
 			images, thinks, ctx, output := false, false, 0, 0
 			var imageInput *bool
-			unknown := false
+			unknown, reasonless := false, false
 			for _, x := range entries {
 				if x.Provider.ID == m.Provider.ID && x.Model == m.Model {
 					efforts, images, thinks, ctx, output, imageInput = x.Efforts, x.Images, x.Reasoning, x.Context, x.Output, x.ImageInput
-					unknown = levelsUnknown(x)
+					unknown, reasonless = levelsUnknown(x), x.Reasonless
 				}
 			}
 			// it reasons when a member does: the gateway sends the
@@ -695,10 +797,8 @@ func groupEntries(entries []Entry) []Entry {
 			// to think is sent none of it, as a text-only member is sent
 			// no image (#756's rule for images, applied to reasoning).
 			// One that doesn't think is no reason to tell the agent the
-			// group can't. Which levels the group offers is left as it
-			// was: a member known to take none still leaves the group
-			// none (#597), and the group is then Levelless, a shape
-			// magpie serves
+			// group can't, nor does it take the others' levels away
+			// (below)
 			e.Reasoning = e.Reasoning || thinks
 			// the reply agents are told is the longest a member gives: the
 			// gateway asks each member for no more than its own
@@ -724,9 +824,6 @@ func groupEntries(entries []Entry) []Entry {
 			if ctx > e.Context {
 				e.Context = ctx
 			}
-			if ctx > 0 && (smallest == 0 || ctx < smallest) {
-				smallest = ctx
-			}
 			if i == 0 {
 				e.ImageInput = imageInput
 			} else {
@@ -736,6 +833,12 @@ func groupEntries(entries []Entry) []Entry {
 			// its models (the outermost that does)
 			if i := slices.IndexFunc(m.Via, func(v Group) bool { return len(v.Levels) > 0 }); i >= 0 {
 				efforts = m.Via[i].Levels
+			} else if reasonless {
+				// the user said it takes no reasoning ask: the gateway sends
+				// it none, whatever the agent asks, so it doesn't take the
+				// others' levels away (yuexian7 on Discord: a group of
+				// Opus and a model that answers reasoning_effort with 422)
+				continue
 			} else if m.Effort != "" {
 				if !slices.Contains(fixed, m.Effort) {
 					fixed = append(fixed, m.Effort)
@@ -758,6 +861,14 @@ func groupEntries(entries []Entry) []Entry {
 				// had none, and dsh offered no thinking for it (ARNO on
 				// Discord: routing group 在接入 harness 的时候，没有设置
 				// reasoning_efforts)
+				continue
+			} else if len(efforts) == 0 {
+				// it is known not to think (Quiet): the gateway sends it no
+				// reasoning ask (quiet.go, #950), so it doesn't take the
+				// others' levels away either. It left the group none, and a
+				// group that reasons with none to pick from is a model Codex
+				// offers no effort control for, at its own medium (#2127:
+				// a 高性能 group's sessions and subagents ran at medium)
 				continue
 			}
 			ultra = ultra || slices.Contains(efforts, "ultra")
@@ -786,14 +897,41 @@ func groupEntries(entries []Entry) []Entry {
 		}
 		ruledEntry(&e, g.Live(), ms, entries)
 		if g.Context > 0 {
-			e.Context = g.Context
-		} else if g.Context == ContextSmallest && smallest > 0 {
-			e.Context = smallest
+			e.Context, e.WindowSet = g.Context, true
+		} else if smallest, typed := smallestWindow(entries, ms); g.Context == ContextSmallest && smallest > 0 {
+			e.Context, e.WindowSet = smallest, typed
 		}
 		e.Family = g.Family
 		out = append(out, e)
 	}
 	return out
+}
+
+// smallestWindow is the smallest window a member of ms is known to have
+// (0 when none is), and whether the user typed it, on the member's
+// provider for its model or all of its models. A group told its
+// smallest member's window is then told one the user typed (#2224: a
+// group following its smallest member, a 500K the user set on it, was
+// handed to Claude Desktop and Codex as magpie's default 272K, which a
+// group set to 500K itself wasn't). A tie counts as typed: the window is
+// the user's either way.
+func smallestWindow(entries []Entry, ms []Member) (n int, typed bool) {
+	for _, m := range ms {
+		ctx, set := 0, false
+		for _, x := range entries {
+			if x.Provider.ID == m.Provider.ID && x.Model == m.Model {
+				ctx, set = x.Context, x.WindowSet
+			}
+		}
+		switch {
+		case ctx <= 0:
+		case n == 0 || ctx < n:
+			n, typed = ctx, set
+		case ctx == n:
+			typed = typed || set
+		}
+	}
+	return n, typed
 }
 
 // levelsUnknown reports whether nothing magpie reads says which reasoning
@@ -824,12 +962,13 @@ func levelsUnknown(x Entry) bool {
 // but for one the user fixed at an effort (Group's member syntax, #189):
 // the gateway leaves that alone, the user's word over magpie's.
 func (e Entry) Quiet() bool {
-	return !e.Reasoning && len(e.Efforts) == 0 && !levelsUnknown(e)
+	return e.Reasonless || !e.Reasoning && len(e.Efforts) == 0 && !levelsUnknown(e)
 }
 
 // SaveGroup adds or replaces a group of the user's. Changing one magpie
 // found makes it the user's.
 func SaveGroup(g Group) error {
+	g = g.own() // cleaned below in place: the caller's lists stay as they were
 	g.ID = strings.ToLower(strings.TrimSpace(g.ID))
 	g.Name = strings.TrimSpace(g.Name)
 	if g.ID == "" {
@@ -842,6 +981,10 @@ func SaveGroup(g Group) error {
 		g.Name = g.ID
 	}
 	g.FirstToken = max(g.FirstToken, 0)
+	if g.Patience < 0 {
+		g.Patience = PatienceOff
+	}
+	g.Patience = min(g.Patience, PatienceLongest)
 	if g.Context < 0 {
 		g.Context = ContextSmallest
 	}
@@ -884,6 +1027,9 @@ func SaveGroup(g Group) error {
 		}
 	}
 	g.Off = off
+	if err := cleanWeights(entries, &g); err != nil {
+		return err
+	}
 	if g.Routing != Manual && len(g.Members) > 0 && len(g.Off) == len(g.Members) {
 		return fmt.Errorf("every model in %s is switched off: switch one on, or it has nothing to send to", g.Name)
 	}
@@ -893,12 +1039,12 @@ func SaveGroup(g Group) error {
 	if err := groupsInGroup(g, groupsIn(entries)); err != nil {
 		return err
 	}
-	for _, m := range g.Members {
-		if IsDecider(m) {
-			return fmt.Errorf("%s decides a group's model and effort; it holds no conversation, so it can only be the group's classifier", m)
-		}
+	// decision models make a group of their own, asked at /v1/systemone,
+	// never one with models that hold conversations (decide_group.go)
+	if err := cleanDecisionGroup(&g, groupsIn(entries)); err != nil {
+		return err
 	}
-	if g.Routing != Ordered && g.Routing != Rotate && g.Routing != LeastUsed && g.Routing != Pace && g.Routing != Manual {
+	if g.Routing != Ordered && g.Routing != Rotate && g.Routing != LeastUsed && g.Routing != Pace && g.Routing != Weighted && g.Routing != Manual {
 		g.Routing = ""
 	}
 	if !slices.Contains(Affinities, g.Affinity) {
@@ -1274,6 +1420,12 @@ func RenameGroup(from, to string) error {
 				f.Groups[i].Off[j] = now
 			}
 		}
+		f.Groups[i].Weights = renamedWeights(f.Groups[i].Weights, func(m string) string {
+			if m == old {
+				return now
+			}
+			return m
+		})
 		if f.Groups[i].Classifier == old {
 			f.Groups[i].Classifier = now
 		}

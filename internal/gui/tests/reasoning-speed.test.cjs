@@ -24,22 +24,29 @@ const timing = [
   [2200, 2000, 0, 15500, 14000, 14000], // the turn: 200 in 1.5 s, 133 tok/s
   [1300, 0, 1000, 9000, 6000, 6000],    // an older route: 300 in 3 s, 100 tok/s
   [1500, 1400, 0, 9000, 8000, 0],       // reasoning, then tool calls only: none
-  [500, 0, 0, 7000, 2000, 2000],        // no reasoning: 500 in 5 s, 100 tok/s
+  [500, 0, 0, 7000, 2000, 2000],         // no reasoning: 500 in 5 s, 100 tok/s
+  [1500, 1400, 0, 15000, 1000, 0],      // paced visible reasoning: 107 tok/s
+  [1500, 1400, 0, 9000, 8000, 0],       // a late summary stays untimed
+  [120, 0, 0, 9000, 1000, 0],           // mixed redacted thinking without a reasoning count
 ];
 const routes = timing.map(([out, reasoning, usageReasoning, ms, ttft, firstText], i) => ({
+  ...(i === 4 ? { firstReasoning: 1000, flow: 12000 } : {}),
+  ...(i === 6 ? { reasoningHidden: true, flow: 7000 } : {}),
   id: 100 - i, seq: 100 - i, time: at(i), agent: "codex", session: "think-chat", model: "codex/gpt-6.1-sol", provider: "codex",
   order: [seat], tries: [{ id: seat.id, model: seat.model, start: at(i), done: true, status: 200, ms, ttft, firstText }],
   done: true, status: 200, ms, ttft, firstText, tokens: out + 9000, out, ...(reasoning ? { reasoning } : {}),
   usage: [{ provider: "codex", model: seat.model, in: 9000, out, ...(reasoning || usageReasoning ? { reasoning: reasoning || usageReasoning } : {}) }],
 }));
 const rows = timing.map(([out, reasoning, usageReasoning, ms, ttft, firstText], i) => ({
+  ...(i === 4 ? { first_reasoning_ms: 1000, flow_ms: 12000 } : {}),
+ ...(i === 6 ? { reasoning_hidden: true, flow_ms: 7000 } : {}),
   route_id: 100 - i, t: at(i), agent: "codex", agentName: "Codex", icon: "codex-color", provider: "codex", providerName: "Codex",
   host: "test@example.com", req: "codex/gpt-6.1-sol", model: "gpt-6.1-sol", served: "gpt-6.1-sol", in: 9000, out,
   ...(reasoning || usageReasoning ? { reasoning: reasoning || usageReasoning } : {}), ms, ttft_ms: ttft, ...(firstText ? { first_text_ms: firstText } : {}),
   status: 200, ep: "/backend-api/codex/responses", cost: 0.01, priced: true,
 }));
-// what the server sums: 1000 answer tokens in 9.5 s
-const M = { id: "gpt-6.1-sol", calls: 4, input: 36000, output: 5500, cache_read: 0, cache_write: 0, cost: 0.04, timed: 4, ttft_ms: 30000, decode_ms: 9500, decode_out: 1000 };
+// what the server sums: 1000 answer tokens plus 1500 visible output tokens in 23.5 s
+const M = { id: "gpt-6.1-sol", calls: 7, input: 63000, output: 8620, cache_read: 0, cache_write: 0, cost: 0.04, timed: 4, ttft_ms: 30000, decode_ms: 23500, decode_out: 2500 };
 
 function serve(lang) {
   const state = { agents: [{ id: "codex", name: "Codex", path: "/t/c.toml", icon: "codex-color", fields: [] }], profiles: [], settings: { lang, theme: "light" } };
@@ -71,6 +78,7 @@ function serve(lang) {
 }
 
 const L = {
+  "zh-TW": { s: (n) => `${n} token/秒`, speed: "速度", note: /首個正文後/, rule: /有推理的回覆只算正文部分/ },
   en: { s: (n) => `${n} tok/s`, speed: "Speed", note: /200 answer tokens in 1\.5 s after the first text, the 2,000 reasoning tokens before it left out/, rule: /A reply that reasoned counts only its answer/ },
   zh: { s: (n) => `${n} token/秒`, speed: "速度", note: /首个正文后 1\.5 秒 输出 200 个正文 token，之前的 2,000 个推理 token 不计/, rule: /有推理的回复只算正文部分/ },
   ja: { s: (n) => `${n} トークン/秒`, speed: "速度", note: /回答 200 トークン（その前の推論 2,000 トークンは含めず）/, rule: /推論した応答は/ },
@@ -99,6 +107,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await speedOf(1), w.s(100), "an older route's reasoning is its try's");
       assert.equal(await speedOf(2), "", "tool calls after reasoning tell no speed");
       assert.equal(await speedOf(3), w.s(100), "no reasoning: as before");
+      assert.equal(await speedOf(4), w.s(107), "visible reasoning timed from its first delta");
+      assert.equal(await speedOf(5), "", "late hidden summary stays untimed");
+ assert.equal(await speedOf(6), "", "redacted reasoning stays untimed without a count");
       assert.match(await reqs.nth(0).locator(".speed").getAttribute("title"), w.rule);
       await reqs.nth(0).click();
       await page.waitForTimeout(200);
@@ -107,14 +118,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator(".rt-group-by button").nth(1).click();
       const group = page.locator("button.rt-session").first();
       await group.waitFor();
-      // 1000 answer tokens over 9.5 s of answers, not 4500 over them
-      assert.equal((await group.locator(".speed .v").textContent()).trim(), w.s(105));
+      // Hidden reasoning is excluded; visible reasoning adds its own decode window.
+      assert.equal((await group.locator(".speed .v").textContent()).trim(), w.s(106));
       assert.match(await group.locator(".speed").getAttribute("title"), w.rule);
 
       // the Usage page's requests: each row, its tooltip, and the period's
       await page.goto("http://magpie.test/");
       await page.locator('[data-view="usage"]').first().click();
-      await page.locator("#usageTab .opt").nth(1).click();
+      await page.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
       await page.locator("#ledWrap .led tbody tr").first().waitFor();
       await page.waitForTimeout(300);
       const heads = await page.locator(".led thead th").evaluateAll((ths) => ths.filter((th) => th.offsetParent).map((th) => th.textContent));
@@ -126,8 +137,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal((await cell(1).textContent()).trim(), w.s(100));
       assert.equal((await cell(2).textContent()).trim(), "—");
       assert.equal((await cell(3).textContent()).trim(), w.s(100));
+      assert.equal((await cell(4).textContent()).trim(), w.s(107));
+      assert.equal((await cell(5).textContent()).trim(), "—");
+ assert.equal((await cell(6).textContent()).trim(), "—");
       const kpi = page.locator("#ledKpi .blk").nth(4);
-      assert.equal((await kpi.locator(".v").textContent()).trim(), w.s(105));
+      assert.equal((await kpi.locator(".v").textContent()).trim(), w.s(106));
       assert.match(await kpi.getAttribute("title") || await kpi.locator("[title]").first().getAttribute("title"), w.rule);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "no sideways scroll");
       assert.deepEqual(errors, []);

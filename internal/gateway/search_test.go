@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -193,6 +194,48 @@ func TestWebSearchForAModelThatCannot(t *testing.T) {
 	}
 	if res.Usage.Prompt != 40 || res.Usage.Completion != 12 {
 		t.Fatalf("usage %+v", res.Usage)
+	}
+
+	// Responses clients must receive the delegated search too, including
+	// its sources, without using the Messages endpoint or a search MCP.
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "Responses JSON", true: "Responses SSE"}[stream], func(t *testing.T) {
+			mu.Lock()
+			asked, searched = nil, nil
+			mu.Unlock()
+			body := `{"model":"deep/deep-chat","input":"What is the latest Go?","stream":` + map[bool]string{false: "false", true: "true"}[stream] + `,
+				"tools":[{"type":"function","name":"Read","parameters":{"type":"object"}},{"type":"web_search"}],"include":["web_search_call.action.sources"]}`
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%d %s", rec.Code, rec.Body.String())
+			}
+			var response map[string]any
+			if stream {
+				for _, ev := range events(rec.Body.String()) {
+					if ev["type"] == "response.completed" {
+						response = ev["response"].(map[string]any)
+					}
+				}
+			} else if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			output, _ := response["output"].([]any)
+			if len(output) != 3 || output[1].(map[string]any)["type"] != "web_search_call" {
+				t.Fatalf("delegated search missing from Responses output: %v", output)
+			}
+			item := output[1].(map[string]any)
+			action := item["action"].(map[string]any)
+			sources, _ := action["sources"].([]any)
+			if item["status"] != "completed" || action["type"] != "search" || action["query"] != "latest go" || len(sources) != 1 || sources[0].(map[string]any)["url"] != "https://go.dev/dl/" {
+				t.Fatalf("delegated search lost its query or sources: %v", item)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(asked) != 2 || len(searched) != 1 {
+				t.Fatalf("model rounds=%d provider searches=%d", len(asked), len(searched))
+			}
+		})
 	}
 }
 
@@ -486,5 +529,69 @@ func TestWebSearchOfARelayThatSearches(t *testing.T) {
 		if searchesItself(chat, proto) {
 			t.Errorf("a Chat-only relay searches by itself on %s", proto)
 		}
+	}
+}
+
+// A plugin whose config hook says its upstream searches by itself (#2027),
+// as a plugin in front of Claude's API does, is sent the client's
+// web_search as sent, on Anthropic's API, as a relay said to search is
+// (#359); it is never magpie's searcher for other models, and its Chat
+// models don't search. A plugin that doesn't say so is given magpie's
+// search (none here, so the request goes without the tool).
+func TestPluginSaidToSearch(t *testing.T) {
+	for _, said := range []bool{true, false} {
+		t.Run(map[bool]string{true: "said", false: "not said"}[said], func(t *testing.T) {
+			if said {
+				t.Setenv("FAKE_SEARCHES", "1")
+			}
+			var mu sync.Mutex
+			var tools []string
+			pid := besideFake(t, "fakeco", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				var q struct {
+					Tools []struct {
+						Type string `json:"type"`
+						Name string `json:"name"`
+					} `json:"tools"`
+				}
+				json.Unmarshal(b, &q)
+				mu.Lock()
+				for _, tl := range q.Tools {
+					tools = append(tools, tl.Type+":"+tl.Name)
+				}
+				mu.Unlock()
+				// a plugin's requests are streamed
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, sse(`event: message_start`+"\n"+`data: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"fake-claude","content":[],"usage":{"input_tokens":5}}}`,
+					`event: content_block_start`+"\n"+`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+					`event: content_block_delta`+"\n"+`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Go 1.27.1 is out."}}`,
+					`event: content_block_stop`+"\n"+`data: {"type":"content_block_stop","index":0}`,
+					`event: message_delta`+"\n"+`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}`,
+					`event: message_stop`+"\n"+`data: {"type":"message_stop"}`))
+			}))
+			p, err := provider.Find(pid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := searchesItself(*p, provider.Anthropic); got != said {
+				t.Fatalf("searches by itself on Anthropic: %v", got)
+			}
+			if searchesItself(*p, provider.Chat) || searchRank(*p) >= 0 {
+				t.Fatalf("searches on Chat %v, searcher rank %d", searchesItself(*p, provider.Chat), searchRank(*p))
+			}
+			body := `{"model":"` + pid + `/fake-claude","max_tokens":1000,"stream":false,
+				"messages":[{"role":"user","content":"Perform a web search for the query: latest go"}],
+				"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":8}]}`
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+			if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Go 1.27.1 is out.") {
+				t.Fatalf("%d %s", rec.Code, rec.Body)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if sent := slices.Contains(tools, "web_search_20250305:web_search"); sent != said {
+				t.Fatalf("said to search %v, the plugin was sent %v", said, tools)
+			}
+		})
 	}
 }

@@ -15,6 +15,7 @@ package provider
 // and a run of the same figure is its first and last point only. A cycle
 // ends where the window starts again: its reset passed, or moved further
 // than the time between two readings (a rolling window's moves with it).
+// A fixed deadline's refill also starts a cycle, even if the reset stays.
 // Points older than quotaHistKept go, and a window keeps quotaHistMax.
 //
 // Other computers' points come in through the usage sync (davsync), merged
@@ -35,6 +36,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/filememo"
+	"github.com/yetone/magpie/internal/lastgood"
 )
 
 const (
@@ -107,6 +109,12 @@ func writeQuotaHist(h quotaHist) {
 		return
 	}
 	path := quotaHistPath()
+	// parseQuotaHist reads a file that doesn't parse as no history: it is
+	// kept aside before it is written over, and not written over when it
+	// can't be
+	if lastgood.KeepUnparsed(path, lastgood.Into[quotaHist]) != nil {
+		return
+	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)
 	_ = writeFileAtomic(path, b)
 }
@@ -149,6 +157,13 @@ func newCycle(a, b QuotaPoint) bool {
 		return true
 	}
 	moved := b.ResetsAt.Sub(*a.ResetsAt)
+	// A manual or vendor reset can refill a fixed window without changing
+	// its deadline. Small corrections aren't a refill; a rolling deadline
+	// moving with the reading isn't a fixed window's reset either.
+	rolling := moved > 0 && (moved-b.At.Sub(a.At)).Abs() <= quotaHistSlack
+	if !rolling && moved.Abs() <= quotaHistSlack && b.Left > a.Left+5 {
+		return true
+	}
 	return moved > b.At.Sub(a.At)+quotaHistSlack || moved < -quotaHistSlack
 }
 

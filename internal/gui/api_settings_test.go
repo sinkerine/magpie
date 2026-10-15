@@ -11,6 +11,26 @@ import (
 	"github.com/yetone/magpie/internal/settings"
 )
 
+func TestSettingsSearchProviderOff(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	h := Handler(nil, nil)
+	for _, body := range []string{`{"searcher":"off"}`, `{"theme":"dark","searcher":"off"}`} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/api/settings", strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("saving %s: %d %s", body, rec.Code, rec.Body)
+		}
+		if got := settings.Load().Searcher; got != "off" {
+			t.Fatalf("searcher = %q, want off", got)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/api/settings", strings.NewReader(`{"searcher":"missing-provider"}`)))
+	if rec.Code != http.StatusBadRequest || settings.Load().Searcher != "off" {
+		t.Fatalf("invalid provider changed the choice: %d %s", rec.Code, rec.Body)
+	}
+}
+
 // The Settings page sends only its own choices. What the settings keep per
 // model — every name, level, price and image answer the user gave of a model
 // on a page of its own — is set elsewhere, so a save from this page has to
@@ -149,4 +169,75 @@ func perModelValue(typ reflect.Type, table string) reflect.Value {
 		return out
 	}
 	return reflect.Zero(typ)
+}
+
+// How often a refused request is asked again (DD on Discord) is set by the
+// Settings page, null for every one left, and kept by a save from a page
+// that doesn't send it.
+func TestSettingsRefusalRetries(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	handler := Handler(nil, nil)
+	for _, x := range []struct {
+		body string
+		want int // -1 for unset
+	}{
+		{`{"theme":"dark","refusalRetries":0}`, 0},
+		{`{"theme":"light"}`, 0},
+		{`{"theme":"light","refusalRetries":2}`, 2},
+		{`{"theme":"light","refusalRetries":null}`, -1},
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest("POST", "/api/settings", strings.NewReader(x.body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", x.body, rec.Code, rec.Body)
+		}
+		got := settings.Load().RefusalRetries
+		if x.want < 0 && got != nil || x.want >= 0 && (got == nil || *got != x.want) {
+			t.Fatalf("%s: refusalRetries %v", x.body, got)
+		}
+	}
+}
+
+func TestSettingsColorblindMode(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	handler := Handler(nil, nil)
+
+	getBoot := func() string {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest("GET", "/boot.js", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /boot.js: %d %s", rec.Code, rec.Body)
+		}
+		return rec.Body.String()
+	}
+	if boot := getBoot(); strings.Contains(boot, `"colorblind":true`) {
+		t.Fatalf("colorblind off by default, got boot.js: %s", boot)
+	}
+
+	for _, tc := range []struct {
+		body string
+		want bool
+	}{
+		{`{"theme":"dark","colorblind":true}`, true},
+		{`{"theme":"dark","colorblind":false}`, false},
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest("POST", "/api/settings", strings.NewReader(tc.body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", tc.body, rec.Code, rec.Body)
+		}
+		if got := settings.Load().Colorblind; got != tc.want {
+			t.Fatalf("%s: Colorblind = %v, want %v", tc.body, got, tc.want)
+		}
+		if boot := getBoot(); strings.Contains(boot, `"colorblind":true`) != tc.want {
+			t.Fatalf("%s: boot.js = %s, want colorblind=%v", tc.body, boot, tc.want)
+		}
+	}
 }

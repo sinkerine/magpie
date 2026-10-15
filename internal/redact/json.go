@@ -26,13 +26,21 @@ func keep(key, s string) bool {
 // keepIn is keep for a request's string at path, with its ids kept too.
 // In a tool call's arguments (args) the keys are the tool's, not the
 // vendor's: a "signature", "name" or "user_id" there holds what the agent
-// wrote, so only an encoded data: value is kept.
-func keepIn(path, key, s string, args []string) bool {
+// wrote, so only an encoded data: value is kept. In what the agent defines
+// for the vendor to check (defs: its tools, their schemas and grammars, the
+// output's schema, the request's settings) only a description is masked:
+// the rest is read by the vendor as structure, and a word masked inside a
+// Lark grammar's rule name ("pd" in update_hunk) left a grammar the vendor
+// turned away with 400 "Invalid lark grammar" (#1911).
+func keepIn(path, key, s string, args, defs []string) bool {
 	if strings.HasPrefix(s, "data:") {
 		return true
 	}
 	if under(path, args) {
 		return false
+	}
+	if under(path, defs) {
+		return key != "description"
 	}
 	return kept[key] || isID(key)
 }
@@ -52,23 +60,29 @@ func isID(key string) bool {
 // Responses' encrypted reasoning.
 var signatureKeys = []string{"signature", "thoughtSignature", "thought_signature", "encrypted_content"}
 
-// scan finds two kinds of objects in body. signed are those a vendor
+// scan finds three kinds of objects in body. signed are those a vendor
 // sealed with a signature: what is in them the vendor wrote and checks, so
 // it goes back exactly as the vendor wrote it. args are a tool call's
 // arguments (Anthropic's tool_use input, Gemini's functionCall args), whose
-// keys are the tool's own; nothing in them counts as sealed.
-func scan(body []byte) (signed, args []string) {
+// keys are the tool's own; nothing in them counts as sealed. defs are what
+// the agent defines for the vendor rather than says to the model
+// (definitions).
+func scan(body []byte) (signed, args, defs []string) {
 	found := false
 	for _, k := range append(signatureKeys, "tool_use", "functionCall", "function_call") {
 		found = found || bytes.Contains(body, []byte(`"`+k+`"`))
 	}
+	for _, k := range defKeys {
+		found = found || bytes.Contains(body, []byte(`"`+k+`"`))
+	}
 	if !found {
-		return nil, nil
+		return nil, nil, nil
 	}
 	var v any
 	if json.Unmarshal(body, &v) != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
+	defs = definitions(v)
 	var visit func(path, key string, v any)
 	visit = func(path, key string, v any) {
 		switch x := v.(type) {
@@ -93,7 +107,59 @@ func scan(body []byte) (signed, args []string) {
 		}
 	}
 	visit("", "", v)
-	return signed, args
+	return signed, args, defs
+}
+
+// defKeys are the request's own keys whose values the agent defines for the
+// vendor to read as structure, in every protocol an agent sends: the tools
+// (Anthropic, Chat Completions, Responses, Gemini) and the choice among
+// them, the output's schema (Chat's response_format, Responses' text,
+// Anthropic's output_format and output_config, Gemini's generationConfig),
+// Responses' reasoning and include.
+var defKeys = []string{
+	"tools", "tool_choice", "functions", "function_call", "toolConfig", "tool_config",
+	"response_format", "text", "reasoning", "include", "output_format", "output_config",
+	"generationConfig", "generation_config",
+}
+
+// defItems are the Responses input items that carry tools: Responses
+// Lite's additional_tools, which Codex sends its tools in in place of the
+// request's tools, and a tool search's output, the tools it found.
+var defItems = map[string]bool{"additional_tools": true, "tool_search_output": true}
+
+// definitions are the paths in a request v at which the agent defines
+// rather than says: the request's own defKeys, and the tools of its
+// defItems. Only where they sit in the protocol counts: a "tools" or
+// "text" key deeper in, in a message or a tool call's arguments, is what
+// the agent or the model wrote.
+func definitions(v any) []string {
+	m, _ := v.(map[string]any)
+	if m == nil {
+		return nil
+	}
+	var defs []string
+	for _, k := range defKeys {
+		if _, ok := m[k]; !ok {
+			continue
+		}
+		if k == "text" {
+			// Responses' text is the output's settings; a prompt's text
+			// (a completion's, a Gemini contents part's) is a string
+			if _, ok := m[k].(map[string]any); !ok {
+				continue
+			}
+		}
+		defs = append(defs, k)
+	}
+	items, _ := m["input"].([]any)
+	for i, it := range items {
+		if im, _ := it.(map[string]any); im != nil {
+			if t, _ := im["type"].(string); defItems[t] {
+				defs = append(defs, join(join("input", strconv.Itoa(i)), "tools"))
+			}
+		}
+	}
+	return defs
 }
 
 // sealed says x is a block the vendor signed: a part with Gemini's thought
@@ -293,7 +359,7 @@ func jsonEscape(s string) string {
 // placeholder: either way the text no longer matched its signature, and
 // Anthropic answers 400 "Invalid `signature` in `thinking` block".
 func MaskJSON(body []byte, o Options) ([]byte, int) {
-	signed, args := scan(body)
+	signed, args, defs := scan(body)
 	total := 0
 	var seen []string // value, placeholder, value, placeholder…
 	put := func(kind, v string) string {
@@ -302,7 +368,7 @@ func MaskJSON(body []byte, o Options) ([]byte, int) {
 		return p
 	}
 	out, ok := walk(body, func(path, key, s string) string {
-		if keepIn(path, key, s, args) || signed != nil && under(path, signed) {
+		if keepIn(path, key, s, args, defs) || signed != nil && under(path, signed) {
 			return s
 		}
 		t, n := mask(s, o, put)
@@ -321,7 +387,7 @@ func MaskJSON(body []byte, o Options) ([]byte, int) {
 		remask = replacerOf(seen)
 	}
 	out, _ = walk(out, func(path, key, s string) string {
-		if keepIn(path, key, s, args) || !under(path, signed) {
+		if keepIn(path, key, s, args, defs) || !under(path, signed) {
 			return s
 		}
 		t := s

@@ -154,6 +154,16 @@ func TestAgentMCPFiles(t *testing.T) {
 			web:   entry{"url": "https://example.com/mcp", "headers": entry{"Authorization": "Bearer x"}},
 			noSSE: true,
 		},
+		{
+			// Grok App's independent home: the same [mcp_servers] tables,
+			// and the route and magpie's channel stay
+			id: "grok-app", file: "grok-app-data/agent-home/config.toml", toml: true,
+			env:   map[string]string{"GROK_APP_HOME": "grok-app-data"},
+			user:  "# mine\n[models]\ndefault = \"deepseek\"\n\n[model.magpie]\nmodel = \"grok/grok-4.7\"\nname = \"magpie\"\n\n[mcp_servers.mine]\ncommand = \"uvx\"\nargs = [\"mine\"]\nenabled = true\n",
+			fs:    entry{"command": "npx", "args": []any{"-y", "@mcp/fs"}, "env": entry{"K": "V"}},
+			web:   entry{"url": "https://example.com/mcp", "headers": entry{"Authorization": "Bearer x"}},
+			noSSE: true,
+		},
 	} {
 		t.Run(c.id+" "+c.file, func(t *testing.T) {
 			h := sandbox(t)
@@ -165,6 +175,9 @@ func TestAgentMCPFiles(t *testing.T) {
 			}
 			p := filepath.Join(h, c.file)
 			write(t, p, c.user)
+			// omp, Cline and CodeBuddy have an install command, so with the
+			// MCP file alone each is gone (#2177): its CLI beside the folder
+			holdCLI(t, h, map[string]string{"omp": "omp", "cline": "cline", "codebuddy": "codebuddy"}[c.id])
 			parse := func() map[string]entry {
 				t.Helper()
 				var doc map[string]any
@@ -269,7 +282,7 @@ func TestAgentMCPFiles(t *testing.T) {
 			if len(got) != 1 || got["mine"] == nil {
 				t.Errorf("after removing:\n%s", read(t, p))
 			}
-			for _, keep := range []string{`"$schema"`, "timeout", "disabled", "enabled", "# mine", `default = "grok-4"`, "A = "} {
+			for _, keep := range []string{`"$schema"`, "timeout", "disabled", "enabled", "# mine", `default = "grok-4"`, `default = "deepseek"`, `model = "grok/grok-4.7"`, "A = "} {
 				if strings.Contains(c.user, keep) && !strings.Contains(read(t, p), keep) {
 					t.Errorf("lost %s:\n%s", keep, read(t, p))
 				}
@@ -284,6 +297,7 @@ func TestAgentMCPFiles(t *testing.T) {
 func TestCodeBuddyMCPFile(t *testing.T) {
 	h := sandbox(t)
 	write(t, filepath.Join(h, ".codebuddy/models.json"), "")
+	holdCLI(t, h, "codebuddy") // the folder alone is gone (#2177)
 	tg := targetByID("codebuddy")
 	if tg == nil || tg.MCP == nil || tg.MCP.Path != filepath.Join(h, ".codebuddy/.mcp.json") {
 		t.Fatalf("with no file: %+v", tg)

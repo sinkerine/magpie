@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 
+	"github.com/yetone/magpie/internal/access"
+	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/mcpauth"
 )
@@ -19,6 +22,25 @@ import (
 
 func init() {
 	mcpauth.Changed = func(string) { _, _ = Sync() }
+	// an agent beyond loopback is given a relayed server with the LAN key
+	// (through), which is the one there is no longer
+	access.LANChanged = func() {
+		if relaysAny() {
+			_, _ = Sync()
+		}
+	}
+}
+
+// relaysAny says whether any of the library's servers is given through the
+// gateway: one magpie is signed in to.
+func relaysAny() bool {
+	mu.Lock()
+	l, err := load()
+	mu.Unlock()
+	if err != nil {
+		return false
+	}
+	return slices.ContainsFunc(l.MCP, func(s *Server) bool { return s.Transport == "http" && mcpauth.SignedIn(s.Name, s.URL) })
 }
 
 // through is the server as an agent that reaches the gateway at base is
@@ -40,6 +62,16 @@ func through(s *Server, base string) *Server {
 			c.Headers = map[string]string{}
 		}
 		c.Headers[k] = v
+	}
+	if k := agent.KeyAt(base); k != gateway.Token {
+		// from another machine (a WSL distro under NAT) the gateway refuses
+		// a call without an enabled key, with a 401 the agent would take
+		// for the server asking it to sign in; the relay drops this
+		// Authorization for magpie's token
+		if c.Headers == nil {
+			c.Headers = map[string]string{}
+		}
+		c.Headers["Authorization"] = "Bearer " + k
 	}
 	return &c
 }
@@ -70,7 +102,11 @@ func SignInServer(ctx context.Context, name string) (mcpauth.State, error) {
 	if s.Transport != "http" {
 		return mcpauth.State{}, errNotHTTP
 	}
-	return mcpauth.Start(ctx, s.Name, s.URL)
+	var app *mcpauth.App
+	if s.OAuth != nil {
+		app = &mcpauth.App{ClientID: s.OAuth.ClientID, ClientSecret: s.OAuth.ClientSecret, CallbackPort: s.OAuth.CallbackPort}
+	}
+	return mcpauth.StartWith(ctx, s.Name, s.URL, app)
 }
 
 // SignOutServer forgets magpie's sign-in to the server called name, and

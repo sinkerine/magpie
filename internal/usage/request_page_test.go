@@ -106,7 +106,7 @@ func TestCompactPageMatchesLedger(t *testing.T) {
 		}
 		return int(b.To - a.To)
 	})
-	price := pricer()
+	price := Pricer()
 	pack := func(r Record, source string) Row {
 		x := Row{Record: r, Source: source, Swapped: r.Served != "" && Swapped(r.Model, r.Served)}
 		if p := price(r); p != nil && r.Input+r.Output > 0 {

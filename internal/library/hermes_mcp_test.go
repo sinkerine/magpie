@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"gopkg.in/yaml.v3"
 )
 
@@ -34,6 +35,7 @@ func TestHermesMCP(t *testing.T) {
 	t.Setenv("HERMES_HOME", dir)
 	p := filepath.Join(dir, "config.yaml")
 	write(t, p, hermesConfig)
+	holdCLI(t, h, "hermes") // the config alone is gone (#2173, #2177)
 
 	tg := targetByID("hermes")
 	if tg == nil || tg.MCP == nil || tg.MCP.Path != p {
@@ -130,8 +132,9 @@ func TestHermesMCP(t *testing.T) {
 // A server Hermes has that the library doesn't is found, to bring in.
 func TestHermesMCPFound(t *testing.T) {
 	h := sandbox(t)
-	dir := filepath.Join(h, ".hermes")
+	dir := appdir.HermesHome()
 	write(t, filepath.Join(dir, "config.yaml"), strings.Replace(hermesConfig, "toolsets:", "  remote:\n    url: https://r.example/sse\n    transport: sse\ntoolsets:", 1))
+	holdCLI(t, h, "hermes") // the config alone is gone (#2173, #2177)
 	l, err := load()
 	if err != nil {
 		t.Fatal(err)

@@ -10,11 +10,13 @@ package gateway
 
 import (
 	"context"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/usage"
 )
@@ -24,9 +26,19 @@ const traceKeep = 60
 
 // Route is one request's way through routing.
 type Route struct {
+	// callerKey: the gateway key the request came with, so a key held to
+	// a budget, models or accounts is told the routes of its own requests
+	// alone (sessionLatest, #1981)
+	callerKey     string
 	imageTurn     string
 	imageCaller   string
 	imageProvider string
+	// turn: a request of an agent's turn, for the notification that it is
+	// done (turns); dirOf, the folder its body says, read once as a turn
+	// starts; tools, whether its reply called a tool
+	turn          bool
+	dirOf         func() string
+	tools         *toolScan
 	Seq           int64        `json:"seq"` // the trace's count when it last changed
 	ID            int64        `json:"id"`
 	Time          time.Time    `json:"time"`
@@ -40,14 +52,26 @@ type Route struct {
 	For           *CallFor     `json:"for,omitempty"`           // the request it was made for, as Call's
 	Model         string       `json:"model"`                   // as the agent asked
 	Effort        string       `json:"effort,omitempty"`        // the reasoning the agent asked for; "" for none
+	Tier          string       `json:"tier,omitempty"`          // the service tier the agent asked for (bodyTier); "" for none
 	Provider      string       `json:"provider"`                // the provider the model resolved to
 	Group         *GroupRef    `json:"group,omitempty"`         // the routing group the agent asked for
 	Rule          *RuleHit     `json:"rule,omitempty"`          // the group's rules for it, when it has any
 	SealedTask    bool         `json:"sealedTask,omitempty"`    // only ChatGPT accounts can read this subagent's task
 	LeadAccount   string       `json:"leadAccount,omitempty"`   // the parent account put first for a sealed task
-	// Subagent is a Codex subagent's request put on the model set for
-	// Codex's subagents, or kept on the one asked for and why
+	// Subagent is a Codex or Claude Desktop subagent's request put on
+	// the model set for its subagents, or kept on the one asked for and why
 	Subagent *SubagentPick `json:"subagent,omitempty"`
+	// Sub: the Claude Code subagent the request is of (subagentOf), whose
+	// session header is its conversation's; "" for the conversation's own
+	Sub string `json:"sub,omitempty"`
+	// SubagentEffort is Desktop's configured effort. Tries keep the actual
+	// level after member overrides and fitting to the model.
+	SubagentEffort string `json:"subagentEffort,omitempty"`
+	// SubagentID is the Claude Code subagent whose turn this is
+	// (subagentTurnOf), the id the ledger's Subagent keeps too. Claude Code
+	// names no kind for it, so Kind stays empty and the Routing page tags
+	// it as Codex's subagents are.
+	SubagentID string `json:"subagentId,omitempty"`
 	// Nested: the rules of the groups in the group, down the way to the
 	// one that went first, each as it decided
 	Nested   []NestedRule `json:"nested,omitempty"`
@@ -70,6 +94,9 @@ type Route struct {
 	// counts: streamed replies only (#196)
 	TTFT      int64 `json:"ttft,omitempty"`
 	FirstText int64 `json:"firstText,omitempty"`
+	// FirstReasoning is the start of paced visible reasoning, absent for hidden reasoning.
+	FirstReasoning  int64 `json:"firstReasoning,omitempty"`
+	ReasoningHidden bool  `json:"reasoningHidden,omitempty"`
 	// Flow: the ms its content took to come (Call.Flow)
 	Flow int64 `json:"flow,omitempty"`
 	// Served: the model the reply says answered, as the last try has it;
@@ -86,6 +113,10 @@ type Route struct {
 	// Conv: the conversation a request without a session id is part of,
 	// as a digest of its first user turn (conversationID)
 	Conv string `json:"conv,omitempty"`
+	// Folder: the last two levels of the folder its agent says it works
+	// in (shortFolder), never the whole path; a request that says none
+	// takes its session's, as said last (#1068)
+	Folder string `json:"folder,omitempty"`
 }
 
 // RouteUsage is one billable attempt's pricing inputs, kept in routing history.
@@ -122,6 +153,9 @@ type GroupRef struct {
 	Via []string `json:"via,omitempty"`
 	// Fast: those of Members sent in their vendor's fast mode
 	Fast []string `json:"fast,omitempty"`
+	// Paused: the models a pause rule left out of the request, so not in
+	// Members (provider.PausedOut)
+	Paused []provider.Paused `json:"paused,omitempty"`
 }
 
 // SubGroup is a routing group in the group a request asked for.
@@ -226,9 +260,16 @@ type Weighed struct {
 	// Aside: a key made for another protocol than the keys routed over,
 	// tried only after them
 	Aside bool `json:"aside,omitempty"`
+	// NoURL: its keys are all set to this protocol, which its provider has
+	// no URL for, so it was tried on the URLs it has (#1702)
+	NoURL provider.Protocol `json:"noURL,omitempty"`
 	// Via: the groups in the group it is of, outermost first, when it is
 	// of a group in the group asked for
 	Via []string `json:"via,omitempty"`
+	// UsedRenews: when the window Used is the share of renews, apart
+	// from Renews' biggest first: a row says the two together, so of one
+	// window, a Factory account's week and not its month (#1778)
+	UsedRenews *time.Time `json:"usedRenews,omitempty"`
 	// Sunk: when it was rate limited with quota left, sending it to the
 	// back of an order that sinks (sink.go); nil when it didn't, or the
 	// order doesn't sink
@@ -253,6 +294,9 @@ type Try struct {
 	// first text, when it streamed any (#196)
 	TTFT      int64 `json:"ttft,omitempty"`
 	FirstText int64 `json:"firstText,omitempty"`
+	// FirstReasoning is the start of paced visible reasoning, absent for hidden reasoning.
+	FirstReasoning  int64 `json:"firstReasoning,omitempty"`
+	ReasoningHidden bool  `json:"reasoningHidden,omitempty"`
 	// Flow: the ms its content took to come (Call.Flow)
 	Flow int64 `json:"flow,omitempty"`
 	// Served: the model its reply said answered, when it named one;
@@ -265,10 +309,25 @@ type Try struct {
 	// Upstream: the provider an aggregator said answered behind it
 	// (OpenRouter's DeepInfra, Novita …)
 	Upstream string `json:"upstream,omitempty"`
-	Fail     string `json:"fail,omitempty"` // why it failed, as rest tells it
-	Error    string `json:"error,omitempty"`
-	Rest     *Rest  `json:"rest,omitempty"`  // how long it now sits out; none when it was the last to try
-	Again    int64  `json:"again,omitempty"` // ms waited before it was tried again, the last one left
+	// Tier: the service tier it went out at, once a fast pick or an
+	// account without Ultrafast had changed it; TierServed: the one its
+	// reply said it ran at, when it said one (#1784)
+	Tier       string `json:"tier,omitempty"`
+	TierServed string `json:"tierServed,omitempty"`
+	Fail       string `json:"fail,omitempty"` // why it failed, as rest tells it
+	Error      string `json:"error,omitempty"`
+	Rest       *Rest  `json:"rest,omitempty"`  // how long it now sits out; none when it was the last to try
+	Again      int64  `json:"again,omitempty"` // ms waited before it was tried again, the last one left
+	// Replan: every member had failed in a way that passes, so after
+	// Again the Replan of them that may answer by then were asked again,
+	// in turn, within the group's Patience (seconds) for the request
+	// (#1418)
+	Replan   int `json:"replan,omitempty"`
+	Patience int `json:"patience,omitempty"`
+	// Gone: the agent canceled the request in the pause Again was to be
+	// waited, so nobody was asked again (#1894: the Routing page's story
+	// otherwise ended on "tried again in 1s", a retry that never came)
+	Gone bool `json:"gone,omitempty"`
 	// Queued: ms it waited for one of its key's or account's slots, the
 	// provider's MaxConcurrency out already (concurrency.go)
 	Queued int64 `json:"queued,omitempty"`
@@ -281,11 +340,14 @@ type Try struct {
 	Auto []provider.AutoPick `json:"auto,omitempty"`
 }
 
-// AutoReset is a Codex or Claude reset spent by itself, on Who's account.
+// AutoReset is a Codex reset spent by itself, on Who's account. (Claude's
+// resets were taken out in 9bf6d4352 and aren't coming back: reading or
+// spending one means magpie calling Anthropic with the account's token,
+// #1972.)
 type AutoReset struct {
 	Who   string `json:"who"`
 	Text  string `json:"text"`
-	Agent string `json:"agent,omitempty"` // "claude" for a Claude account's; Codex's otherwise
+	Agent string `json:"agent,omitempty"` // the account's agent, as Account.Agent has it
 }
 
 type planned struct {
@@ -293,11 +355,15 @@ type planned struct {
 	// held: the accounts left out (in left) as they won't spend their
 	// credits, for one that spends its resets by itself to spend one
 	held []candidate
+	// capped: the accounts left out (in left) as they are past the usage
+	// cap set on them, for a conversation that stays strictly on one to
+	// go on there (provider.AffinityStrict, #1797)
+	capped []candidate
 }
 
 func weighed(c candidate, p provider.Provider, wg weighing, fallback bool, from provider.Protocol) Weighed {
 	w := Weighed{ID: c.rest, Provider: p.ID, Name: p.Name, Icon: p.Icon, Preset: p.Preset, Model: c.model, Fixed: c.effort, Fast: c.fast,
-		Routing: p.Routing, Fallback: fallback, Shared: c.rest != p.ID, Rank: c.rank}
+		Routing: p.Routing, Fallback: fallback, Shared: c.rest != p.ID, Rank: c.rank, NoURL: c.noURL}
 	switch {
 	case c.p.Account != nil:
 		w.Kind, w.Who, w.Agent, w.Plan = "account", c.p.Account.User, c.p.Account.Agent, c.p.Account.Plan
@@ -317,6 +383,10 @@ func weighed(c candidate, p provider.Provider, wg weighing, fallback bool, from 
 	}
 	if l, ok := wg.lefts[c.allowanceKey()]; ok {
 		w.Known, w.Used, w.Renews, w.Pace = true, l.used, l.renews, l.pace
+		if !l.fullest.IsZero() {
+			ur := l.fullest
+			w.UsedRenews = &ur
+		}
 		if l.of > 0 {
 			w.Amount, w.Limit, w.Unit = l.amount, l.of, l.unit
 		}
@@ -350,6 +420,19 @@ type trace struct {
 	routes []*Route
 	wake   chan struct{}
 	totals Totals
+	// bodies are the last requests' masked bodies, for their prompts'
+	// text (PromptText): in memory only, never in the history
+	bodies []keptBody
+	// turns follows agents' turns, to say when one is done (TurnDone)
+	turns turns
+	// folders: each session's folder, as its requests said it last, for
+	// the requests that don't say it (a title, a topic check)
+	folders map[string]sessionFolder
+}
+
+type sessionFolder struct {
+	folder string
+	at     time.Time
 }
 
 // Totals count the requests routed since the gateway started.
@@ -374,9 +457,27 @@ func (t *trace) changed() {
 	}
 }
 
+// beginFor begins req's route, marked with the gateway key req came with.
+// Every route of a request begins here, so a held key's own routes are
+// told it: one begun without (begin alone) is told to no held key.
+func (t *trace) beginFor(req *http.Request, r Route) *Route {
+	r.callerKey = access.Caller(req.Context()).KeyID
+	rt := t.begin(r)
+	noteRoute(req.Context(), rt)
+	return rt
+}
+
 func (t *trace) begin(r Route) *Route {
+	// the body is read for its folder before the lock: a long one takes
+	// a while, and every route waits on the lock
+	if r.dirOf != nil {
+		dir := r.dirOf()
+		r.dirOf = func() string { return dir }
+		r.Folder = shortFolder(dir)
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.sessionFolder(&r, time.Now())
 	if t.ids == 0 {
 		// ids go on from one run to the next, the history keeping them
 		// all: counted on from the time the gateway began
@@ -388,11 +489,69 @@ func (t *trace) begin(r Route) *Route {
 		r.Tries = []Try{}
 	}
 	rp := &r
+	t.turns.begin(rp, time.Now())
 	t.routes = append(t.routes, rp)
 	t.trim()
 	t.changed()
 	rp.Seq = t.seq
 	return rp
+}
+
+// foldersKeep is how many sessions' folders are kept, the oldest said
+// going first when there are more.
+const foldersKeep = 512
+
+// sessionFolder gives r its session's folder when it says none, and keeps
+// the one it says for those that come after: an agent's requests on the
+// side, a title or a topic check, have no full system prompt to say it.
+// A request with no session id has only its own (#1068).
+func (t *trace) sessionFolder(r *Route, now time.Time) {
+	key := func(s string) string {
+		if s == "" {
+			return ""
+		}
+		return r.Agent + "\x00" + s
+	}
+	own, parent := key(r.Session), key(r.ParentSession)
+	if r.Folder == "" {
+		for _, k := range []string{own, parent} {
+			if f, ok := t.folders[k]; ok && k != "" {
+				r.Folder = f.folder
+				return
+			}
+		}
+		return
+	}
+	if own == "" {
+		return
+	}
+	if t.folders == nil {
+		t.folders = map[string]sessionFolder{}
+	}
+	t.folders[own] = sessionFolder{r.Folder, now}
+	for len(t.folders) > foldersKeep {
+		oldest := ""
+		for k, f := range t.folders {
+			if oldest == "" || f.at.Before(t.folders[oldest].at) {
+				oldest = k
+			}
+		}
+		delete(t.folders, oldest)
+	}
+}
+
+// shortFolder is the last two levels of dir, "/"-joined: enough to tell
+// one project from another, without the rest of the path (#1068). A
+// Windows drive is no level; "" for none.
+func shortFolder(dir string) string {
+	parts := strings.FieldsFunc(strings.TrimSpace(dir), func(c rune) bool { return c == '/' || c == '\\' })
+	if len(parts) > 0 && len(parts[0]) == 2 && parts[0][1] == ':' {
+		parts = parts[1:]
+	}
+	if len(parts) > 2 {
+		parts = parts[len(parts)-2:]
+	}
+	return strings.Join(parts, "/")
 }
 
 // trim keeps traceKeep routes, the oldest finished ones going first: a
@@ -431,7 +590,8 @@ func (t *trace) update(r *Route, f func(r *Route)) {
 		if r.Status >= 400 || r.Error != "" {
 			t.totals.Errors++
 		}
-		if keepRoutes {
+		t.turns.end(r, r.Status < 400 && r.Error == "" && !r.tools.called(), time.Now())
+		if keepsRoutes() {
 			c := *r
 			c.Order = append([]Weighed{}, r.Order...) // [] for none: the GUI reads it as a list
 			c.Left = append([]Weighed(nil), r.Left...)
@@ -491,10 +651,18 @@ func swapped(sent, served string) bool { return usage.Swapped(sent, served) }
 
 // routeUsage retains only what pricing needs, without another copy of the
 // request's metadata. Unknown token counts have no price, including failures.
+// What the reply counted of earlier requests (Deferred) is priced as a tier
+// of its own before the request's, which stays last: the prompt is read
+// from the last (promptCounted), and is the request's own.
 func routeUsage(id, model string, u Usage) []RouteUsage {
-	if u.Input+u.Output == 0 {
-		return nil
+	var out []RouteUsage
+	if d := u.Deferred; d != nil && d.Input+d.Output+d.CacheRead+d.CacheWrite > 0 {
+		out = append(out, RouteUsage{Provider: id, Model: model, Input: d.Input, Output: d.Output,
+			CacheRead: d.CacheRead, CacheWrite: d.CacheWrite, Reasoning: d.Reasoning})
 	}
-	return []RouteUsage{{Provider: id, Model: model, Input: u.Input, Output: u.Output,
-		CacheRead: u.CacheRead, CacheWrite: u.CacheWrite, Reasoning: u.Reasoning}}
+	if u.Input+u.Output == 0 {
+		return out
+	}
+	return append(out, RouteUsage{Provider: id, Model: model, Input: u.Input, Output: u.Output,
+		CacheRead: u.CacheRead, CacheWrite: u.CacheWrite, Reasoning: u.Reasoning})
 }

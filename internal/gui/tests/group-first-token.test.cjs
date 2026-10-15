@@ -1,10 +1,11 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
 // A routing group may let a member go that is slow to begin its answer
 // (Chen on X: every answer waits on a slow vendor). The group editor's
-// "Slow to start" row picks Wait, 30 s, 1 min or 2 min, its hint saying
-// what each does; saved, the group is sent with firstToken in seconds and
-// its card says "Next after 60 s without a first token". Wait sends 0 and
-// the card says nothing. In English and Chinese, Chromium and WebKit.
+// "Slow to start" row picks Wait, 30 s, 1 min or 2 min, or Custom and as
+// many minutes as are typed (Kismet Alan on Discord), its hint saying what
+// each does; saved, the group is sent with firstToken in seconds and its
+// card says "Next after 60 s without a first token". Wait sends 0 and the
+// card says nothing. In five languages, Chromium and WebKit, at 1100 and 420.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -28,7 +29,11 @@ const groups = () => ({
 const words = {
   en: { edit: "Edit", save: "Save", label: "Slow to start", wait: "Wait", min: "1 min", tag: "Next after 60 s without a first token", waits: "Every member is waited for" },
   zh: { edit: "编辑", save: "保存", label: "迟迟不出字", wait: "一直等", min: "1 分钟", tag: "60 秒 无首字换下一个", waits: "每个成员都会一直等" },
+  "zh-TW": { edit: "編輯", save: "儲存", label: "遲遲不出字", wait: "一直等", min: "1 分鐘", tag: "60 秒 無首字換下一個", waits: "每個成員都會一直等" },
+  ja: { edit: "編集", save: "保存", label: "応答開始が遅いとき", wait: "待つ", min: "1 分", tag: "最初のトークンが 60 秒 なければ次へ", waits: "どのメンバーも" },
+  de: { edit: "Bearbeiten", save: "Speichern", label: "Langsamer Start", wait: "Warten", min: "1 Min.", tag: "Nächstes nach 60 s ohne erstes Token", waits: "Auf jedes Mitglied wird gewartet" },
 };
+const custom = { en: "Custom", zh: "自定义", "zh-TW": "自定義", ja: "カスタム", de: "Benutzerdefiniert" };
 
 function serve(lang, posts) {
   const state = { agents: [{ id: "codex", name: "Codex", path: "/test/codex", fields: [] }], profiles: [], settings: { lang, theme: "light" } };
@@ -60,16 +65,16 @@ function serve(lang, posts) {
 }
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
-  for (const lang of ["en", "zh"]) {
+  for (const lang of Object.keys(words)) for (const width of [1100, 420]) {
     const w = words[lang];
-    test(`${engine} ${lang}: a group lets a slow-to-start member go`, async (t) => {
+    test(`${engine} ${lang} ${width}: a group lets a slow-to-start member go`, async (t) => {
       saved.firstToken = 0;
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
-      const page = await (await browser.newContext({ viewport: { width: 1100, height: 2000 }, reducedMotion: "reduce" })).newPage();
+      const page = await (await browser.newContext({ viewport: { width, height: 2000 }, reducedMotion: "reduce" })).newPage();
       t.after(async () => {
         if (process.env.ARTIFACT_DIR) {
           await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
-          await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `${engine}-${lang}-group-first-token.png`) });
+          await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `${engine}-${lang}-${width}-group-first-token.png`) });
         }
         await browser.close();
       });
@@ -82,29 +87,84 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await card.waitFor();
       assert.equal(await card.locator(".tag", { hasText: w.tag }).count(), 0, "off by default");
 
+      // at 420 the editor runs past the window's foot, and WebKit doesn't
+      // scroll the page's own scroller to a click: wheel it into view
+      const reach = async (loc) => {
+        await loc.waitFor();
+        await page.mouse.move(width / 2, 600);
+        for (let i = 0; i < 30; i++) {
+          const b = await loc.boundingBox();
+          if (b && b.y >= 0 && b.y + b.height <= 2000) return loc;
+          await page.mouse.wheel(0, b && b.y < 0 ? -400 : 400);
+          await page.waitForTimeout(50);
+        }
+        return loc;
+      };
       const save = async () => {
         const ed = page.locator(".rt-gedit");
-        await ed.locator("button.primary", { hasText: w.save }).click();
+        await (await reach(ed.locator("button.primary", { hasText: w.save }))).click();
         await page.waitForFunction(() => !document.querySelector(".rt-gedit"));
         return posts.filter((p) => p.path === "/api/groups/save").at(-1).body;
       };
-      await card.locator("button", { hasText: w.edit }).click();
+      await (await reach(card.locator("button", { hasText: w.edit }))).click();
       const ed = page.locator(".rt-gedit");
       const row = ed.locator("label", { hasText: w.label }).locator("xpath=following-sibling::div[1]");
       await row.waitFor();
+      await reach(row);
       assert.equal(await row.locator(".opt.on").textContent(), w.wait);
       assert((await row.locator(".hint").textContent()).startsWith(w.waits));
       await row.locator(".opt", { hasText: w.min }).click();
-      assert((await row.locator(".hint").textContent()).includes(lang === "zh" ? "60 秒" : "60 s"));
+      const secs = (n) => page.evaluate((n) => t("{n} s", { n }), n);
+      assert((await row.locator(".hint").textContent()).includes(await secs(60)));
       assert.equal((await save()).firstToken, 60);
       await card.locator(".tag", { hasText: w.tag }).waitFor();
 
-      await card.locator("button", { hasText: w.edit }).click();
+      await (await reach(card.locator("button", { hasText: w.edit }))).click();
       await row.waitFor();
+      await reach(row);
       assert.equal(await row.locator(".opt.on").textContent(), w.min, "the editor opens at what was saved");
       await row.locator(".opt", { hasText: w.wait }).click();
       assert.equal((await save()).firstToken, 0);
       await page.waitForFunction((tag) => ![...document.querySelectorAll(".rt-group .tag")].some((x) => x.textContent === tag), w.tag);
+
+      // Custom: as many minutes as are typed, from 5 when it was Wait
+      await (await reach(card.locator("button", { hasText: w.edit }))).click();
+      await row.waitFor();
+      await reach(row);
+      const minutes = row.locator("input.first-in");
+      assert.equal(await minutes.isVisible(), false, "no minutes box until Custom is picked");
+      await row.locator(".opt", { hasText: custom[lang] }).click();
+      assert.equal(await minutes.isVisible(), true);
+      assert.equal(await minutes.inputValue(), "5");
+      assert.equal(await page.evaluate(() => document.activeElement?.classList.contains("first-in")), true, "the box is focused to type in");
+      assert((await row.locator(".hint").textContent()).includes(await secs(300)));
+      await minutes.fill("abc");
+      assert.equal(await minutes.getAttribute("aria-invalid"), "true");
+      assert((await row.locator(".hint").textContent()).includes("abc"), "the hint says what is wrong");
+      await minutes.fill("2.5");
+      assert.equal(await minutes.getAttribute("aria-invalid"), "false");
+      assert((await row.locator(".hint").textContent()).includes(await secs(150)));
+      // the row fits the editor at this width
+      const fit = await row.evaluate((r) => {
+        const box = r.getBoundingClientRect(), ed = r.closest(".rt-gedit").getBoundingClientRect();
+        return [...r.querySelectorAll(".segs, input.first-in, .first-unit")].every((x) => {
+          const b = x.getBoundingClientRect();
+          return b.left >= ed.left - 0.5 && b.right <= ed.right + 0.5 && b.right <= box.right + 0.5;
+        }) && document.scrollingElement.scrollWidth <= document.scrollingElement.clientWidth;
+      });
+      assert.equal(fit, true, "the Custom row overflows at " + width);
+      assert.equal((await save()).firstToken, 150);
+      const tag150 = w.tag.replace(await secs(60), await secs(150));
+      await card.locator(".tag", { hasText: tag150 }).waitFor();
+
+      await (await reach(card.locator("button", { hasText: w.edit }))).click();
+      await row.waitFor();
+      await reach(row);
+      assert.equal(await row.locator(".opt.on").textContent(), custom[lang], "a time of its own opens as Custom");
+      assert.equal(await minutes.inputValue(), "2.5");
+      await row.locator(".opt", { hasText: w.min }).click();
+      assert.equal(await minutes.isVisible(), false);
+      assert.equal((await save()).firstToken, 60);
 
       const missing = await page.evaluate(() => [
         "Wait", "30 s", "1 min", "2 min", "Slow to start", "slow to start", "Next after {n} without a first token",
@@ -112,8 +172,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         "A member that hasn't begun answering after {n} — no text, reasoning or tool call yet — is let go and the next one asked, before any of it reaches the agent. It doesn't rest; the last one left is always waited for. Only for streamed requests.",
         "{who} hadn't begun answering after {ms}, so the request went on to the next before any of it reached {agent}. Nothing is wrong with {who}, so it doesn't rest.",
         "In magpie", "Vendor's first token",
-      ].filter((k) => !I18N.zh[k]));
-      assert.deepEqual(missing, [], "every string has its Chinese");
+        "Custom", "e.g. 5", "Minutes", "min", "{v} is not a number of minutes",
+      ].filter((k) => !["zh", "zh-TW", "ja", "de"].every((l) => I18N[l][k])));
+      assert.deepEqual(missing, [], "every string has its zh, zh-TW, ja and de");
       assert.deepEqual(errors, []);
     });
   }

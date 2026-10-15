@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/testenv"
 )
@@ -24,5 +25,11 @@ func TestMain(m *testing.M) {
 		// never the runner's keychain: a test that wants the Copilot
 		// CLI's token there stands one in itself
 		copilotCLISecret = func(string) string { return "" }
+		// the fakes of ChatGPT's backend read turns plain; codex_zstd's
+		// tests send them as the real one is sent
+		CodexZstdForTests(false)
+		// the fakes' device sign-ins give an interval of 0: polled at
+		// once, not a second apart (#2051)
+		devicePollFloor = 10 * time.Millisecond
 	}))
 }

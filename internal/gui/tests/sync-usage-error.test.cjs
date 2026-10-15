@@ -11,6 +11,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const CUT = "the WebDAV server kept 0 of 6869 bytes of 5f0c-2026-08-29.magpie-usage: the write was cut short — sync again, and if it keeps happening the network to the server is dropping long uploads";
@@ -68,7 +69,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           page.setDefaultTimeout(5000);
           await page.goto("http://magpie.test/");
           await page.locator("#prefs").click();
-          await page.locator("#setTab-sync").click();
+          await openPart(page, "sync");
           const first = page.locator("#syncList .row.pref").first();
           await first.waitFor({ state: "visible" });
           const status = first.locator(".who > .sub").first();

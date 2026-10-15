@@ -11,6 +11,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/usage"
 )
 
 // clsUp is a Chat vendor that classifies: it answers what answer says,
@@ -142,15 +143,33 @@ func TestIntentRoutesATurn(t *testing.T) {
 	if r.Rule.Classified == nil || r.Rule.Classified.After != "" || strings.Contains(c.last(), "was of kind") || c.n() != 3 {
 		t.Fatalf("turn 3: %+v %s", r.Rule.Classified, c.last())
 	}
-	// the classifier's call is magpie's own, in the usage
+	// the classifier's call is magpie's own, in the usage, marked as the
+	// routing classifier's (#1839)
 	var seen bool
 	for _, call := range s.Recent() {
-		if call.Model == "c/cls" && call.Agent == "magpie-router" {
+		if call.Model == "c/cls" && call.Agent == "magpie-router" && call.Kind == "routing" {
 			seen = true
 		}
 	}
 	if !seen {
-		t.Fatal("the classifier's call isn't recorded as magpie-router's")
+		t.Fatal("the classifier's call isn't recorded as magpie-router's routing")
+	}
+	var recs, agents int
+	for _, r := range usage.Load(time.Time{}) {
+		switch {
+		case r.Provider == "c":
+			if r.Kind != "routing" || !r.ByMagpie() || usage.PurposeOf(r.Kind) != "kind:routing" {
+				t.Fatalf("the classifier's record: %+v", r)
+			}
+			recs++
+		case r.ByMagpie() || r.Kind == "routing":
+			t.Fatalf("an agent's record marked magpie's or routing: %+v", r)
+		default:
+			agents++
+		}
+	}
+	if recs != 3 || agents == 0 {
+		t.Fatalf("%d classifier records, %d the agent's", recs, agents)
 	}
 }
 
@@ -261,6 +280,37 @@ func TestIntentClassifierFails(t *testing.T) {
 	out, r = postOK(t, s, "f4", chat("rename everything", nil, 0, ""))
 	if !strings.Contains(out, "from ka") || !strings.Contains(r.Rule.Classified.Error, "no answer") || time.Since(t0) > 1500*time.Millisecond {
 		t.Fatalf("slow: %s %+v %s", out, r.Rule, time.Since(t0))
+	}
+}
+
+// A classifier that fails, times out or rests on a turn whose conversation
+// had an intent keeps that intent, marked as kept, rather than sending the
+// turn to the group's first member (#1826: two timeouts in a row sent
+// 复杂 turns to the cheap member); one with none before has none.
+func TestIntentClassifierFailsKeepsThePreviousIntent(t *testing.T) {
+	s, _, _, c := intented(t, provider.Rule{Use: "b/big", Intent: "refactoring"})
+	c.set("1", 0)
+	out, r := postOK(t, s, "k1", chat("rename this package", nil, 0, ""))
+	if !strings.Contains(out, "from kb") || r.Rule.N != 1 || r.Rule.Classified.Fallback != "" {
+		t.Fatalf("turn 1: %s %+v", out, r.Rule)
+	}
+	c.set("", 500)
+	out, r = postOK(t, s, "k1", chat("rename this package", []string{"and the tests"}, 0, ""))
+	cl := r.Rule.Classified
+	if !strings.Contains(out, "from kb") || r.Rule.N != 1 || !strings.Contains(cl.Error, "classifier down") || cl.Intent != "refactoring" || cl.Fallback != "previous" {
+		t.Fatalf("down: %s %+v %+v", out, r.Rule, cl)
+	}
+	// resting after the failure, the turn after keeps it too
+	asked := c.n()
+	out, r = postOK(t, s, "k1", chat("rename this package", []string{"and the tests", "and the docs"}, 0, ""))
+	cl = r.Rule.Classified
+	if !strings.Contains(out, "from kb") || !strings.Contains(cl.Error, "not asked again") || cl.Fallback != "previous" || c.n() != asked {
+		t.Fatalf("resting: %s %+v %d/%d", out, cl, c.n(), asked)
+	}
+	// another conversation, with no turn before, has no intent to keep
+	out, r = postOK(t, s, "k2", chat("rename that package", nil, 0, ""))
+	if cl = r.Rule.Classified; !strings.Contains(out, "from ka") || r.Rule.N != 0 || cl.Intent != "" || cl.Fallback != "" {
+		t.Fatalf("no turn before: %s %+v", out, cl)
 	}
 }
 

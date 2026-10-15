@@ -370,9 +370,12 @@ func TestRefreshInvalidationCancelsStaleCall(t *testing.T) {
 	Cached()
 	done := make(chan struct{})
 	go func() { Refreshed(); close(done) }()
+	// a stale listing left uncancelled never ends (this ask waits on its
+	// context alone), so 10s tells that apart and leaves a loaded runner
+	// room for the second ask
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("stale listing was not cancelled and followed by the new state")
 	}
 	if asks.Load() != 2 || !refreshCacheGood() || Cached()[0].Name != "Recovered" {

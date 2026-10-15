@@ -13,8 +13,11 @@ const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
 const at = (min) => new Date(Date.now() - min * 60e3).toISOString();
-// names long enough that eleven agents make a strip wider than an 866px window
-const NAMES = ["Trae CN Agent Long Name Here", "Kilo Code Agent Long Name", "Pi", "WorkBuddy",
+// names long enough that eleven agents make a strip wider than an 866px window,
+// and short enough to fit a wide one, whose pages keep to 1200px (面条 on Discord),
+// with room to spare: a strip that fits by a fraction of a pixel fails on a
+// glyph's rounding
+const NAMES = ["Trae CN Agent", "Kilo Code Agent", "Pi", "WorkBuddy",
   "DeepSeek Harness Agent", "Claude Code", "Codex", "omp", "OpenCode Agent", "Qoder Code", "ZCode Agent"];
 const NARROW = { width: 866, height: 800 };
 const WIDE = { width: 1600, height: 800 };
@@ -153,7 +156,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const wideView = await box(page, "#view-usage");
       assert.ok(wideView.scroll <= wideView.client + 1, `a window wider than the strip still scrolls the page sideways by ${wideView.scroll - wideView.client}px`);
       const fit = await box(page, "#sessAgent");
-      assert.ok(fit.scroll <= fit.client + 1, "the strip scrolls sideways in a window that fits it");
+      assert.ok(fit.scroll <= fit.client + 1, `the strip scrolls sideways in a window that fits it (${fit.scroll} in ${fit.client})`);
       const widths = await opts.evaluateAll((els) => els.map((el) => ({ w: el.getBoundingClientRect().width, need: el.scrollWidth })));
       assert.ok(widths.every((o) => o.need <= o.w + 1), "an option was squeezed narrower than its own text");
       assert.ok(new Set(widths.map((o) => Math.round(o.w))).size > 1, "every option is the same width: they were stretched, not laid out by their text");

@@ -38,6 +38,11 @@ var errNotModified = errors.New("the file on the server is unchanged")
 type version struct {
 	ETag     string `json:"etag,omitempty"`
 	Modified string `json:"modified,omitempty"`
+	// Blind: a put told it wrote without the server checking the version
+	// it went over (s3.go's HEAD then PUT, where conditional writes are
+	// refused): another computer's write in the moment between may have
+	// gone over it (#1776)
+	Blind bool `json:"-"`
 }
 
 // conditions are the headers that ask for the file only when it isn't v.
@@ -107,7 +112,7 @@ func retryAfter(v string) time.Duration {
 	return 0
 }
 
-// remote is where the backup is kept: a WebDAV folder, or an S3 bucket.
+// remote is where the backup is kept.
 type remote interface {
 	// get reads the backup and its version; nil data and no error when
 	// there is none yet. With have, the version last read, it is asked
@@ -119,8 +124,11 @@ type remote interface {
 	put(ctx context.Context, data []byte, etag string) (version, error)
 }
 
-// newRemote is c's: an S3 bucket for an s3:// address, WebDAV for the rest.
+// newRemote selects the backend from c's address.
 func newRemote(c Config) (remote, error) {
+	if c.GitHub() {
+		return newGitHub(c)
+	}
 	if c.S3() {
 		return newS3(c)
 	}

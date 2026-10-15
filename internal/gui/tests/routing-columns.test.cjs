@@ -105,7 +105,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const requests = await box(".rt-col:first-child"), accounts = await box(".rt-col:last-child");
         const rw = requests.right - requests.left, aw = accounts.right - accounts.left;
         assert(rw > aw * 1.6, `${width}px: requests should have more room than accounts (${rw} / ${aw})`);
-        assert(aw >= 280 && aw <= 400.5, `${width}px: account column stays readable and capped (${aw})`);
+        assert(aw >= 260 && aw <= 360.5, `${width}px: account column stays readable and capped (${aw})`);
         const rightList = await box(".rt-acts"), leftList = await box(".rt-reqs");
         assert(Math.abs(rightList.bottom - leftList.bottom) <= 1, `${width}px: list bottoms stay aligned`);
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `${width}px: no horizontal overflow`);

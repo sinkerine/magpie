@@ -10,6 +10,7 @@
 package update
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -125,15 +126,42 @@ func Newer(a, b string) bool {
 			return x.n[i] > y.n[i]
 		}
 	}
+	return comparePre(x.pre, y.pre) > 0
+}
+
+// comparePre orders two pre-releases the way semver does (§11): no
+// pre-release comes after any; otherwise identifier by identifier, numbers
+// as numbers ("beta.10" after "beta.9"), a number before a word, and a
+// shorter list before a longer one it starts.
+func comparePre(a, b string) int {
 	switch {
-	case x.pre == y.pre:
-		return false
-	case x.pre == "":
-		return true
-	case y.pre == "":
-		return false
+	case a == b:
+		return 0
+	case a == "":
+		return 1
+	case b == "":
+		return -1
 	}
-	return x.pre > y.pre
+	x, y := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(x) && i < len(y); i++ {
+		m, errM := strconv.ParseUint(x[i], 10, 64)
+		n, errN := strconv.ParseUint(y[i], 10, 64)
+		switch {
+		case errM == nil && errN == nil:
+			if m != n {
+				return cmp.Compare(m, n)
+			}
+		case errM == nil:
+			return -1
+		case errN == nil:
+			return 1
+		default:
+			if c := strings.Compare(x[i], y[i]); c != 0 {
+				return c
+			}
+		}
+	}
+	return cmp.Compare(len(x), len(y))
 }
 
 type semver struct {
@@ -143,6 +171,8 @@ type semver struct {
 
 func parse(v string) *semver {
 	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	// build metadata ("+sha.5d0c1dc") plays no part in the order
+	v, _, _ = strings.Cut(v, "+")
 	v, pre, _ := strings.Cut(v, "-")
 	parts := strings.Split(v, ".")
 	if len(parts) != 3 {
@@ -318,12 +348,22 @@ func InstallAsAdmin(staged, bundle string) error {
 	return err
 }
 
-// Relaunch opens bundle again once this process (pid) has exited.
-func Relaunch(bundle string) error {
-	script := fmt.Sprintf(`while kill -0 %d 2>/dev/null; do sleep 0.2; done; open %q`, os.Getpid(), bundle)
+// Relaunch opens bundle again once this process (pid) has exited: with its
+// window when window is set, else only its menu bar icon (`tray`, as a
+// login launch), which a restart by itself uses while no window was up.
+func Relaunch(bundle string, window bool) error {
+	script := fmt.Sprintf(`while kill -0 %d 2>/dev/null; do sleep 0.2; done; %s`, os.Getpid(), relaunchOpen(bundle, window))
 	cmd := proc.Command("/bin/sh", "-c", script)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
 	return cmd.Start()
+}
+
+// relaunchOpen is the open command Relaunch runs for bundle.
+func relaunchOpen(bundle string, window bool) string {
+	if window {
+		return fmt.Sprintf("open %q", bundle)
+	}
+	return fmt.Sprintf("open %q --args tray", bundle)
 }
 
 // ReplaceBinary puts the release's build for this binary where the
@@ -403,9 +443,9 @@ func InstallBinaryAside(staged, exe string) (string, error) {
 			return "", err
 		}
 	}
-	if err := os.Rename(staged, exe); err != nil {
+	if err := moveIn(staged, exe); err != nil {
 		if old != "" {
-			if restoreErr := os.Rename(old, exe); restoreErr != nil {
+			if restoreErr := moveIn(old, exe); restoreErr != nil {
 				return "", errors.Join(err, fmt.Errorf("couldn't restore %s from %s: %w", filepath.Base(exe), old, restoreErr))
 			}
 		} else if !NeedsAdmin(err) { // kept for InstallBinaryAsAdmin
@@ -430,6 +470,28 @@ const (
 	errSharingViolation syscall.Errno = 32
 	errLockViolation    syscall.Errno = 33
 )
+
+// moveIn moves from to exe, trying again for a few seconds while
+// something holds from open, as moveAside does for the running exe. On
+// Windows that is the download just after canStart's trial: an antivirus
+// that checks a program as its process starts can hold its file a moment
+// after the process has ended, and a move made at once failed the first
+// install of every update (#2272). Any other failure is returned at once.
+func moveIn(from, exe string) error {
+	var err error
+	for i := 0; ; i++ {
+		if err = os.Rename(from, exe); err == nil || i == len(asideWaits) || !heldOpen(err) {
+			return err
+		}
+		time.Sleep(asideWaits[i])
+	}
+}
+
+// heldOpen is whether err is Windows refusing a file another program has
+// open.
+func heldOpen(err error) bool {
+	return errors.Is(err, errSharingViolation) || errors.Is(err, errLockViolation)
+}
 
 // moveAside moves the running exe out of the way of the new version, under
 // a name of its own, trying again for a few seconds while something has it
@@ -458,7 +520,7 @@ func moveAside(exe string) (string, error) {
 	}
 	var hint string
 	switch {
-	case errors.Is(err, errSharingViolation), errors.Is(err, errLockViolation):
+	case heldOpen(err):
 		hint = "another program has it open (often an antivirus or OneDrive): let magpie through it and restart to update again, or download the new version and put it in place of this one"
 	case errors.Is(err, fs.ErrPermission):
 		hint = "Windows doesn't let magpie change files in " + filepath.Dir(exe) + " (an antivirus' folder protection, or the folder's permissions): let magpie through, or download the new version and put it in place of this one"

@@ -17,6 +17,12 @@ static int movesToActiveSpace(void *win) {
 	return (((NSWindow *)win).collectionBehavior & NSWindowCollectionBehaviorMoveToActiveSpace) != 0;
 }
 
+// On every Space and over a full-screen app's.
+static int joinsFullScreenSpaces(void *win) {
+	NSWindowCollectionBehavior b = ((NSWindow *)win).collectionBehavior;
+	return (b & NSWindowCollectionBehaviorCanJoinAllSpaces) != 0 && (b & NSWindowCollectionBehaviorFullScreenAuxiliary) != 0;
+}
+
 // Ordered in and not in the Dock: on a Space of its own, or covered, it is
 // still open, where Wails' IsVisible (its occlusion state) says it isn't.
 static int windowOpen(void *win) {
@@ -70,6 +76,13 @@ func setMovesToActiveSpace(w *application.WebviewWindow, on bool) {
 func movesToActiveSpace(w *application.WebviewWindow) bool {
 	p := w.NativeWindow()
 	return p != nil && C.movesToActiveSpace(p) != 0
+}
+
+// joinsFullScreenSpaces says whether w is on every Space, a full-screen
+// app's too, as the quick panel is (#2141); on the main thread.
+func joinsFullScreenSpaces(w *application.WebviewWindow) bool {
+	p := w.NativeWindow()
+	return p != nil && C.joinsFullScreenSpaces(p) != 0
 }
 
 // windowOpen says whether w is open: shown, on any Space, and not

@@ -1,13 +1,21 @@
 package gui
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
 )
 
@@ -66,6 +74,91 @@ func TestContextOfALeanAgent(t *testing.T) {
 	s := out.Sessions[0]
 	if s.Requests != 4 || s.Peak != 20000 || s.LatestID != 4 || len(s.Points) != 4 || s.Points[0].Tokens != 13000 {
 		t.Fatalf("session %+v", s)
+	}
+}
+
+// Claude Code's auto mode asks its classifier about each action under the
+// conversation's own session id: a security monitor's system prompt and
+// the transcript, no tools, 34–48K. Interleaved with turns of 60–116K, as
+// Player's glm-5.3 session on Discord was, those drops are no compaction,
+// nor are its title, quota check or a subagent's turns; the
+// conversation's line, latest request and peak are its own turns', and a
+// real compaction of them still counts.
+func TestContextSideCallsAreNoCompaction(t *testing.T) {
+	const window = 1_000_000
+	var routes []gateway.Route
+	id := int64(0)
+	turn := func(chat int) {
+		id++
+		routes = append(routes, ctxRoute(id, "claude", "cc-1", 24000, chat, window, 24000+chat*9/10))
+	}
+	// a request with no tool definitions, as the classifier, the title and
+	// the quota check send
+	side := func(system, chat int) {
+		id++
+		r := ctxRoute(id, "claude", "cc-1", 0, chat, window, 0)
+		r.Prompt.Tokens = system + chat
+		r.Prompt.Parts = []gateway.PromptPart{{Kind: gateway.PartSystem, Tokens: system}, {Kind: gateway.PartChat, Tokens: chat}}
+		routes = append(routes, r)
+	}
+	side(60, 900) // the title, before the first turn has an answer
+	side(0, 8)    // the quota check
+	chats := []int{36000, 48000, 60000, 72000, 80000, 86000, 92000}
+	for i, chat := range chats {
+		turn(chat)
+		// the classifier on the turn's actions: its transcript grows as the
+		// conversation does, well under its turns
+		side(6000, 28000+i*2000)
+		side(6000, 28000+i*2000+500)
+	}
+	// a subagent's turns, with tools of their own, under the same session
+	for _, chat := range []int{4000, 9000} {
+		id++
+		r := ctxRoute(id, "claude", "cc-1", 18000, chat, window, 0)
+		r.Sub = "agent-a1b2"
+		routes = append(routes, r)
+	}
+	turn(chats[len(chats)-1] + 4000)
+	side(6000, 42000)
+	// a real compaction: the next turn starts over from the summary
+	turn(9000)
+	side(6000, 12000)
+	turn(14000)
+	last := id
+
+	out := contextOf(routes, 7)
+	if len(out.Agents) != 1 || len(out.Sessions) != 1 {
+		t.Fatalf("agents %d sessions %d", len(out.Agents), len(out.Sessions))
+	}
+	s, a := out.Sessions[0], out.Agents[0]
+	if s.Compacts != 1 || a.Compacts != 1 {
+		t.Fatalf("compactions: session %d agent %d, want the one real one", s.Compacts, a.Compacts)
+	}
+	if want := len(chats) + 3; s.Requests != want || len(s.Points) != want {
+		t.Fatalf("session requests %d points %d, want its %d turns", s.Requests, len(s.Points), want)
+	}
+	if s.LatestID != last || s.Latest.Tokens != 24000+14000 {
+		t.Fatalf("latest %d (%d tokens), want turn %d", s.LatestID, s.Latest.Tokens, last)
+	}
+	if s.Peak != 24000+96000 {
+		t.Fatalf("peak %d", s.Peak)
+	}
+	if a.Baseline != 24000 {
+		t.Fatalf("baseline %d: side calls are no part of what its turns start with", a.Baseline)
+	}
+}
+
+// An agent that sends no tools at all keeps every request on its line.
+func TestContextToollessAgentKeepsItsTurns(t *testing.T) {
+	var routes []gateway.Route
+	for i, chat := range []int{30000, 50000, 70000, 20000} {
+		r := ctxRoute(int64(i+1), "chatbox", "c1", 0, chat, 128000, 0)
+		r.Prompt.Parts = []gateway.PromptPart{{Kind: gateway.PartChat, Tokens: chat}}
+		routes = append(routes, r)
+	}
+	s := contextOf(routes, 7).Sessions[0]
+	if s.Requests != 4 || s.Compacts != 1 {
+		t.Fatalf("requests %d compacts %d", s.Requests, s.Compacts)
 	}
 }
 
@@ -144,5 +237,61 @@ func TestContextSessionTitles(t *testing.T) {
 	}
 	if titles[id] != "Port the parser" || titles["not-a-session"] != "" {
 		t.Fatalf("titles %v", titles)
+	}
+}
+
+// masaka on Discord: a part of the context window card opens to its text.
+// /api/context/text lists the part's items, and gives one item's text when
+// asked for it; a request whose body is no longer kept is 404.
+func TestContextTextAPI(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","model":"m1","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":90,"output_tokens":1}}`)
+	}))
+	defer up.Close()
+	if err := provider.Save(provider.Provider{ID: "ct", Name: "CT", Anthropic: up.URL, Models: []string{"m1"}, Key: "k"}); err != nil {
+		t.Fatal(err)
+	}
+	gw := gateway.New()
+	prev := served.Swap(gw)
+	t.Cleanup(func() { served.Store(prev) })
+	body := `{"model":"ct/m1","max_tokens":10,"system":"You are the reviewer agent.",
+		"tools":[{"name":"Read","description":"Reads a file.","input_schema":{"type":"object"}},{"name":"Grep","description":"Searches files for a long pattern, across the whole tree.","input_schema":{"type":"object"}}],
+		"messages":[{"role":"user","content":"review it"}]}`
+	rec := httptest.NewRecorder()
+	gw.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+	rs := gw.Trace(context.Background(), 0, 0).Routes
+	if rec.Code != 200 || len(rs) != 1 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	mux := http.NewServeMux()
+	contextRoutesAPI(mux)
+	get := func(q string) (int, gateway.PromptText) {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/context/text?"+q, nil))
+		var pt gateway.PromptText
+		json.Unmarshal(rec.Body.Bytes(), &pt)
+		return rec.Code, pt
+	}
+	id := strconv.FormatInt(rs[0].ID, 10)
+	code, list := get("id=" + id + "&kind=tools")
+	if code != 200 || len(list.Items) != 2 || list.Items[0].Name != "Grep" || list.Items[0].Pieces != nil || list.Items[1].Pieces != nil {
+		t.Fatalf("%d %+v", code, list)
+	}
+	code, one := get("id=" + id + "&kind=tools&item=1")
+	if code != 200 || one.Items[0].Pieces != nil || len(one.Items[1].Pieces) != 1 || !strings.Contains(one.Items[1].Pieces[0].Text, "Reads a file.") {
+		t.Fatalf("%d %+v", code, one)
+	}
+	if code, sys := get("id=" + id + "&kind=system&item=0"); code != 200 || sys.Items[0].Pieces[0].Text != "You are the reviewer agent." {
+		t.Fatalf("%d %+v", code, sys)
+	}
+	if code, _ := get("id=1&kind=tools"); code != 404 {
+		t.Fatalf("not kept: %d", code)
+	}
+	if code, _ := get("id=" + id + "&kind=tools&item=9"); code != 400 {
+		t.Fatalf("no such item: %d", code)
 	}
 }

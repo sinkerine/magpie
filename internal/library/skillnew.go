@@ -100,16 +100,23 @@ func newBase(skills []*Skill) string {
 
 // gitTree is a repository's files as GitHub's API lists them.
 type gitTree struct {
-	Truncated bool `json:"truncated"`
-	Tree      []struct {
-		Path string `json:"path"`
-		Type string `json:"type"`
-	} `json:"tree"`
+	Truncated bool       `json:"truncated"`
+	Tree      []gitEntry `json:"tree"`
+}
+
+// gitEntry is one file or folder in a gitTree.
+type gitEntry struct {
+	Path string `json:"path"`
+	Type string `json:"type"`
+	Mode string `json:"mode"`
+	SHA  string `json:"sha"`
+	Size int64  `json:"size"`
 }
 
 // skillDirsIn are the folders with a SKILL.md under base in a repository's
-// tree, as candidates would find them: a few folders deep, none hidden or
-// in node_modules, and none inside another skill.
+// tree, as candidates would find them: a few folders deep, none in
+// node_modules, a hidden folder only through its skills folder, and none
+// inside another skill or a copy of one outside hidden folders.
 func skillDirsIn(t *gitTree, base string) []string {
 	var dirs []string
 	for _, e := range t.Tree {
@@ -133,7 +140,7 @@ func skillDirsIn(t *gitTree, base string) []string {
 		if rel != "" {
 			parts = strings.Split(rel, "/")
 		}
-		if len(parts) > 4 || slices.ContainsFunc(parts, func(p string) bool { return strings.HasPrefix(p, ".") || p == "node_modules" }) {
+		if len(parts) > 4 || slices.Contains(parts, "node_modules") || !hiddenThroughSkills(parts) {
 			continue
 		}
 		dirs = append(dirs, dir)
@@ -146,7 +153,18 @@ func skillDirsIn(t *gitTree, base string) []string {
 			out = append(out, d)
 		}
 	}
-	return out
+	return unhiddenFirst(out, func(d string) string { return d }, func(a, b string) bool { return slash.Base(a) == slash.Base(b) })
+}
+
+// hiddenThroughSkills is whether a path candidates walks: every hidden
+// folder in it is an agent's own, entered only for its skills folder.
+func hiddenThroughSkills(parts []string) bool {
+	for i, p := range parts {
+		if strings.HasPrefix(p, ".") && (i+1 == len(parts) || parts[i+1] != "skills") {
+			return false
+		}
+	}
+	return true
 }
 
 // repoTree is a repository's files at a ref, from GitHub's API.

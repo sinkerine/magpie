@@ -31,6 +31,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/yetone/magpie/internal/desktopdir"
+	"github.com/yetone/magpie/internal/dirent"
 	"github.com/yetone/magpie/internal/edit"
 )
 
@@ -40,7 +41,7 @@ const desktopManifest = "manifest.json"
 // Desktop has, in its own folder and Claude-3p's alike: each one with a
 // manifest.json or the plugin's plugin.json.
 func desktopSkillRoots(desktopDir string) []string {
-	dirs := append([]string{desktopDir}, desktopdir.Here().All()...)
+	dirs := append([]string{desktopDir}, desktopdir.Everywhere()...)
 	var out []string
 	seen := map[string]bool{}
 	for _, d := range dirs {
@@ -51,13 +52,13 @@ func desktopSkillRoots(desktopDir string) []string {
 		base := filepath.Join(d, "local-agent-mode-sessions", "skills-plugin")
 		orgs, _ := os.ReadDir(base)
 		for _, o := range orgs {
-			if !o.IsDir() {
+			if !dirent.IsFolder(base, o) {
 				continue
 			}
 			accts, _ := os.ReadDir(filepath.Join(base, o.Name()))
 			for _, a := range accts {
 				p := filepath.Join(base, o.Name(), a.Name())
-				if a.IsDir() && (isFile(filepath.Join(p, desktopManifest)) || isFile(filepath.Join(p, ".claude-plugin", "plugin.json"))) {
+				if dirent.IsFolder(filepath.Join(base, o.Name()), a) && (isFile(filepath.Join(p, desktopManifest)) || isFile(filepath.Join(p, ".claude-plugin", "plugin.json"))) {
 					out = append(out, p)
 				}
 			}
@@ -276,15 +277,24 @@ func (l *Library) syncDesktopSkills(t *Target, res *Result) {
 			p := filepath.Join(dir, s.Name)
 			if ours(p, s.Name) {
 				keep(s.Name)
+				current := false
+				if !linked(p) {
+					var err error
+					current, err = copyIsFresh(p, l.libHash(s.Name), false)
+					if err != nil {
+						res.fail(id, "skill:"+s.Name, err)
+						continue
+					}
+				}
 				switch {
-				case linked(p) || !fresh(p, s.Name) && !desktopEdited(p):
+				case linked(p) || !current && !desktopEdited(p):
 					if err := desktopCopy(p, s.Name); err != nil {
 						res.fail(id, "skill:"+s.Name, err)
 						continue
 					}
 					put[s.Name] = true
 					res.changed(id)
-				case !fresh(p, s.Name):
+				case !current:
 					res.Problems = append(res.Problems, Problem{Agent: id, What: "skill:" + s.Name,
 						Error: fmt.Sprintf("%s was changed in Claude Desktop, so the library's copy isn't put over it: delete it in Desktop to have the library's again", s.Name)})
 				}
@@ -296,10 +306,12 @@ func (l *Library) syncDesktopSkills(t *Target, res *Result) {
 			}
 			// one of Desktop's own (built in, or made there) by that name
 			// stays, the library's left out; magpie's own entry, its folder
-			// gone, gets the folder back
+			// gone, gets the folder back. It is the agent's own, which the
+			// page settles by keeping Desktop's (#1896), not a write that
+			// failed and might work if tried again.
 			_, err := os.Lstat(p)
 			if err == nil || manifestEntry(raw, s.Name) != "" && !slices.Contains(prior, s.Name) {
-				res.Problems = append(res.Problems, Problem{Agent: id, What: "skill:" + s.Name,
+				res.Problems = append(res.Problems, Problem{Agent: id, What: "skill:" + s.Name, Own: true,
 					Error: fmt.Sprintf("Claude Desktop already has a skill of its own called %s", s.Name)})
 				continue
 			}

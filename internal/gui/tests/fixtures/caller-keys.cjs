@@ -22,9 +22,13 @@ function fixture(lang, theme, events, options = {}) {
   let lan = !!options.lan;
   let lanKeyID = "", rotations = 0, lanSecret = "";
   const secrets = new Map([["laptop", "fixture-laptop"], ["server", "fixture-server"], ["work", "fixture-work"]]);
-  const lanURLs = ["http://192.168.1.10:3999", "http://10.0.0.10:3999"];
+  // options.lanURLs is the test's own list, so it can take the network away
+  const lanURLs = options.lanURLs || ["http://192.168.1.10:3999", "http://10.0.0.10:3999"];
+  // options.publicURL is MAGPIE_PUBLIC_URL's, offered while shared (#1551)
+  const publicURL = () => lan && options.publicURL ? { publicURL: options.publicURL } : {};
   const lanState = () => ({ lang, theme, lan,
-    lanURLs: lan ? lanURLs : [], fx: { rate: 7.2, at: new Date().toISOString() } });
+    lanURLs: lan ? lanURLs : [], fx: { rate: 7.2, at: new Date().toISOString() },
+    ...(options.publicURL ? { gateway: "http://127.0.0.1:3999", ...publicURL() } : {}) });
   const rows = [
     { callerKeyId: "laptop", callerKeyName: "Laptop", in: 100, out: 10, cost: 0.1 },
     { callerKeyId: "server", callerKeyName: "Server", in: 200, out: 20, cost: 0.2 },
@@ -51,13 +55,13 @@ function fixture(lang, theme, events, options = {}) {
   return async (route) => {
     const req = route.request(), url = new URL(req.url());
     const json = (data) => route.fulfill({ json: data });
-    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = ${JSON.stringify({ lang, theme, web: false })};` });
+    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = ${JSON.stringify({ lang, theme, web: !!options.web })};` });
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (url.pathname === "/favicon.ico") return route.fulfill({ status: 204 });
     if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings: { lang, theme } });
     if (url.pathname === "/api/providers") return json({
       providers: [{ id: "relay", name: "Relay", icon: "generic", models: [{ id: "m", name: "Model", on: true }], agents: [] }],
-      gateway: { running: true, window: true, mine: true, url: "http://127.0.0.1:3999", lan, lanURLs: lan ? lanURLs : [], calls: [], groups: [] },
+      gateway: { running: true, window: true, mine: true, url: "http://127.0.0.1:3999", lan, lanURLs: lan ? lanURLs : [], ...publicURL(), calls: [], groups: [] },
     });
     if (url.pathname === "/api/groups") return json({ groups: [], models: [] });
     if (url.pathname === "/api/settings/lan") {
@@ -123,12 +127,37 @@ function fixture(lang, theme, events, options = {}) {
       if (action === "on-key" || action === "off-key") k.off = action === "off-key";
       if (action === "limit-key") {
         // what a key has used is the fixture's; a new limit starts unused
-        k.limit = body.limit || undefined;
-        k.used = body.limit ? { period: body.limit.period, start: new Date().toISOString(), reset: new Date(Date.now() + 864e5).toISOString(),
-          calls: 0, tokens: 0, cost: 0, tokenLimit: body.limit.tokens, costLimit: body.limit.cost, tokensLeft: body.limit.tokens, costLeft: body.limit.cost, spent: false } : undefined;
+        const usedOf = (l) => {
+          const span = l.period === "hours" ? l.hours * 36e5 : (l.days || 1) * 864e5;
+          return { period: l.period, days: l.days, hours: l.hours, start: new Date().toISOString(), reset: new Date(Date.now() + span).toISOString(),
+            calls: 0, tokens: 0, cost: 0, tokenLimit: l.tokens, costLimit: l.cost, tokensLeft: l.tokens, costLeft: l.cost, spent: false };
+        };
+        // one of several by its index (#2227), as access.Update keeps them;
+        // without one, the key's only limit
+        const ls = body.index === undefined ? [] : k.limit ? [k.limit, ...(k.moreLimits || [])] : [];
+        const us = body.index === undefined ? [] : k.usedAll || (k.used ? [k.used] : []);
+        const i = body.index ?? 0;
+        if (!body.limit) ls.splice(i, 1), us.splice(i, 1);
+        else ls[i] = body.limit, us[i] = usedOf(body.limit);
+        k.limit = ls[0];
+        k.moreLimits = ls.length > 1 ? ls.slice(1) : undefined;
+        k.used = us[0];
+        k.usedAll = us.length > 1 ? us : undefined;
+      }
+      if (action === "reset-limit-key") {
+        // what it used goes back to 0, tokens and cost together (#1509);
+        // an N-day or N-hour cycle starts again now, a calendar window keeps
+        // its end; one limit of several by its index, or every one (#2227)
+        const now = Date.now();
+        const reset = (u) => ({ ...u, start: new Date(now).toISOString(), calls: 0, tokens: 0, cost: 0, inFlight: 0, unpriced: 0, spent: false,
+          tokensLeft: u.tokenLimit || 0, costLeft: u.costLimit || 0,
+          reset: u.period === "days" ? new Date(now + u.days * 864e5).toISOString() : u.period === "hours" ? new Date(now + u.hours * 36e5).toISOString() : u.reset });
+        if (k.usedAll) k.usedAll = k.usedAll.map((u, i) => (body.index === undefined || body.index === i ? reset(u) : u)), k.used = k.usedAll[0];
+        else k.used = reset(k.used);
       }
       if (action === "models-key") k.models = body.models?.length ? body.models : undefined;
       if (action === "accounts-key") k.accounts = body.accounts?.length ? body.accounts : undefined;
+      if (action === "quotas-key") k.quotas = body.quotas || undefined;
       if (action === "copy-key") secret = k.id === lanKeyID ? lanSecret : secrets.get(k.id);
       return json({ keys, secret });
     }

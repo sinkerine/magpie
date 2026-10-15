@@ -128,8 +128,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator("dialog.action-confirm[open] button").last().click();
       await page.locator("#modal").waitFor({ state: "hidden" });
 
-      // an agent's model picker
-      await page.goto("http://magpie.test/");
+      // an agent's model picker (asked for: the window opens again on the
+      // page last left, Providers here)
+      await page.goto("http://magpie.test/?view=agents");
       await page.locator('.row.agent[data-id="claude"] > .field.ag-start[data-key="model"]').click();
       const list = page.locator("#pop:not([hidden]) #list");
       await list.locator("li").filter({ hasText: "Qwen3.8-Max" }).first().waitFor();

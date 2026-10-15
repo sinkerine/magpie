@@ -1,13 +1,14 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"sort"
@@ -17,8 +18,10 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -35,6 +38,8 @@ func init() {
 	sessions.WSLHomes = wslHomes
 	sessions.WSLRunning = WSLRunning
 	sessions.WSLOff = func() bool { return !wslLooks() }
+	// a Copilot CLI signed in inside a running distro (#723)
+	provider.CopilotWSLHomes = copilotWSLHomes
 }
 
 // others are clients that reach the gateway without being agents magpie
@@ -42,6 +47,11 @@ func init() {
 var others = []*Agent{
 	{ID: "magpie", Name: "magpie", Icon: "magpie", UA: []string{"magpie"}},
 	{ID: "curl", Name: "curl", Icon: "curl", UA: []string{"curl"}},
+	// PI-Desktop (vastsa/PI-Desktop) runs Pi's own library, which says
+	// "pi (…)"; given a User-Agent of its own in its provider's settings
+	// ("pi-desktop/0.1.0"), it is told apart from Pi by that name, which
+	// Pi's "pi-" would take otherwise (#1966, dgmico)
+	{ID: "pi-desktop", Name: "PI-Desktop", Icon: "pi", UA: []string{"pi-desktop"}},
 }
 
 // Clients is everyone whose requests the gateway knows by name: every
@@ -58,25 +68,41 @@ func Clients() []*Agent {
 	return append(out, others...)
 }
 
-// All returns every agent magpie knows about, detected or not.
+// All returns every agent magpie knows about, detected or not: its own,
+// then those plugins add.
 func All() []*Agent {
-	home, _ := os.UserHomeDir()
-	cfg := appdir.Getenv("XDG_CONFIG_HOME")
+	home, cfg := homes()
+	own := builtins(home, cfg)
+	return append(own, pluggedAgents(home, own, nil)...)
+}
+
+func homes() (home, cfg string) {
+	home, _ = os.UserHomeDir()
+	cfg = appdir.Getenv("XDG_CONFIG_HOME")
 	if cfg == "" {
 		cfg = filepath.Join(home, ".config")
 	}
+	return home, cfg
+}
+
+// builtins are the agents magpie has wiring of its own for.
+func builtins(home, cfg string) []*Agent {
 	return append([]*Agent{
 		claude(home),
 		claudeDesktop(home),
+		claudeScience(),
 		codex(home),
 		gemini(home),
 		agy(home),
 		opencode(home, cfg),
 		openChamber(home, cfg),
 		mimocode(home, cfg),
+		deveco(home, cfg),
 		pi(home),
+		stepcode(home),
 		aside(home),
 		omo(home),
+		primeAgent(home),
 		goose(home, cfg),
 		cursor(home),
 		cursorLocal(),
@@ -101,19 +127,24 @@ func All() []*Agent {
 		muse(cfg),
 		empryo(home),
 		ante(home),
+		astrbot(home),
+		jcode(home),
 		miniMax(home),
 		droid(home),
 		cline(home),
 		qoder(home),
 		qoderCN(home),
 		grok(home),
+		grokApp(home),
 		zcode(home),
 		workbuddy(home),
+		workbuddyAI(home),
 		codebuddy(home),
 		pencil(home),
 		t3code(home),
 		hanako(home),
 		atomcode(home),
+		snow(home),
 		alma(),
 		cindy(),
 	}, append(ompProfiles(home), wslAgents()...)...)
@@ -263,7 +294,7 @@ func ownOptionsFrom(native func(p string) []catalog.Model, authFile string, cur 
 	if p, _, ok := strings.Cut(cur, "/"); ok && p != magpieID {
 		set[p] = true
 	}
-	if b, err := os.ReadFile(authFile); err == nil {
+	if b, err := readOwnAuth(authFile); err == nil {
 		var m map[string]json.RawMessage
 		if json.Unmarshal(b, &m) == nil {
 			for k := range m {
@@ -329,8 +360,11 @@ func magpieProviderJSONAt(shape, catalog, gw string) any {
 		ms := map[string]any{}
 		for _, m := range models {
 			e := map[string]any{"name": m.Name}
+			// modalities alone says a model takes images: OpenCode 1 takes
+			// its image input from them, and its attachment flag, which
+			// nothing of OpenCode 1.18 reads, is a legacy field OpenCode 2
+			// drops with a WARN per model on every load (#2209)
 			if m.Images {
-				e["attachment"] = true
 				e["modalities"] = map[string]any{"input": []string{"text", "image"}, "output": []string{"text"}}
 			}
 			// without it OpenCode doesn't know when to compact, and a
@@ -346,7 +380,7 @@ func magpieProviderJSONAt(shape, catalog, gw string) any {
 			ms[m.ID] = e
 		}
 		return map[string]any{"npm": "@ai-sdk/openai-compatible", "name": "magpie",
-			"options": map[string]any{"baseURL": gw + "/v1", "apiKey": keyAt(gw)}, "models": ms}
+			"options": map[string]any{"baseURL": gw + "/v1", "apiKey": openCodeKeyAt(catalog, gw)}, "models": ms}
 	case "crush":
 		var ms []map[string]any
 		for _, m := range models {
@@ -377,9 +411,38 @@ func magpieProviderJSONAt(shape, catalog, gw string) any {
 		if ms == nil {
 			ms = []map[string]any{}
 		}
-		return map[string]any{"name": "magpie", "baseUrl": gw + "/v1", "api": "openai-completions", "apiKey": keyAt(gw), "models": ms}
+		// Pi names its session to a provider only when asked to:
+		// sendSessionAffinityHeaders has it send it on Chat
+		// (x-session-affinity, session_id) and Anthropic's Messages API
+		// (x-session-affinity). On Responses it sends session_id anyway.
+		// Without it a turn of Pi's on Chat or Messages reached the gateway
+		// with no session: its usage had none and "Record gateway
+		// conversations" kept none of it (akic404 on Discord).
+		return map[string]any{"name": "magpie", "baseUrl": gw + "/v1", "api": "openai-completions", "apiKey": keyAt(gw),
+			"compat": map[string]any{"sendSessionAffinityHeaders": true}, "models": ms}
 	}
 	return nil
+}
+
+// piBlockKept is theirsKept for magpie's provider in a Pi models.json at
+// path, where a sendSessionAffinityHeaders the file already has, the
+// user's own or pi-cache-optimizer's (#1103), stays as it is.
+func piBlockKept(path string, value func() any) func() any {
+	return theirsKept(path, "providers."+magpieID, func() any {
+		v := value()
+		if _, set := edit.GetJSON(path, "providers."+magpieID+".compat.sendSessionAffinityHeaders"); !set {
+			return v
+		}
+		if m, ok := v.(map[string]any); ok {
+			if c, ok := m["compat"].(map[string]any); ok {
+				delete(c, "sendSessionAffinityHeaders")
+				if len(c) == 0 {
+					delete(m, "compat")
+				}
+			}
+		}
+		return v
+	}, "models")
 }
 
 // piModelJSON is one of magpie's models as an entry of Pi's models.json.
@@ -622,7 +685,7 @@ func openCodeLike(at place, id, name, icon, bin, dir, auth string, ua []string, 
 				return ""
 			}
 			return wiringOff(name, path, func(k string) (string, bool) { return edit.GetJSON(path, "provider."+magpieID+".options."+k) },
-				"baseURL", at.v1(), "apiKey", at.gwKey())
+				"baseURL", at.v1(), "apiKey", openCodeKeyAt(id, at.gw()))
 		},
 		Sync: func() error {
 			// a model of magpie's chosen, but its provider gone from the
@@ -637,6 +700,17 @@ func openCodeLike(at place, id, name, icon, bin, dir, auth string, ua []string, 
 			{Key: "small", Label: "small", Get: jsonGet(path, "small_model"), Set: set("small_model"), Options: opts("small")},
 		},
 	}
+}
+
+// openCodeKeyAt is the key an OpenCode-shaped agent (id) sends the gateway
+// at gw: the gateway's own, which OpenCode and MiMo Code are told apart by
+// their User-Agents with, or for DevEco Code, parts of whose code still
+// send OpenCode's User-Agent, one that names it.
+func openCodeKeyAt(id, gw string) string {
+	if id == "deveco" {
+		return agentKeyAt(id, gw)
+	}
+	return keyAt(gw)
 }
 
 // openCodeRef is the value that makes the OpenCode config at path (agent
@@ -754,6 +828,31 @@ func mimocode(home, cfg string) *Agent {
 		[]string{"mimocode"}, "mimo")
 }
 
+// deveco is DevEco Code, Huawei's fork of OpenCode for HarmonyOS apps
+// (openharmony-sig/deveco-code, #1885). It keeps OpenCode's config shape
+// in its own folder, $XDG_CONFIG_HOME/deveco, merging config.json,
+// deveco.json and deveco.jsonc there (packages/opencode/src/config,
+// loadGlobal); DEVECO_CONFIG_DIR adds a folder read after it, as
+// OPENCODE_CONFIG_DIR does OpenCode's, so what magpie writes there wins.
+// Its auth is xdg-basedir's data folder's, ~/.local/share/deveco. 0.2.3's
+// requests to a provider of the config's say "deveco/0.2.3 ai-sdk/…", but
+// much of the OpenCode code it keeps still sends OpenCode's own User-Agent
+// (opencode/<version>), so its key names it as well (openCodeKeyAt).
+func deveco(home, cfg string) *Agent {
+	return openCodeLike(here(home), "deveco", "DevEco Code", "deveco-color", "deveco",
+		devecoDir(cfg), filepath.Join(home, ".local", "share", "deveco", "auth.json"), []string{"deveco"})
+}
+
+// devecoDir is the folder DevEco Code reads its user config from:
+// $DEVECO_CONFIG_DIR when set to an absolute folder, else
+// $XDG_CONFIG_HOME/deveco (cfg).
+func devecoDir(cfg string) string {
+	if d := strings.TrimSpace(appdir.Getenv("DEVECO_CONFIG_DIR")); filepath.IsAbs(d) {
+		return d
+	}
+	return filepath.Join(cfg, "deveco")
+}
+
 func pi(home string) *Agent { return piIn(here(home)) }
 
 // piIn is Pi as it lives at a place: this machine's home, or a WSL
@@ -790,10 +889,96 @@ func homeDir(home, d string) string {
 	return filepath.Clean(d)
 }
 
+// beforeMagpie is a copy of an agent's own files taken before magpie first
+// writes them (file.before-magpie beside each), which Disconnect puts back
+// byte for byte when what it left says the same as the copy: the same
+// JSON, in the user's own order, spacing and comments-free layout. Where
+// they differ (the user changed something while connected), what
+// Disconnect left stands. A file that wasn't there (named in the stash
+// under absent) goes again when nothing but empty objects is left in it.
+type beforeMagpie struct {
+	absent string
+	files  []string
+}
+
+// take copies each file aside, or notes it absent; a file that can't be
+// read is neither, and isn't put back.
+func (b beforeMagpie) take() {
+	var gone []string
+	for _, f := range b.files {
+		raw, err := os.ReadFile(f)
+		switch {
+		case err == nil:
+			if edit.WriteAtomic(f+".before-magpie", raw) != nil {
+				os.Remove(f + ".before-magpie")
+			}
+		case errors.Is(err, fs.ErrNotExist):
+			os.Remove(f + ".before-magpie")
+			gone = append(gone, filepath.Base(f))
+		default:
+			os.Remove(f + ".before-magpie")
+		}
+	}
+	stash(map[string]string{b.absent: strings.Join(gone, "\n")})
+}
+
+// restore puts back what take kept, where Disconnect left the same.
+func (b beforeMagpie) restore() error {
+	gone := strings.Split(unstash(b.absent), "\n")
+	for _, f := range b.files {
+		cur, err := os.ReadFile(f)
+		if err != nil {
+			os.Remove(f + ".before-magpie")
+			continue
+		}
+		var now any
+		if json.Unmarshal(edit.TrimBOM(cur), &now) != nil { // a BOM is the user's own (#1534)
+			continue
+		}
+		if was, err := os.ReadFile(f + ".before-magpie"); err == nil {
+			var then any
+			if json.Unmarshal(edit.TrimBOM(was), &then) == nil && reflect.DeepEqual(now, then) && !bytes.Equal(cur, was) {
+				if err := edit.WriteAtomic(f, was); err != nil {
+					return err
+				}
+			}
+			os.Remove(f + ".before-magpie")
+			continue
+		}
+		if slices.Contains(gone, filepath.Base(f)) && emptyJSON(now) {
+			if err := os.Remove(f); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// emptyJSON says v is an object holding nothing but empty objects.
+func emptyJSON(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, x := range m {
+		if !emptyJSON(x) {
+			return false
+		}
+	}
+	return true
+}
+
 // piLike is Pi, or a fork of it that keeps Pi's settings.json and
 // models.json in an agent folder of its own (OmO, omo.go): id is its id,
 // icon and command, dir its agent folder.
 func piLike(at place, id, name, dir string) *Agent {
+	return piLikeKeyed(at, id, name, dir, at.gwKey)
+}
+
+// piLikeKeyed is piLike whose provider "magpie" carries key's key: one
+// that names the agent (agentKeyAt) for an agent whose requests carry
+// nothing else of it (Prime Agent, primeagent.go).
+func piLikeKeyed(at place, id, name, dir string, key func() string) *Agent {
 	path := filepath.Join(dir, "settings.json")
 	modelsPath := filepath.Join(dir, "models.json")
 	auth := filepath.Join(dir, "auth.json")
@@ -802,21 +987,47 @@ func piLike(at place, id, name, dir string) *Agent {
 	pair := pairSet(set, "defaultProvider", "defaultModel")
 	// the model a new session starts on, as the model field shows it
 	startup := func() string { return piStartup(path, pairGet(get, "defaultProvider", "defaultModel")()) }
-	block := theirsKept(modelsPath, "providers."+magpieID, func() any { return magpieProviderJSONAt("pi", id, at.gw()) }, "models")
+	block := piBlockKept(modelsPath, func() any {
+		b := magpieProviderJSONAt("pi", id, at.gw()).(map[string]any)
+		b["apiKey"] = key()
+		return b
+	})
 	writeMagpie := func() error {
 		return edit.SetJSON(modelsPath, edit.KV{Path: "providers." + magpieID, Value: block()})
 	}
+	// the user's two files as they were before magpie's first write, put
+	// back byte for byte by Disconnect where it leaves them saying the same
+	before := beforeMagpie{at.key(id + ".before.absent"), []string{path, modelsPath}}
+	// the entries of enabledModels a sync took out (scope_gone.go)
+	gone := at.key(id + ".scope.gone")
 	return &Agent{
 		ID: id, Name: name, Icon: id, Bin: id, Dir: dir, Path: path, Spelled: prefixed,
+		Restore: before.restore,
 		Check: func() string {
 			if p, _ := get("defaultProvider"); p != magpieID {
 				return ""
 			}
 			return wiringOff(name, modelsPath, func(k string) (string, bool) { return edit.GetJSON(modelsPath, "providers."+magpieID+"."+k) },
-				"baseUrl", at.v1(), "apiKey", at.gwKey())
+				"baseUrl", at.v1(), "apiKey", key())
 		},
 		Sync: func() error {
-			return syncJSON(modelsPath, "providers."+magpieID, block)
+			if err := syncJSON(modelsPath, "providers."+magpieID, block); err != nil {
+				return err
+			}
+			// an entry on a model magpie no longer gives Pi names nothing
+			// (#2055, scope_gone.go)
+			return piScopeSynced(path, modelsPath, gone)
+		},
+		// a provider renamed takes its magpie/<id>/ entries in enabledModels
+		// with it: an entry left on the old id names nothing, and Pi would
+		// leave that model out of Ctrl+P (#1919, #1828)
+		RenameRefs: func(from, to string) (bool, error) {
+			scopeGoneRename(gone, from, to)
+			next, ok := renameRefList(piScope(path), from, to)
+			if !ok {
+				return false, nil
+			}
+			return true, edit.SetJSON(path, edit.KV{Path: "enabledModels", Value: next})
 		},
 		Fields: []Field{
 			{
@@ -831,9 +1042,15 @@ func piLike(at place, id, name, dir string) *Agent {
 						if err := edit.DelJSON(modelsPath, "providers."+magpieID); err != nil {
 							return err
 						}
+						forget(gone)
 						return piScopeWithout(path)
 					}
 					if ref, ok := strings.CutPrefix(v, magpieID+"/"); ok && isMagpie(ref) {
+						if _, has := edit.GetJSON(modelsPath, "providers."+magpieID); !has {
+							if p, _ := get("defaultProvider"); p != magpieID {
+								before.take()
+							}
+						}
 						if err := writeMagpie(); err != nil {
 							return err
 						}
@@ -913,20 +1130,20 @@ func gooseIn(at place, cfg string) *Agent {
 		keyEnv = func(string) string { return "" }
 	}
 	return &Agent{
-		ID: "goose", Name: "Goose", Icon: "goose", Bin: "goose", Dir: filepath.Dir(path), Path: path, Spelled: prefixed,
+		ID: "goose", Name: "Goose", Icon: "goose", Bin: "goose", Dir: filepath.Dir(path), Path: path, Spelled: prefixed, NoNames: true,
 		UA: []string{"goose"},
 		Check: func() string {
 			if p, _ := gooseActive(path); p != gooseProviderID {
 				return ""
 			}
 			return wiringOff("Goose", provider, func(k string) (string, bool) { return edit.GetJSON(provider, k) },
-				"base_url", at.v1(), "headers.Authorization", "Bearer "+at.gwKey())
+				"base_url", at.v1(), "headers.Authorization", "Bearer "+gooseKey(at))
 		},
 		Sync: func() error { return syncGooseProvider(provider, at) },
 		// goose loads custom_providers when it starts
 		Notice: func() string {
 			if p, _ := gooseActive(path); p == gooseProviderID && Running(`Goose\.app/`, `(^|/)goose( |$)`) {
-				return "Goose loads its providers at start-up — quit and reopen Goose (and open goose sessions) to use magpie's models."
+				return noticeGoose.String()
 			}
 			return ""
 		},
@@ -936,7 +1153,7 @@ func gooseIn(at place, cfg string) *Agent {
 			if agentDir(filepath.Dir(path)) {
 				return true
 			}
-			bin, err := exec.LookPath("goose")
+			bin, err := proc.Look("goose")
 			return err == nil && !goProgram(bin)
 		},
 		Fields: []Field{{
@@ -1018,6 +1235,11 @@ func copilot(home string) *Agent {
 		ID: "copilot", Name: "Copilot CLI", Icon: "githubcopilot", Aliases: []string{"gh-copilot"},
 		UA:  []string{"copilot", "github-copilot"},
 		Bin: "copilot", Dir: dir, Path: path,
+		// GitHub Copilot's JetBrains and VS Code plugins write ~/.copilot
+		// too (agents, skills, hooks, instructions, prompts, ide), so the
+		// folder says nothing of the CLI: its settings.json or the copilot
+		// command does (#1495)
+		dirShared: true,
 		Fields: []Field{{
 			Key: "model", Label: "model",
 			Get: jsonGet(path, "model"),
@@ -1119,7 +1341,7 @@ func crushAt(at place, path, data string) *Agent {
 				var c struct {
 					Providers map[string]json.RawMessage `json:"providers"`
 				}
-				if json.Unmarshal(b, &c) == nil {
+				if json.Unmarshal(edit.TrimBOM(b), &c) == nil {
 					for p := range c.Providers {
 						if p != magpieID {
 							extra = append(extra, p)
@@ -1211,4 +1433,18 @@ func crushAt(at place, path, data string) *Agent {
 			},
 		},
 	}
+}
+
+// what goose says after a change (notice.go)
+var (
+	noticeGoose = newNotice("Goose loads its providers at start-up — quit and reopen Goose (and open goose sessions) to use magpie's models.")
+)
+
+// readOwnAuth is os.ReadFile for an agent's own sign-ins (OpenCode's
+// auth.json and its kin), left unread with account discovery off (#1535).
+func readOwnAuth(path string) ([]byte, error) {
+	if settings.AccountDiscoveryOff() {
+		return nil, os.ErrNotExist
+	}
+	return os.ReadFile(path)
 }

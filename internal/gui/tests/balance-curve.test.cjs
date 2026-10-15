@@ -28,12 +28,12 @@ function fixtures(now) {
   ];
 }
 
-function serve(lang, theme, quotas) {
-  const settings = { theme, lang, tray: "panel", quotaLeft: false, currency: "usd" };
+function serve(lang, theme, quotas, colorblind = false) {
+  const settings = { theme, lang, tray: "panel", quotaLeft: false, currency: "usd", colorblind };
   return async (route) => {
     const url = new URL(route.request().url());
     const json = (body) => route.fulfill({ json: body });
-    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:"${lang}",theme:"${theme}",web:true};` });
+    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:"${lang}",theme:"${theme}",web:true,colorblind:${colorblind}};` });
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings });
     if (url.pathname === "/api/settings") return json(settings);
@@ -132,4 +132,44 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.deepEqual(errors, []);
     });
   }
+}
+
+// Colorblind mode (#2073) dashes a quota curve's windows by their place in
+// it; the balance curve has one line, kept solid beside its dashed fit, and
+// its legend keeps its dot in the line's colour.
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  test(`${engine}: colorblind mode leaves the balance curve's solid line, dashed fit and dot as they were`, async (t) => {
+    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+    t.after(() => browser.close());
+    const errors = [];
+    const read = async (theme, colorblind) => {
+      const page = await (await browser.newContext({ viewport: { width: 900, height: 520 }, reducedMotion: "reduce" })).newPage();
+      page.setDefaultTimeout(5000);
+      page.on("pageerror", (e) => errors.push(e.message));
+      await page.route("**/*", serve("en", theme, fixtures(Date.now()), colorblind));
+      await page.goto("http://magpie.test/?view=usage");
+      const curve = page.locator(".subscription-card", { hasText: "DeepSeek" }).locator(".balance-curve");
+      await curve.waitFor();
+      const got = await curve.evaluate((c) => {
+        const line = getComputedStyle(c.querySelector("path.qc-line")), fit = getComputedStyle(c.querySelector("line.bc-fit"));
+        const dot = getComputedStyle(c.querySelector(".qc-key i"));
+        return { cb: document.documentElement.dataset.colorblind || "", line: line.strokeDasharray, stroke: line.stroke, fit: fit.strokeDasharray,
+          dot: dot.display, dotColor: dot.backgroundColor, dotShadow: dot.boxShadow, title: c.title };
+      });
+      await page.context().close();
+      return got;
+    };
+    for (const theme of ["light", "dark"]) {
+      const plain = await read(theme, false), cb = await read(theme, true);
+      assert.equal(cb.cb, "1");
+      assert.equal(cb.line, "none", `the balance stays solid: ${JSON.stringify(cb)}`);
+      assert.equal(cb.fit, plain.fit, "its fit keeps its dashes");
+      assert.notEqual(cb.fit, "none");
+      assert.notEqual(cb.dot, "none", "its legend keeps the dot");
+      assert.equal(cb.dotShadow, "none", "a filled dot, not a ring");
+      assert.equal(cb.dotColor, cb.stroke, `the dot is the line's colour: ${JSON.stringify(cb)}`);
+      assert.equal(cb.title, plain.title, "its tooltip still says solid and dashed");
+    }
+    assert.deepEqual(errors, []);
+  });
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
@@ -429,5 +430,143 @@ func TestRTKNoHookListed(t *testing.T) {
 	}
 	if _, err := RTKTakes("dsh"); err == nil || !strings.Contains(err.Error(), "rewriting the shell command") {
 		t.Fatalf("magpie library rtk on dsh: %v", err)
+	}
+}
+
+// fakeRTKHermes acts as rtk 0.51's rtk init -g --agent hermes does
+// (src/hooks/init/hermes.rs): its plugin and config go into $HERMES_HOME,
+// else ~/.hermes, whatever the OS. It notes the HERMES_HOME it was given.
+const fakeRTKHermes = `#!/bin/sh
+case "$1" in
+--version) echo "rtk 0.51.0"; exit 0 ;;
+gain) echo '{"summary":{}}'; exit 0 ;;
+esac
+shift 2
+[ "$*" = "--agent hermes --auto-patch" ] || { echo "unknown: $*" >&2; exit 2; }
+h="${HERMES_HOME:-$HOME/.hermes}"
+echo "$HERMES_HOME" > "$HOME/given"
+/bin/mkdir -p "$h/plugins/rtk-rewrite"
+echo "name: rtk-rewrite" > "$h/plugins/rtk-rewrite/plugin.yaml"
+echo "x" > "$h/plugins/rtk-rewrite/__init__.py"
+printf 'plugins:\n  enabled:\n    - rtk-rewrite\n' >> "$h/config.yaml"
+echo "Config: $h/config.yaml"
+echo "Hermes will now rewrite terminal commands through rtk. Restart Hermes."
+echo "Test with: git status"
+`
+
+// TestRTKHermesHome (新v学员 on Discord, native Windows): Hermes's folder is
+// %LOCALAPPDATA%\hermes there, and rtk's installer wrote its plugin into it,
+// while magpie looked for the plugin in ~/.hermes: "rtk's installer didn't
+// add its hook to Hermes Agent". The plugin is looked for, and taken out,
+// in Hermes's own folder (appdir.HermesHome), and the installer is told
+// that folder, since rtk itself knows only $HERMES_HOME and ~/.hermes.
+func TestRTKHermesHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake rtk is a shell script")
+	}
+	h := sandbox(t)
+	bin := filepath.Join(h, "bin")
+	testenv.Program(t, filepath.Join(bin, "rtk"), fakeRTKHermes)
+	holdCLI(t, h, "hermes") // the config alone is gone (#2254)
+	t.Setenv("PATH", bin)
+	for _, c := range []struct{ name, env string }{
+		// the reporter's layout: Hermes's folder isn't ~/.hermes
+		{"elsewhere", filepath.Join(h, "AppData", "Local", "hermes")},
+		// Hermes's default here: rtk is still told it, which on Windows
+		// is the one way it writes where Hermes reads
+		{"default", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("HERMES_HOME", c.env)
+			dir := appdir.HermesHome()
+			if c.env != "" && dir != c.env {
+				t.Fatalf("Hermes's folder is %s, want %s", dir, c.env)
+			}
+			cfg := filepath.Join(dir, "config.yaml")
+			write(t, cfg, "model:\n  default: x\n")
+			if _, err := SetRTK("hermes", true); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.TrimSpace(read(t, filepath.Join(h, "given"))); got != dir {
+				t.Errorf("rtk was given HERMES_HOME=%q, want %q", got, dir)
+			}
+			if !exists(filepath.Join(dir, "plugins", "rtk-rewrite", "plugin.yaml")) {
+				t.Fatalf("no plugin in %s", dir)
+			}
+			if c.env != "" && exists(filepath.Join(h, ".hermes")) {
+				t.Error("~/.hermes was made beside Hermes's own folder")
+			}
+			on := false
+			for _, a := range ReadRTK().Agents {
+				if a.ID == "hermes" {
+					on = a.On
+				}
+			}
+			if !on {
+				t.Fatal("Hermes isn't seen with rtk on")
+			}
+			if _, err := SetRTK("hermes", false); err != nil {
+				t.Fatal(err)
+			}
+			if exists(filepath.Join(dir, "plugins", "rtk-rewrite")) {
+				t.Error("rtk's plugin is still in Hermes's folder")
+			}
+			if got := read(t, cfg); got != "model:\n  default: x\n" {
+				t.Errorf("config.yaml = %q", got)
+			}
+			os.RemoveAll(dir)
+		})
+	}
+}
+
+// Grok App is listed on the RTK tab with the switch unable to turn on:
+// rtk init has no Grok agent, so there is nothing to install.
+func TestRTKNoHookGrokApp(t *testing.T) {
+	h := sandbox(t)
+	root := filepath.Join(h, "grok-app-data")
+	t.Setenv("GROK_APP_HOME", root)
+	write(t, filepath.Join(root, "agent-home", "config.toml"), "")
+	var app *RTKAgent
+	for _, a := range ReadRTK().Agents {
+		if a.ID == "grok-app" {
+			app = &a
+		}
+	}
+	if app == nil {
+		t.Fatal("Grok App isn't listed")
+	}
+	if b, _ := json.Marshal(app); app.On || !strings.Contains(string(b), `"noHook":true`) || !strings.Contains(app.Blocked, "no Grok or Grok App agent") {
+		t.Fatalf("listed as %s", b)
+	}
+	if _, err := SetRTK("grok-app", true); err == nil || !strings.Contains(err.Error(), "Grok App") {
+		t.Fatalf("switched on: %v", err)
+	}
+	if _, err := RTKTakes("grok-app"); err == nil || !strings.Contains(err.Error(), "no Grok or Grok App agent") {
+		t.Fatalf("magpie library rtk on grok-app: %v", err)
+	}
+}
+
+// Grok Build, which Grok App runs, has no rtk agent either (#1625's
+// sibling): it is listed with the switch off, never switched on.
+func TestRTKNoHookGrokBuild(t *testing.T) {
+	h := sandbox(t)
+	write(t, filepath.Join(h, ".grok", "config.toml"), "")
+	var grok *RTKAgent
+	for _, a := range ReadRTK().Agents {
+		if a.ID == "grok" {
+			grok = &a
+		}
+	}
+	if grok == nil {
+		t.Fatal("Grok Build isn't listed")
+	}
+	if b, _ := json.Marshal(grok); grok.On || !strings.Contains(string(b), `"noHook":true`) || !strings.Contains(grok.Blocked, "no Grok agent") {
+		t.Fatalf("listed as %s", b)
+	}
+	if _, err := SetRTK("grok", true); err == nil || !strings.Contains(err.Error(), "Grok Build") {
+		t.Fatalf("switched on: %v", err)
+	}
+	if _, err := RTKTakes("grok"); err == nil || !strings.Contains(err.Error(), "no Grok agent") {
+		t.Fatalf("magpie library rtk on grok: %v", err)
 	}
 }

@@ -148,7 +148,7 @@ func TestOptionalFieldMixedValidation(t *testing.T) {
 }
 
 func TestRefusedOptionalNamesOnlyUnsupportedFields(t *testing.T) {
-	request := []byte(`{"store":false,"metadata":{"session":"synthetic"},"service_tier":"default","prompt_cache_retention":"24h","thinking":{"type":"enabled"}}`)
+	request := []byte(`{"store":false,"metadata":{"session":"synthetic"},"service_tier":"default","prompt_cache_retention":"24h","prompt_cache_options":{"mode":"explicit"},"thinking":{"type":"enabled"}}`)
 	for _, tt := range []struct {
 		name, reply string
 		status      int
@@ -175,6 +175,10 @@ func TestRefusedOptionalNamesOnlyUnsupportedFields(t *testing.T) {
 		{"root-location", `{"detail":[{"type":"extra_forbidden","loc":["store"],"msg":"Extra inputs are not permitted"}]}`, 422, []string{"store"}},
 		{"unsupported-code", `{"error":{"message":"Not accepted here","code":"unsupported_parameter","param":"store"}}`, 400, []string{"store"}},
 		{"codex-unquoted-unsupported-parameter", `{"code":null,"message":"Codex: Unsupported parameter: prompt_cache_retention","param":null,"type":"invalid_request_error"}`, 400, []string{"prompt_cache_retention"}},
+		// the ChatGPT backend's, as it gave it on 2026-10-14 (#2154)
+		{"openai-bare-name", `{"error":{"message":"prompt_cache_options is not supported on this model","type":"invalid_request_error","param":"prompt_cache_options","code":"invalid_parameter"}}`, 400, []string{"prompt_cache_options"}},
+		{"bare-name-not-leading", `{"error":{"message":"The input said metadata is not supported here"}}`, 400, nil},
+		{"bare-name-other-field", `{"error":{"message":"reasoning is not supported on this model"}}`, 400, nil},
 		{"plain-error", `Unknown name "store": Cannot find field.`, 400, []string{"store"}},
 		{"status-prefix", `[400] Unknown name "store": Cannot find field.`, 400, []string{"store"}},
 		{"text-status-prefix", `[HTTP 400] Unknown name "store": Cannot find field.`, 400, []string{"store"}},
@@ -238,4 +242,35 @@ func optionalFieldReply(proto provider.Protocol) string {
 		`data: {"id":"c1","model":"m1","choices":[{"delta":{"content":"ok"}}]}`,
 		`data: {"id":"c1","choices":[{"delta":{},"finish_reason":"stop"}]}`,
 		`data: [DONE]`)
+}
+
+// #2154 (neavo): pi-ai sends prompt_cache_options, which OpenAI's Responses
+// API turns away by its bare name: asked again without it, and not sent it
+// again, while the cache key stays.
+func TestPromptCacheOptionsRefusedRetried(t *testing.T) {
+	f := &fake{t: t, reply: optionalFieldReply(provider.Responses)}
+	f.refuse = func(b []byte) (int, string) {
+		var v map[string]json.RawMessage
+		json.Unmarshal(b, &v)
+		if _, present := v["prompt_cache_options"]; present {
+			return 400, `{"error":{"message":"prompt_cache_options is not supported on this model","type":"invalid_request_error","param":"prompt_cache_options","code":"invalid_parameter"}}`
+		}
+		return 0, ""
+	}
+	setup(t, provider.Responses, f)
+	srv := New()
+	path, body := optionalFieldAsk(provider.Responses)
+	request := string(withFields([]byte(body), map[string]any{"prompt_cache_options": map[string]string{"mode": "explicit"}, "prompt_cache_key": "k1"}))
+	for turn, want := range []int{2, 1} {
+		calls := f.calls
+		code, reply := postTo(t, srv, path, request)
+		if code != 200 || f.calls-calls != want {
+			t.Fatalf("turn %d: %d after %d calls, want %d: %s", turn+1, code, f.calls-calls, want, reply)
+		}
+		var sent map[string]json.RawMessage
+		json.Unmarshal(f.got, &sent)
+		if sent["prompt_cache_options"] != nil || sent["prompt_cache_key"] == nil {
+			t.Errorf("turn %d: options kept or the key lost: %s", turn+1, f.got)
+		}
+	}
 }

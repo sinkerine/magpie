@@ -171,6 +171,18 @@ func TestZCodeAccounts(t *testing.T) {
 	if r := q.Resets; r == nil || r.Count != 2 || r.FiveHour != 1 || r.Weekly != 1 || r.Team {
 		t.Fatalf("resets: %+v", r)
 	}
+	// a window whose whole is told carries the count itself, as amount of
+	// limit (#659): the card says it as used or as left, as it says the share
+	w := q.Windows[0]
+	if w.Amount != 500 || w.Limit != 2000 {
+		t.Fatalf("5 hours count: %v of %v", w.Amount, w.Limit)
+	}
+	if w.Count(false) != groupedNumber(500)+" / "+groupedNumber(2000) || w.Count(true) != groupedNumber(1500)+" / "+groupedNumber(2000) {
+		t.Fatalf("5 hours count as used or as left: %q %q", w.Count(false), w.Count(true))
+	}
+	if w := q.Windows[1]; w.Amount != 1000 || w.Limit != 10000 {
+		t.Fatalf("Weekly count: %v of %v", w.Amount, w.Limit)
+	}
 
 	if err := SwitchLogin("zcode", "two@example.com"); err != nil {
 		t.Fatal(err)
@@ -192,5 +204,89 @@ func TestZCodeAccounts(t *testing.T) {
 	os.Remove(filepath.Join(home, ".zcode", "v2", "credentials.json"))
 	if _, ok := find(All(), "zcode"); ok {
 		t.Fatal("zcode without an account")
+	}
+}
+
+// ZCode 3.15 keeps no coding plan key in its credentials: a BigModel GLM
+// Coding Pro's key sits in config.json, the built-in coding plan
+// provider's options.apiKey, and the account reads as that plan, not as
+// one with no plan and a Start Plan ended (#2130).
+func TestZCodePlanKeyFromConfig(t *testing.T) {
+	home := signIn(t)
+	t.Setenv("ZCODE_CREDENTIAL_SECRET", "test-secret")
+	dir := filepath.Join(home, ".zcode", "v2")
+	writeFile(t, filepath.Join(dir, "credentials.json"), map[string]any{
+		"oauth:bigmodel:user_info":    zcodeEncrypt(t, `{"user_id":"u1","email":"bm@example.com","name":"bm"}`),
+		"oauth:bigmodel:access_token": zcodeEncrypt(t, "tok"),
+		"zcodejwttoken":               zcodeEncrypt(t, "Bearer zc"),
+	})
+	// as the reporter's: OpenCode's layout, the key as it is
+	writeFile(t, filepath.Join(dir, "config.json"), map[string]any{
+		"$schema": "https://opencode.ai/config.json",
+		"provider": map[string]any{
+			"builtin:bigmodel-coding-plan": map[string]any{
+				"name":    "GLM Coding Plan",
+				"options": map[string]any{"apiKey": "bm.secret", "baseURL": "https://open.bigmodel.cn/api/anthropic"},
+				"models":  map[string]any{"glm-5.1": map[string]any{}},
+			},
+			"builtin:zai-coding-plan": map[string]any{"options": map[string]any{"apiKey": ""}},
+		},
+	})
+	var start atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ok := func(data any) { json.NewEncoder(w).Encode(map[string]any{"code": 200, "success": true, "data": data}) }
+		auth := r.Header.Get("Authorization")
+		switch {
+		case strings.Contains(r.URL.Path, "/balance") || strings.Contains(r.URL.Path, "start"):
+			start.Add(1)
+			w.WriteHeader(404)
+		case auth != "bm.secret":
+			w.WriteHeader(401)
+		case r.URL.Path == "/api/biz/subscription/list":
+			ok([]any{map[string]any{"productName": "GLM Coding Pro", "status": "VALID"}})
+		case r.URL.Path == "/api/monitor/usage/quota/limit":
+			reset := time.Now().Add(time.Hour).UnixMilli()
+			ok(map[string]any{"level": "pro", "limits": []any{
+				map[string]any{"type": "TOKENS_LIMIT", "unit": 3, "number": 5, "percentage": 1, "nextResetTime": reset},
+				map[string]any{"type": "TOKENS_LIMIT", "unit": 6, "number": 1, "percentage": 5, "nextResetTime": reset},
+			}})
+		default:
+			ok([]any{})
+		}
+	}))
+	defer srv.Close()
+	oldAPI, oldZai, oldBM, oldZaiBase, oldBMBase := zcodeAPI, zcodeZaiAPI, zcodeBigModelAPI, ZCodeZaiBase, ZCodeBigModelBase
+	zcodeAPI, zcodeZaiAPI, zcodeBigModelAPI = srv.URL, srv.URL, srv.URL
+	ZCodeZaiBase, ZCodeBigModelBase = srv.URL+"/zai/api/anthropic", srv.URL+"/bigmodel/api/anthropic"
+	defer func() {
+		zcodeAPI, zcodeZaiAPI, zcodeBigModelAPI, ZCodeZaiBase, ZCodeBigModelBase = oldAPI, oldZai, oldBM, oldZaiBase, oldBMBase
+	}()
+
+	who, k, ok := zcodeOwn()
+	if !ok || who != "bm@example.com" || k.Key != "bm.secret" || k.Base != ZCodeBigModelBase || k.JWT != "zc" {
+		t.Fatalf("own: %v %q %+v", ok, who, k)
+	}
+	q := zcodeQuota(context.Background(), Login{User: who}, k)
+	if q.Error != "" || q.Plan != "GLM Coding Pro" || len(q.Windows) != 2 {
+		t.Fatalf("quota: %+v", q)
+	}
+	if n := start.Load(); n != 0 {
+		t.Fatalf("the Start Plan asked %d times for an account with a Coding Plan", n)
+	}
+
+	// a key written encrypted reads too; one that isn't a key doesn't
+	writeFile(t, filepath.Join(dir, "config.json"), map[string]any{"provider": map[string]any{
+		"builtin:zai-coding-plan":      map[string]any{"options": map[string]any{"apiKey": "{env:ZAI_KEY}"}},
+		"builtin:bigmodel-coding-plan": map[string]any{"options": map[string]any{"apiKey": zcodeEncrypt(t, "bm.secret")}},
+	}})
+	if _, k, _ := zcodeOwn(); k.Key != "bm.secret" || k.Base != ZCodeBigModelBase {
+		t.Fatalf("encrypted: %+v", k)
+	}
+	// a key in credentials.json still comes first
+	writeFile(t, filepath.Join(dir, "credentials.json"), map[string]any{
+		"account-provider:coding-plan:account:zai-individual-coding-plan:account:a:api-key": zcodeEncrypt(t, "own.secret"),
+	})
+	if _, k, _ := zcodeOwn(); k.Key != "own.secret" || k.Base != ZCodeZaiBase {
+		t.Fatalf("credentials first: %+v", k)
 	}
 }

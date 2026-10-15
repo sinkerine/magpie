@@ -1,9 +1,13 @@
 package library
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -69,6 +73,139 @@ func TestSkillRepoTraced(t *testing.T) {
 	}
 }
 
+// A site's kit of skills (npx skills add from a /.well-known/agent-skills/
+// index) is one group, by the lock's sourceBaseUrl (#1862, WardLu): the
+// reporter's three Feishu skills and two Fish Audio ones, each with a
+// sourceUrl of its own, were five groups. Another kit under the same host
+// with another base URL stays apart. A lock with no sourceBaseUrl is
+// grouped by the base in its sourceUrl, before /.well-known/.
+func TestWellKnownKitGrouped(t *testing.T) {
+	h := sandbox(t)
+	const feishu = "https://open.feishu.cn/lark-cli/skills/regular"
+	lock := map[string][2]string{ // name: sourceBaseUrl, sourceUrl
+		"lark-base":      {feishu, feishu + "/.well-known/agent-skills/lark-base.tar.gz"},
+		"lark-doc":       {feishu, feishu + "/.well-known/agent-skills/lark-doc.tar.gz"},
+		"lark-sheets":    {feishu, feishu + "/.well-known/agent-skills/lark-sheets.tar.gz"},
+		"fish-audio-api": {"https://docs.fish.audio", "https://docs.fish.audio/.well-known/agent-skills/fish-audio-api/skill.md"},
+		"fish-audio-sdk": {"https://docs.fish.audio/", "https://docs.fish.audio/.well-known/agent-skills/fish-audio-sdk/skill.md"},
+		// the same host, another kit
+		"lark-admin": {"https://open.feishu.cn/lark-cli/skills/admin", "https://open.feishu.cn/lark-cli/skills/admin/.well-known/agent-skills/lark-admin.tar.gz"},
+		// a lock from before sourceBaseUrl
+		"lark-old": {"", feishu + "/.well-known/agent-skills/lark-old.tar.gz"},
+		// a kit one folder down a site, which reads like owner/repo
+		"kit-one": {"https://docs.example.com/kit", "https://docs.example.com/kit/.well-known/agent-skills/kit-one/SKILL.md"},
+	}
+	var entries []string
+	os.MkdirAll(filepath.Join(h, ".claude/skills"), 0o755)
+	var names []string
+	for n, u := range lock {
+		skill(t, filepath.Join(h, ".agents/skills", n), n, "D")
+		dirLink(filepath.Join(h, ".agents/skills", n), filepath.Join(h, ".claude/skills", n))
+		base := ""
+		if u[0] != "" {
+			base = `,"sourceBaseUrl":"` + u[0] + `"`
+		}
+		entries = append(entries, `"`+n+`":{"sourceType":"well-known","sourceUrl":"`+u[1]+`"`+base+`}`)
+		names = append(names, n)
+	}
+	write(t, filepath.Join(h, ".agents/.skill-lock.json"), `{"version":3,"skills":{`+strings.Join(entries, ",")+`}}`)
+	ok(t)(ImportSkills(names))
+
+	got := repoIn(t)
+	for n, want := range map[string]string{
+		"lark-base": "open.feishu.cn/lark-cli/skills/regular", "lark-doc": "open.feishu.cn/lark-cli/skills/regular",
+		"lark-sheets": "open.feishu.cn/lark-cli/skills/regular", "lark-old": "open.feishu.cn/lark-cli/skills/regular",
+		"fish-audio-api": "docs.fish.audio", "fish-audio-sdk": "docs.fish.audio",
+		"lark-admin": "open.feishu.cn/lark-cli/skills/admin", "kit-one": "docs.example.com/kit",
+	} {
+		if got[n] != want {
+			t.Errorf("%s: repo %q, want %q", n, got[n], want)
+		}
+	}
+
+	// Group again fetches GitHub repositories only: none of these is one
+	var asked []string
+	oldT := tarballURL
+	tarballURL = func(repo, ref string) string { asked = append(asked, repo); return "http://127.0.0.1:1/" }
+	t.Cleanup(func() { tarballURL = oldT })
+	if _, err := RegroupSkills(); err != nil {
+		t.Fatal(err)
+	}
+	if len(asked) != 0 {
+		t.Errorf("fetched from GitHub: %v", asked)
+	}
+}
+
+// #1862 (WardLu, v0.1.1223): skills brought into the library before
+// well-known kits were grouped by their base kept the lock's key of then
+// as their From, each skill's own sourceUrl, and From is read before the
+// lock, so Feishu's three were three groups and Fish Audio's two were two
+// after the fix. The reporter's lock entries, with From as v0.1.1217's
+// ImportSkills wrote it.
+func TestWellKnownKitFromBeforeGrouped(t *testing.T) {
+	h := sandbox(t)
+	lock := `{"skills":{
+  "lark-base":{"source":"open.feishu.cn","sourceType":"well-known","sourceUrl":"https://open.feishu.cn/lark-cli/skills/regular/.well-known/agent-skills/lark-base.tar.gz","sourceBaseUrl":"https://open.feishu.cn/lark-cli/skills/regular"},
+  "lark-doc":{"source":"open.feishu.cn","sourceType":"well-known","sourceUrl":"https://open.feishu.cn/lark-cli/skills/regular/.well-known/agent-skills/lark-doc.tar.gz","sourceBaseUrl":"https://open.feishu.cn/lark-cli/skills/regular"},
+  "lark-sheets":{"source":"open.feishu.cn","sourceType":"well-known","sourceUrl":"https://open.feishu.cn/lark-cli/skills/regular/.well-known/agent-skills/lark-sheets.tar.gz","sourceBaseUrl":"https://open.feishu.cn/lark-cli/skills/regular"},
+  "fish-audio-api":{"source":"docs.fish.audio","sourceType":"well-known","sourceUrl":"https://docs.fish.audio/.well-known/agent-skills/fish-audio-api/skill.md","sourceBaseUrl":"https://docs.fish.audio"},
+  "fish-audio-sdk":{"source":"docs.fish.audio","sourceType":"well-known","sourceUrl":"https://docs.fish.audio/.well-known/agent-skills/fish-audio-sdk/skill.md","sourceBaseUrl":"https://docs.fish.audio"}
+}}`
+	write(t, filepath.Join(h, ".agents/.skill-lock.json"), lock)
+	before := map[string]string{ // remoteRepo of each sourceUrl, the key before 97dfed0f3
+		"lark-base":      "open.feishu.cn/lark-cli/skills/regular/.well-known/agent-skills/lark-base.tar.gz",
+		"lark-doc":       "open.feishu.cn/lark-cli/skills/regular/.well-known/agent-skills/lark-doc.tar.gz",
+		"lark-sheets":    "open.feishu.cn/lark-cli/skills/regular/.well-known/agent-skills/lark-sheets.tar.gz",
+		"fish-audio-api": "docs.fish.audio/.well-known/agent-skills/fish-audio-api/skill.md",
+		"fish-audio-sdk": "docs.fish.audio/.well-known/agent-skills/fish-audio-sdk/skill.md",
+	}
+	var names []string
+	for n := range before {
+		skill(t, filepath.Join(h, ".agents/skills", n), n, "D")
+		names = append(names, n)
+	}
+	ok(t)(ImportSkills(names))
+	l := mustLoad(t)
+	for n, f := range before {
+		l.skill(n).From = f
+	}
+	if err := l.save(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := repoIn(t)
+	for n := range before {
+		want := "docs.fish.audio"
+		if strings.HasPrefix(n, "lark-") {
+			want = "open.feishu.cn/lark-cli/skills/regular"
+		}
+		if got[n] != want {
+			t.Errorf("%s: repo %q, want %q", n, got[n], want)
+		}
+	}
+}
+
+// A well-known kit's base, from the lock's sourceBaseUrl or else its
+// sourceUrl; neither an http(s) address, its sourceUrl as a remote.
+func TestWellKnownBase(t *testing.T) {
+	for _, c := range []struct{ base, src, want string }{
+		{"https://open.feishu.cn/lark-cli/skills/regular", "", "open.feishu.cn/lark-cli/skills/regular"},
+		{"https://Docs.Fish.Audio/", "", "docs.fish.audio"},
+		{"https://www.example.com/kit/?v=2", "", "example.com/kit"},
+		{"https://me:tok@example.com/kit", "", "example.com/kit"},
+		{"https://example.com/kit/.well-known/agent-skills/index.json", "", "example.com/kit"},
+		{"", "https://docs.fish.audio/.well-known/agent-skills/fish-audio-api/skill.md", "docs.fish.audio"},
+		{"not a url", "https://example.com/a/.well-known/agent-skills/x.tar.gz", "example.com/a"},
+		{"", "https://example.com/team/kit.git", "example.com/team/kit"},
+		{"file:///etc/kit", "", ""},
+		{"https://example.com/../etc", "", ""},
+	} {
+		if got := wellKnownBase(c.base, c.src); got != c.want {
+			t.Errorf("%q %q: %q, want %q", c.base, c.src, got, c.want)
+		}
+	}
+}
+
 // The remote forms git takes, each read as the repository.
 func TestRemoteRepo(t *testing.T) {
 	for in, want := range map[string]string{
@@ -129,4 +266,97 @@ func mustLoad(t *testing.T) *Library {
 		t.Fatal(err)
 	}
 	return l
+}
+
+// A pack added a while ago is mostly older copies of its skills (White
+// Immortal on Discord: 20 of mattpocock/skills' 38 grouped, the rest
+// edited there since). Group again fetches each repository the library
+// has skills from, and the skills it has by name that are traced to
+// nowhere join the rest of it; one of the user's own it doesn't have, and
+// one traced to another repository, stay where they are.
+func TestRegroupOlderCopies(t *testing.T) {
+	h := sandbox(t)
+	repos := map[string]map[string]string{
+		"someone/pack": {
+			"skills/eng/same/SKILL.md":    "---\nname: same\ndescription: Same\n---\nBody\n",
+			"skills/eng/edited/SKILL.md":  "---\nname: edited\ndescription: Edited since\n---\nNew body\n",
+			"skills/misc/later/SKILL.md":  "---\nname: later\ndescription: Rewritten\n---\nAll new\n",
+			"skills/misc/locked/SKILL.md": "---\nname: locked\ndescription: Theirs\n---\n",
+		},
+		"other/locked": {"skills/locked/SKILL.md": "---\nname: locked\ndescription: Locked\n---\n"},
+	}
+	var asked []string
+	var amu sync.Mutex
+	tar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		repo := strings.TrimPrefix(r.URL.Path, "/tar/")
+		amu.Lock()
+		asked = append(asked, repo)
+		amu.Unlock()
+		files, ok := repos[repo]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write(tarball(t, files))
+	}))
+	t.Cleanup(tar.Close)
+	oldT := tarballURL
+	tarballURL = func(repo, ref string) string { return tar.URL + "/tar/" + repo }
+	t.Cleanup(func() { tarballURL = oldT })
+
+	// the copies as added before: same is the repository's own, edited
+	// and later older ones, mine the user's own
+	write(t, filepath.Join(h, ".claude/skills/same/SKILL.md"), repos["someone/pack"]["skills/eng/same/SKILL.md"])
+	skill(t, filepath.Join(h, ".claude/skills/edited"), "edited", "Edited")
+	skill(t, filepath.Join(h, ".claude/skills/later"), "later", "Later")
+	skill(t, filepath.Join(h, ".claude/skills/mine"), "mine", "Mine")
+	// npx skills add other/locked: traced by the lock
+	skill(t, filepath.Join(h, ".agents/skills/locked"), "locked", "Locked")
+	write(t, filepath.Join(h, ".agents/.skill-lock.json"), `{"version":3,"skills":{"locked":{"source":"other/locked","sourceType":"github"}}}`)
+	dirLink(filepath.Join(h, ".agents/skills/locked"), filepath.Join(h, ".claude/skills/locked"))
+	ok(t)(ImportSkills([]string{"same", "edited", "later", "mine", "locked"}))
+	// same grouped before, as installing from the repository again did
+	l := mustLoad(t)
+	l.skill("same").From = "someone/pack"
+	if err := l.save(); err != nil {
+		t.Fatal(err)
+	}
+	if r := repoIn(t)["edited"]; r != "" {
+		t.Fatalf("edited has a repo before: %q", r)
+	}
+
+	n, err := RegroupSkills()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := repoIn(t)
+	want := map[string]string{"same": "someone/pack", "edited": "someone/pack", "later": "someone/pack", "mine": "", "locked": "other/locked"}
+	for name, r := range want {
+		if got[name] != r {
+			t.Errorf("%s: repo %q, want %q", name, got[name], r)
+		}
+	}
+	if n != 2 {
+		t.Errorf("grouped %d, want 2", n)
+	}
+	amu.Lock()
+	slices.Sort(asked)
+	if !slices.Equal(asked, []string{"other/locked", "someone/pack"}) {
+		t.Errorf("fetched %v", asked)
+	}
+	asked = nil
+	amu.Unlock()
+
+	// nothing more to group: none grouped, nothing wrong
+	if n, err := RegroupSkills(); err != nil || n != 0 {
+		t.Errorf("again: %d %v", n, err)
+	}
+	// GitHub not answering: said, nothing changed
+	tarballURL = func(repo, ref string) string { return tar.URL + "/tar/gone/" + repo }
+	if _, err := RegroupSkills(); err == nil {
+		t.Error("no repository fetched, and no error")
+	}
+	if r := repoIn(t)["edited"]; r != "someone/pack" {
+		t.Errorf("edited after a failed regroup: %q", r)
+	}
 }

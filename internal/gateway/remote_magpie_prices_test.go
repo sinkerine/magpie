@@ -157,8 +157,8 @@ func TestRemoteMagpiePricesTold(t *testing.T) {
 	if _, got := priced("127.0.0.1:5000", "", false); got {
 		t.Error("prices told to a list that didn't ask (an older magpie, an agent)")
 	}
-	t.Setenv("MAGPIE_ADDR", "0.0.0.0:0") // open to anyone, magpie not shared
-	if code, got := priced("192.168.1.9:5000", "", true); code != 200 || got {
+	t.Setenv("MAGPIE_ADDR", "0.0.0.0:0") // on the network, magpie not shared
+	if code, got := priced("192.168.1.9:5000", "", true); code != http.StatusUnauthorized || got {
 		t.Errorf("another machine without a key: %d, priced %v", code, got)
 	}
 	t.Setenv("MAGPIE_ADDR", "")

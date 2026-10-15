@@ -326,6 +326,11 @@ func TestCSVStamp(t *testing.T) {
 			t.Fatalf("%q: %s", day, got)
 		}
 	}
+	// a rolling window's name has no colon, which Windows refuses (#2075)
+	p, _ := usage.LastOf(24 * time.Hour)
+	if got := csvStamp(p, "", now); strings.ContainsAny(got, `:/\\`) {
+		t.Errorf("rolling window: %s", got)
+	}
 }
 
 // midnightUsageClock sets usage.Clock to read a tenth of a second before

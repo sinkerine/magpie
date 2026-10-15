@@ -147,11 +147,25 @@ func TestClaudeRunEndsAfterStructuredOutput(t *testing.T) {
 	if !alive(read) {
 		t.Fatalf("the run waiting on a read result was let go")
 	}
-	s.subscription.mu.Lock()
-	runs := len(s.subscription.runs)
-	s.subscription.mu.Unlock()
-	if runs != 1 {
+	// A run is taken off the bridge after its process is reaped, so the
+	// count is polled too: under -race it lags the processes' end.
+	if runs := keptRuns(s, 1, 3*time.Second); runs != 1 {
 		t.Fatalf("%d runs kept, want only the one waiting on read", runs)
+	}
+}
+
+// keptRuns is how many runs the bridge holds once it holds want, or after
+// within, polled.
+func keptRuns(s *Server, want int, within time.Duration) int {
+	deadline := time.Now().Add(within)
+	for {
+		s.subscription.mu.Lock()
+		n := len(s.subscription.runs)
+		s.subscription.mu.Unlock()
+		if n == want || time.Now().After(deadline) {
+			return n
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
