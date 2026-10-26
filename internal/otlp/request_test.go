@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/sessions"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -20,6 +21,12 @@ func TestOTelSessionDiscoveredDuringFirstRequest(t *testing.T) {
 	t.Setenv("MAGPIE_OTEL_HEADERS", "")
 	t.Setenv("MAGPIE_OTEL_SESSIONS", "true")
 	fastOTel(t)
+	// Begin's cached miss must outlast the test however slow the machine
+	// is (#1811): neither the transcript watcher's poll nor the end of the
+	// discovery cache window may find the transcript before skip() does.
+	sessionsEvery, ttl := OTelSessionsEvery, sessions.TraceIdentityTTL
+	OTelSessionsEvery, sessions.TraceIdentityTTL = time.Hour, time.Hour
+	t.Cleanup(func() { OTelSessionsEvery, sessions.TraceIdentityTTL = sessionsEvery, ttl })
 	stop := StartOTel()
 	t.Cleanup(stop)
 	// a local pi turn with no key, as the gateway describes it

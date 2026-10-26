@@ -490,6 +490,16 @@ func TestModelPriceCmdSaysWhereThePriceCameFrom(t *testing.T) {
 	if out := show("claude-opus-5-5"); !strings.Contains(out, "what its provider lists, else its maker's on models.dev") {
 		t.Errorf("nothing given: printed %q, want it to say the price is the provider's or the maker's", out)
 	}
+	// #2344: one priced only as the model the user said it is the same as
+	// says so, and which model that is
+	st := settings.Load()
+	st.ModelSameAs = map[string]string{"a/m": "claude-opus-5-5"}
+	if err := settings.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	if out := show("m"); !strings.Contains(out, "the maker's price of claude-opus-5-5 on models.dev, which you said it is the same as") {
+		t.Errorf("priced as its Same as: printed %q, want it to name the model it is the same as", out)
+	}
 	for _, tc := range []struct {
 		what string
 		set  []string

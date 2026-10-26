@@ -288,34 +288,66 @@ func TestHooksUnreadableFileLeftAlone(t *testing.T) {
 
 // Codex trusts a hook by its place in hooks.json: a group of magpie's
 // taken out from before the user's own moves the user's trust with it,
-// and the record of the group taken out goes.
+// and the record of the group taken out goes. The record's key holds
+// hooks.json's path, spelled as Codex spells it (codexKey): on Windows the
+// path's backslashes make it a literal string (#2275), and a folder with an
+// apostrophe as well, an escaped basic one.
 func TestHooksCodexTrustMovesWithTheGroups(t *testing.T) {
-	h := sandbox(t)
-	codexHooks := filepath.Join(h, ".codex/hooks.json")
-	cfg := filepath.Join(h, ".codex/config.toml")
-	write(t, cfg, "model = \"gpt-5\"\n")
-	ok(t)(SaveHook("", Hook{Name: "bark", Event: "turn-end", Command: "bark", Agents: []string{"codex"}}))
-	// the user adds one of their own after it and trusts both in /hooks
-	raw := read(t, codexHooks)
-	var doc map[string]map[string][]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
-		t.Fatal(err)
-	}
-	doc["hooks"]["Stop"] = append(doc["hooks"]["Stop"], json.RawMessage(`{"hooks":[{"type":"command","command":"mine"}]}`))
-	b, _ := json.Marshal(doc)
-	write(t, codexHooks, string(b))
-	key := func(g int) string { return codexHooks + ":stop:" + string(rune('0'+g)) + ":0" }
-	write(t, cfg, read(t, cfg)+"\n[hooks.state.\""+key(0)+"\"]\ntrusted_hash = \"sha256:aaa\"\n\n[hooks.state.\""+key(1)+"\"]\ntrusted_hash = \"sha256:bbb\"\n\n[hooks.state.\""+codexHooks+":pre_tool_use:0:0\"]\nenabled = false\n")
+	for _, c := range []struct{ name, dir string }{
+		{"default", ""},
+		{"backslash", `co\dex`},
+		{"apostrophe", `o'b\rien`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := sandbox(t)
+			dir := filepath.Join(h, ".codex")
+			if c.dir != "" {
+				dir = filepath.Join(h, c.dir)
+				t.Setenv("CODEX_HOME", dir)
+			}
+			codexHooks := filepath.Join(dir, "hooks.json")
+			cfg := filepath.Join(dir, "config.toml")
+			write(t, cfg, "model = \"gpt-5\"\n")
+			ok(t)(SaveHook("", Hook{Name: "bark", Event: "turn-end", Command: "bark", Agents: []string{"codex"}}))
+			// the user adds one of their own after it and trusts both in /hooks
+			raw := read(t, codexHooks)
+			var doc map[string]map[string][]json.RawMessage
+			if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+				t.Fatal(err)
+			}
+			doc["hooks"]["Stop"] = append(doc["hooks"]["Stop"], json.RawMessage(`{"hooks":[{"type":"command","command":"mine"}]}`))
+			b, _ := json.Marshal(doc)
+			write(t, codexHooks, string(b))
+			key := func(g int) string { return codexKey(codexHooks + ":stop:" + string(rune('0'+g)) + ":0") }
+			pre := codexKey(codexHooks + ":pre_tool_use:0:0")
+			write(t, cfg, read(t, cfg)+"\n[hooks.state]\n\n[hooks.state."+key(0)+"]\ntrusted_hash = \"sha256:aaa\"\n\n[hooks.state."+key(1)+"]\ntrusted_hash = \"sha256:bbb\"\n\n[hooks.state."+pre+"]\nenabled = false\n")
 
-	ok(t)(RemoveHooks([]string{"bark"}))
-	if got := hooksOf(t, codexHooks, "Stop"); len(got) != 1 || !strings.Contains(got[0], "mine") {
-		t.Fatalf("codex Stop after: %v", got)
+			ok(t)(RemoveHooks([]string{"bark"}))
+			if got := hooksOf(t, codexHooks, "Stop"); len(got) != 1 || !strings.Contains(got[0], "mine") {
+				t.Fatalf("codex Stop after: %v", got)
+			}
+			c := read(t, cfg)
+			want := "model = \"gpt-5\"\n\n[hooks.state]\n\n[hooks.state." + key(0) + "]\ntrusted_hash = \"sha256:bbb\"\n\n[hooks.state." + pre + "]\nenabled = false\n"
+			if c != want {
+				t.Errorf("config.toml after:\n%s\nwant:\n%s", c, want)
+			}
+		})
 	}
-	c := read(t, cfg)
-	want := "model = \"gpt-5\"\n\n[hooks.state.\"" + key(0) + "\"]\ntrusted_hash = \"sha256:bbb\"\n\n[hooks.state.\"" + codexHooks + ":pre_tool_use:0:0\"]\nenabled = false\n"
-	if c != want {
-		t.Errorf("config.toml after:\n%s\nwant:\n%s", c, want)
+}
+
+// codexKey is a [hooks.state] key as Codex 0.162 writes it (toml_writer's
+// TomlKeyBuilder::as_default, seen from `codex app-server`'s
+// config/batchWrite): a basic string when nothing in it needs escaping, a
+// literal one when a backslash or a double quote does and it has no
+// apostrophe, else a basic string with its escapes.
+func codexKey(k string) string {
+	if !strings.ContainsAny(k, "\\\"") {
+		return `"` + k + `"`
 	}
+	if !strings.Contains(k, "'") {
+		return "'" + k + "'"
+	}
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(k) + `"`
 }
 
 // An agent's own event goes to that agent alone, and an agent magpie can't

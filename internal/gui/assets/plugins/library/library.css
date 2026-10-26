@@ -35,6 +35,9 @@ body.window .lib-head { top: -2px; margin: -2px 0 0; padding: 8px 0 4px; --bleed
    Library folder, Backups) on one line has the buttons on a line of their own, at
    its end */
 .lib-head { flex-wrap: wrap; row-gap: 4px; }
+/* eight tabs (Subagents, #2283) outgrow a narrow window in German: the
+   tabs wrap onto a second line rather than scroll the view sideways */
+.lib-tabs { max-width: 100%; flex-wrap: wrap; }
 .lib-headacts { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
 .lib-head.stuck::before { box-shadow: 0 1px 0 var(--line-2); }
 .lib-tabs .opt { height: 24px; padding: 0 12px; font-size: 12.5px; }
@@ -43,7 +46,10 @@ body.window .lib-head { top: -2px; margin: -2px 0 0; padding: 8px 0 4px; --bleed
 .lib-mini svg { width: 13px; height: 13px; }
 .lib-body { display: flex; flex-direction: column; flex: none; }
 .lib-body.enter { animation: content-in .22s var(--ease); }
-.lib-intro { margin: 8px 2px 10px; font-size: 12px; line-height: 1.5; color: var(--muted); max-width: 640px; }
+/* as wide as the cards under it: held to 640px it broke off mid-sentence with
+   the cards running on past it (#2319); pretty keeps a last word from
+   standing alone on its line */
+.lib-intro { margin: 8px 2px 10px; font-size: 12px; line-height: 1.5; color: var(--muted); text-wrap: pretty; }
 .lib-aside { margin: 8px 4px 0; font-size: 11.5px; line-height: 1.5; color: var(--faint); }
 .lib-aside.center { text-align: center; margin-top: 14px; }
 
@@ -133,6 +139,7 @@ body.window .lib-head { top: -2px; margin: -2px 0 0; padding: 8px 0 4px; --bleed
 .lib-app { display: flex; gap: 6px; width: 100%; align-items: center; flex-wrap: wrap; }
 .lib-app input { flex: 1 1 9em; min-width: 0; font-family: var(--code-font, var(--code)); font-size: 12px; }
 .lib-app input.port { flex: 0 1 7.5em; }
+.lib-editor input.lib-startup { max-width: 140px; }
 .lib-signin-err { margin-top: 6px; font-size: 12px; color: var(--red); line-height: 1.45; overflow-wrap: anywhere; }
 .lib-signin-link { display: flex; align-items: center; gap: 4px; margin-top: 5px; min-width: 0; }
 .lib-signin-link code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: var(--code-style, normal) var(--code-weight, 400) 11px/1.3 var(--code-font, var(--code)); font-stretch: var(--code-stretch, 100%); color: var(--fg-2); padding: 4px 7px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); user-select: all; -webkit-user-select: all; cursor: text; }
@@ -344,6 +351,9 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .lib-editor .lib-picks { grid-column: 1 / -1; max-height: 320px; }
 .lib-editor .lib-keep { grid-column: 1 / -1; margin: 0 -6px; }
 .lib-confirm { grid-column: 1 / -1; margin: 0; font-size: 12.5px; line-height: 1.55; color: var(--fg-2); }
+/* the skills a Clean up takes out, by name; one changed here says so */
+.lib-gonelist { grid-column: 1 / -1; margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; max-height: 40vh; overflow-y: auto; }
+.lib-gonelist li { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; font-family: var(--code-font, var(--code)); font-size: 12.5px; color: var(--fg); overflow-wrap: anywhere; }
 .text.danger-fill { background: var(--red); color: #fff; }
 /* one agent's skills or servers on or off at once (#475) */
 .lib-byagent-sheet .lib-byagent-list { grid-column: 1 / -1; max-height: min(52vh, 420px); overflow: auto; }
@@ -485,6 +495,8 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .lib-health.auth::before { background: var(--amber); }
 .lib-health.err { color: var(--red); }
 .lib-health.err::before { background: var(--red); }
+/* not checked here, nothing known against it: a ring, not a red dot (#2308) */
+.lib-health.unknown::before { background: transparent; box-shadow: inset 0 0 0 1.2px var(--faint); }
 /* a server that listed its tools: its status opens them, a chevron says so */
 .lib-health.has-list::after { content: ""; flex: none; width: 4px; height: 4px; margin: 0 1px 2px 1px; border: solid currentColor; border-width: 0 1.2px 1.2px 0; transform: rotate(45deg); opacity: .7; transition: transform .14s var(--ease); }
 .lib-health.has-list[aria-expanded="true"]::after { transform: rotate(-135deg); margin-bottom: -2px; }
@@ -616,6 +628,18 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .lib-hook > .who { flex-basis: 240px; }
 .lib-hook .lib-hookdesc { font-size: 12px; line-height: 1.45; color: var(--fg); white-space: normal; overflow-wrap: anywhere; margin-top: 1px; }
 .lib-hookedit .lib-hookdescin { width: 100%; box-sizing: border-box; resize: none; font: inherit; font-size: 12.5px; line-height: 1.45; }
+
+/* Subagents (#2283): the row says what it is for, wrapped, as a hook's
+   description does; its skills and servers are menus as wide as the
+   dialog lets them be, and the prompt a box that grows with it */
+.lib-subagent > .who { flex-basis: 240px; }
+.lib-subagent .lib-subagentdesc { font-size: 12px; line-height: 1.45; color: var(--fg); white-space: normal; overflow-wrap: anywhere; margin-top: 1px; }
+.lib-subagent .lib-subagentuses { white-space: normal; overflow-wrap: anywhere; }
+.lib-subagentedit .lib-menu { max-width: 100%; height: 28px; color: var(--fg); }
+.lib-subagentedit .lib-menu > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lib-subagentedit .lib-subagentdescin, .lib-subagentedit .lib-subagentprompt { width: 100%; box-sizing: border-box; resize: none; font: inherit; font-size: 12.5px; line-height: 1.45; }
+.lib-subagentedit .lib-subagentprompt { max-height: 40vh; overflow-y: auto; }
+.lib-subagentedit .hint:empty { display: none; }
 
 /* a chip whose agent has the item whatever is ticked (it reads
    ~/.agents/skills itself, #595): lit, as it has it, with a lock on its

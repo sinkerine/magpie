@@ -265,3 +265,21 @@ func TestCompactUntimedUnchanged(t *testing.T) {
 		}
 	}
 }
+
+// A model whose window isn't known (Window 0) caps nothing short of Max:
+// the windows tried don't stop at the largest prompt seen (zhemu on
+// Discord: a 1M model offered no more than 412K), and with no setting and
+// no compaction seen it runs now at Max.
+func TestCompactUnknownWindowCapsNothing(t *testing.T) {
+	cs := many(2, func(id string, t0 time.Time) []Call {
+		return session(id, t0, 80, 20000, 5000, 0, 0, 20*time.Second, false)
+	})
+	o := CompactOpts{Min: 50000, Max: 1000000, Step: 10000}
+	r := Compact(cs, o)
+	if r == nil {
+		t.Fatal("no advice")
+	}
+	if last := r.Curve[len(r.Curve)-1].Value; last != 1000000 || r.Current != 1000000 || r.Window != 0 {
+		t.Fatalf("curve to %d, now %d, window %d; want 1000000, 1000000, 0", last, r.Current, r.Window)
+	}
+}

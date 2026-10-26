@@ -280,3 +280,29 @@ func TestRemoteMagpieShowsHeldKeyItsQuotas(t *testing.T) {
 		t.Errorf("a key told no card: %v", got)
 	}
 }
+
+// #2333: a window's whole is reckoned from every call routed through the
+// account, so a held key told the card isn't told it, while this machine's
+// owner (no scope) is; the caller's windows are left as they are.
+func TestHeldKeyToldNoWindowHolds(t *testing.T) {
+	qs := []provider.Quota{{Provider: "alpha", User: "a@example.com", Windows: []provider.QuotaSpan{
+		{Name: "5 hours", Used: 40, Holds: &provider.WindowHolds{Tokens: 900000, Priced: true}},
+		{Name: "7 days", Used: 2, HoldsWhy: provider.HoldsLow},
+	}}}
+	if got := (*quotaScope)(nil).quotas(qs); got[0].Windows[0].Holds == nil || got[0].Windows[1].HoldsWhy == "" {
+		t.Fatalf("the owner wasn't told the whole: %+v", got[0].Windows)
+	}
+	s := &quotaScope{every: map[string]bool{"alpha": true}, refs: map[string][]provider.AccountRef{}}
+	got := s.quotas(qs)
+	if len(got) != 1 {
+		t.Fatalf("the key wasn't told its card: %+v", got)
+	}
+	for _, w := range got[0].Windows {
+		if w.Holds != nil || w.HoldsWhy != "" {
+			t.Errorf("a held key was told %s's whole: %+v", w.Name, w)
+		}
+	}
+	if qs[0].Windows[0].Holds == nil || qs[0].Windows[1].HoldsWhy == "" {
+		t.Errorf("the caller's windows were written to: %+v", qs[0].Windows)
+	}
+}

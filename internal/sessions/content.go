@@ -107,7 +107,7 @@ func FindCall(session string, from, to, at time.Time) (Call, bool) {
 	var best Call
 	found := false
 	dist := func(t time.Time) time.Duration { return max(t.Sub(at), at.Sub(t)) }
-	for _, c := range callsFor(from.Add(-time.Minute), session) {
+	for _, c := range callsFor(from.Add(-time.Minute), session, "") {
 		if c.Session == session && !c.Time.Before(from) && !c.Time.After(to) && (!found || dist(c.Time) < dist(best.Time)) {
 			best, found = c, true
 		}

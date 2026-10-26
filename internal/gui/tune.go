@@ -10,10 +10,13 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/tune"
 )
 
@@ -103,12 +106,14 @@ func tuneOf(cs []sessions.Call, days int, home string) tuneState {
 			if err != nil {
 				continue
 			}
-			window := 272000
-			for _, c := range calls {
-				window = max(window, c.Prompt)
-			}
+			st := settings.Load()
+			window, told := codexWindow(calls, st, provider.Catalog(), provider.GroupFinder())
 			cur, _ := strconv.Atoi(s.Value)
-			o := tune.CompactOpts{Min: 50000, Max: 1000000, Step: 10000, Window: window, Current: cur}
+			if cur == 0 {
+				cur = told
+			}
+			// a value the user chose is never past the last one offered
+			o := tune.CompactOpts{Min: 50000, Max: max(1000000, window, cur, st.CompactAt), Step: 10000, Window: window, Current: cur}
 			if r := tune.Compact(calls, o); r != nil {
 				ta.Advice = append(ta.Advice, tuneAdvice{Knob: agent.TuneCompact, Setting: s, Compact: r})
 			}
@@ -116,6 +121,52 @@ func tuneOf(cs []sessions.Call, days int, home string) tuneState {
 		out.Agents = append(out.Agents, ta)
 	}
 	return out
+}
+
+// codexWindow is the window Codex runs the calls' models to, and where
+// magpie has it compact them when its config.toml says nothing (told; 0
+// when that isn't known for every model). A model of magpie's catalog
+// has the window it is listed with, one the user typed or the vendor's,
+// and is told the threshold the user set on it, else Settings › Long
+// conversations (provider.CompactFor, as codexcat writes it). One whose
+// window magpie doesn't know caps nothing (window 0): the largest prompt
+// it had been sent was taken for its window, and a 1M model set to
+// compact at 750K was offered no more than 412K (zhemu on Discord).
+// Codex's own models, outside magpie's catalog, run to 272K or the
+// largest prompt seen, as before.
+func codexWindow(calls []tune.Call, st settings.Settings, entries []provider.Entry, find func(string) (provider.Group, []provider.Member, bool)) (window, told int) {
+	byID := make(map[string]provider.Entry, len(entries))
+	for _, e := range entries {
+		byID[strings.ToLower(e.ID)] = e
+	}
+	peak := map[string]int{}
+	for _, c := range calls {
+		peak[c.Model] = max(peak[c.Model], c.Prompt)
+	}
+	unknown, all := false, true
+	for m, p := range peak {
+		e, ok := byID[strings.TrimPrefix(m, "magpie/")]
+		switch {
+		case !ok:
+			window, all = max(window, 272000, p), false
+		case e.Context <= 0:
+			unknown, all = true, false
+		default:
+			window = max(window, e.Context, p)
+			at := st.Working(e.Context)
+			if n := provider.CompactFor(st, e, find); n > 0 {
+				at = min(e.Context, n)
+			}
+			told = max(told, at)
+		}
+	}
+	if unknown {
+		window = 0
+	}
+	if !all {
+		told = 0
+	}
+	return window, told
 }
 
 func tuneRoutes(mux *http.ServeMux) {

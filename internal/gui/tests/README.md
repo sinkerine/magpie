@@ -1,11 +1,20 @@
 # Dropdown browser regression
 
-`settings-proxy-auth.test.cjs` checks optional SOCKS5/SOCKS5h usernames and
-passwords in Settings, using the real page with isolated API fixtures. It
-covers saving and reloading, escaped and non-UTF-8 credentials, masked
-addresses/status, clearing authentication, Tab and Escape, mode switches,
-HTTP compatibility, and narrow windows in English and Chinese on Chromium
-and WebKit.
+`plugin-gateway.test.cjs` checks gateway-only plugin identification, the existing
+JSON options editor and aggregate diagnostics in all five languages on Chromium
+and WebKit. It uses local API fixtures, saves options through the real page, and
+checks that request hooks have no provider badge. `MAGPIE_GATEWAY_ASSETS` selects
+an older asset directory for a failing regression comparison; user settings and
+live gateways are never accessed.
+
+`settings-proxy-auth.test.cjs` checks a proxy's optional username and
+password in Settings, in fields of their own for SOCKS5/SOCKS5h, HTTP,
+HTTPS and bare host:port proxies alike, using the real page with isolated
+API fixtures. It covers saving and reloading, @ : / % # and spaces in a
+password, escaped and non-UTF-8 credentials, a login saved in the address
+before loading into the fields, masked addresses/status, clearing
+authentication, Tab and Escape, mode switches, and narrow windows in all
+five languages on Chromium and WebKit.
 ## Installed desktop fonts
 
 `fonts.test.cjs` exercises the interface/code font controls with installed
@@ -31,6 +40,14 @@ Browser fixtures never read or write user settings, install fonts or contact
 a live gateway.
 
 ## Gateway Caller Keys
+
+`gateway-keys-empty.test.cjs` checks the Gateway page with no gateway key
+yet, as magpie web on a 390px phone: "No gateway keys yet" sits inside the
+list's card, inset from its edges, in the muted colour and size of Recent
+calls' empty line, in Chromium and WebKit, light and dark, and every
+language. A list that can't be read says why in the same card, still there
+after the page is drawn again; a list read before stays when a later read
+fails, and the error goes to the status line.
 
 `gateway-caller-keys.test.cjs` checks the named caller-key list on the
 Gateway page, including creation, copying, renaming, disabling, enabling,
@@ -322,6 +339,11 @@ why one didn't load, updates one and removes one. The add sheet's
 "look for a plugin" link lead there. English and Chinese, Chromium and WebKit,
 with the API faked.
 
+`plugins-more-discover.test.cjs` checks that the add sheet's "More in
+Plugins" row and its "look for a plugin" link open Plugins on Discover,
+after Built-in or Installed was the tab open last (outloudvi on Discord).
+English and Chinese, Chromium and WebKit, with the API faked.
+
 `plugin-git.test.cjs` checks a plugin installed from a git repository: the
 market's field says it takes a GitHub repo, and Install sends
 `github:owner/repo` as typed; Installed names it by the package its
@@ -438,8 +460,17 @@ effort Claude Code asks for" / 「跟随 Claude Code 请求的推理强度」 un
 effort entry opens the effort slider without scrolling the page, Default its
 first stop, a level picked is posted for that tier's `<tier>_effort` alone and
 named in the square's title, and the session's effort stays. Its subagents'
-effort is a square that says what unset means for Claude Code, and a Claude
-Code not through magpie has no levels, no square and no effort entries.
+effort is on the Subagents row, not a square, and a Claude Code not through
+magpie has no levels, no square and no effort entries.
+
+`claude-subagent-effort-row.test.cjs` draws Claude Code's subagent effort in
+Chromium and WebKit, English and Chinese, at 1100px and 560px: it is at the
+right of the Subagents row in Tiers, laid out as the tiers' efforts are (same
+class, column and height), and the old square under New sessions is gone.
+With the subagents on Claude Code's pick it reads Default, is disabled and
+says to set a subagent model first (KorenKrita on Discord: magpie writes no
+effort then); with a model it opens the slider without scrolling the page and
+posts `subagent_effort`.
 
 `gateway-fold.test.cjs` folds Connect on the Gateway page with the view
 scrolled: its fields hide, the head keeps the base URL and a copy button, the
@@ -696,6 +727,14 @@ over them; the allowances' tab named Allowances. A click, with the panel
 scrolled, asks for the window's Routing page on that request and moves
 nothing; the window opened so has that request picked. In English and
 Chinese.
+
+`panel-routing-pick.test.cjs` switches a Manual routing group's model from
+the tray panel's Routing tab (#2489): only a Manual group of two or more
+that is on gets a row, its picked member a button opening the app's menu
+(no native select), a member no provider serves noted so. A pick posts
+/api/groups/pick with the group's id and the member alone, and the row says
+the new one; the picked one again posts nothing. At 440px, nothing runs out
+of the panel. Chromium and WebKit, in every language.
 
 `login-import.test.cjs` brings ChatGPT accounts in from CLIProxyAPI's auth
 files: offered from the accounts list and from a browser sign-in under way,
@@ -2143,8 +2182,9 @@ WebKit, in English and Chinese:
 node --test internal/gui/tests/plugin-progressive.test.cjs
 
 `lightweight.test.cjs` checks Settings → General's Lightweight mode row
-(#580): off by default, On and Off saved as `lightweight` true and false
-without the page moving, another setting's save keeping it, no left-border
+(#580): off for a user who never chose, On and Off saved as `lightweight`
+true and false without the page moving, another setting's save keeping the
+choice or leaving it unchosen (no `lightweight` posted), no left-border
 accent, and no such row on a browser's page (`web`). English and Chinese,
 Chromium and WebKit, with `/api/settings` faked:
 node --test internal/gui/tests/lightweight.test.cjs
@@ -2333,8 +2373,9 @@ node --test internal/gui/tests/ledger-protocol.test.cjs
 
 `library-rtk-nohook.test.cjs` checks that an agent RTK has no hook for
 (DeepSeek Harness) is listed in Library › RTK with a No RTK hook tag saying
-why, and that its switch can't be turned on, while Pi's can. English and
-Chinese, Chromium and WebKit.
+why, and that its switch can't be turned on, while Pi's can. Grok Build's
+tag gives its own reason and rtk-ai/rtk#2136, never dsh's #3847. English
+and Chinese, Chromium and WebKit.
 
 ```sh
 node --test internal/gui/tests/library-rtk-nohook.test.cjs
@@ -2442,3 +2483,16 @@ observed duration rather than the nominal window name. Regression checks
 cover missing windows, historical end and sampling dates, Used/Left,
 restoring live values on 2 days/current cycle, and hiding live account
 controls while inspecting history.
+
+
+`quota-curve.test.cjs` also checks that a completed cycle loads its own
+5-hour and weekly whole-window estimates from
+`/api/usage/quotas/history/holds`, never today's (#2009). It shows
+"Loading…" while the answer is pending and drops an answer that arrives
+after another cycle was picked. It reuses a cycle's answer until the card's
+Refresh. A window the server can't reckon says "not enough data" with its
+reason, and one with no estimate and no reason shows nothing, as a live card
+does. Both engines, at 440px. The reckoning itself is covered by
+`TestHistoricalWindowHoldsUsesEachWindowsOwnReading`,
+`TestWindowHoldsResetBeforeRefillReading` and
+`TestWindowHoldsDryAgainAfterReset`.

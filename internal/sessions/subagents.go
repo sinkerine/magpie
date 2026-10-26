@@ -3,6 +3,7 @@ package sessions
 import (
 	"bytes"
 	"cmp"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -55,7 +56,11 @@ func subagentsOf(s Session, fs []file) []Subagent {
 			}
 			m := ccMeta(f.path)
 			sa.Kind, sa.Parent = m.AgentType, m.ParentAgentID
-			sa.Title = cmp.Or(m.Description, ccTask(f.path))
+			// the file only when the meta names no task: cmp.Or read
+			// every Claude Code subagent's file for a title it threw away
+			if sa.Title = m.Description; sa.Title == "" {
+				sa.Title = ccTask(f.path)
+			}
 		case "opencode":
 			sa.ID = f.sid
 			if f.parent != s.ID {
@@ -63,6 +68,11 @@ func subagentsOf(s Session, fs []file) []Subagent {
 			}
 			sa.Title, sa.Kind = ocSubagentTitle(st.Named)
 			sa.Title = cmp.Or(sa.Title, st.Title, st.First)
+			// OpenCode 2 names the agent in the session's row, and its
+			// titles no longer do (#2290)
+			if v2, ok := f.oc.(ocV2DB); ok {
+				sa.Kind = cmp.Or(v2.agent(f.path, f.sid), sa.Kind)
+			}
 		case "kimi":
 			sa.ID = filepath.Base(filepath.Dir(f.path))
 			if spawned == nil {
@@ -79,7 +89,9 @@ func subagentsOf(s Session, fs []file) []Subagent {
 				sa.Parent = sp.ParentAgentID
 			}
 			sa.Kind = sp.SubagentName
-			sa.Title = cmp.Or(title(sp.Description), kimiWireOf(f.path).Prompt)
+			if sa.Title = title(sp.Description); sa.Title == "" {
+				sa.Title = kimiWireOf(f.path).Prompt
+			}
 		default:
 			continue
 		}
@@ -128,13 +140,22 @@ func ccMeta(p string) ccSubMeta {
 var ccMetas sync.Map
 
 // ccTask is what a Claude Code subagent was asked: its file's first user
-// line, which Claude Code writes as it starts it. Kept once found.
+// line, which Claude Code writes as it starts it, among its first 16. What
+// was read, a task or none, is kept until the file's size or time changes,
+// and only its first lines are read again then: every Sessions list asks
+// for each subagent's task, and a file naming none was read on every ask.
 func ccTask(p string) string {
+	fi, err := os.Stat(p)
+	if err != nil {
+		return ""
+	}
 	if v, ok := ccTasks.Load(p); ok {
-		return v.(string)
+		if t := v.(ccTaskRead); fi.Size() == t.size && fi.ModTime().Equal(t.mod) {
+			return t.task
+		}
 	}
 	task, n := "", 0
-	scanAt(p, 0, nil, func(b []byte, _, _ int64) bool {
+	_, err = scanAt(p, 0, nil, func(b []byte, _, _ int64) bool {
 		if n++; n > 16 {
 			return false
 		}
@@ -153,10 +174,24 @@ func ccTask(p string) string {
 		}
 		return task == ""
 	})
-	if task != "" {
-		ccTasks.Store(p, task)
+	if err != nil {
+		// not readable now: what was read before, if anything
+		if v, ok := ccTasks.Load(p); ok {
+			return v.(ccTaskRead).task
+		}
+		return ""
 	}
+	// the size and time from before the read: a line written while it was
+	// read changes them, and the file is read again on the next ask
+	ccTasks.Store(p, ccTaskRead{task: task, size: fi.Size(), mod: fi.ModTime()})
 	return task
+}
+
+// ccTaskRead is what ccTask read of a file, as of its size and time.
+type ccTaskRead struct {
+	task string
+	size int64
+	mod  time.Time
 }
 
 var ccTasks sync.Map
@@ -175,6 +210,24 @@ func ocSubagentTitle(named string) (string, string) {
 	}
 	return named, ""
 }
+
+// agent is the agent OpenCode 2 ran a session as, session_v2.agent
+// ("general", "explore"), "" when it names none or the column isn't there.
+// One found is kept: a session's agent is set as it starts.
+func (s ocV2DB) agent(path, sid string) string {
+	if v, ok := ocAgents.Load(path); ok {
+		return v.(string)
+	}
+	var a sql.NullString
+	if s.db.QueryRow(`SELECT agent FROM session_v2 WHERE id = ?`, sid).Scan(&a) != nil || a.String == "" {
+		return ""
+	}
+	k := a.String[:min(len(a.String), 128)]
+	ocAgents.Store(path, k)
+	return k
+}
+
+var ocAgents sync.Map
 
 // kimiSpawn is Kimi Code's subagent.spawned record, which the agent that
 // started a subagent writes in its own wire.jsonl.

@@ -25,19 +25,23 @@ var (
 // minutes in settings.UpdateEveries.
 var updateEveries = map[string]int{"30m": 30, "1h": 60, "6h": 360, "24h": 1440}
 
-// updateAutoCmd is `magpie update auto [on|off] [30m|1h|6h|24h]`: whether
-// the app asks for a newer version (and downloads it) by itself, and how
-// often (#472). With neither, it says how it is set.
+// updateAutoCmd is `magpie update auto [on|off] [download|notify]
+// [30m|1h|6h|24h]`: whether the app asks for a newer version by itself, how
+// often (#472), and whether one found is downloaded at once or only said to
+// be out, downloaded on a click (notify, #2296). With none, it says how it
+// is set.
 func updateAutoCmd(args []string) error {
 	s := settings.Load()
 	for _, a := range args {
 		switch a {
 		case "on", "off":
 			s.NoAutoUpdate = a == "off"
+		case "download", "notify":
+			s.NoAutoDownload = a == "notify"
 		default:
 			m, ok := updateEveries[a]
 			if !ok {
-				return fmt.Errorf("magpie update auto takes on, off or how often (30m, 1h, 6h or 24h), not %q", a)
+				return fmt.Errorf("magpie update auto takes on, off, download, notify or how often (30m, 1h, 6h or 24h), not %q", a)
 			}
 			s.UpdateEvery = m
 		}
@@ -55,9 +59,16 @@ func updateAutoCmd(args []string) error {
 	}
 	if s.NoAutoUpdate {
 		fmt.Println("automatic updates are off", muted.Render("· magpie update or Settings' Check looks for one (every "+every+" when on)"))
+		if s.NoAutoDownload {
+			fmt.Println(muted.Render("  a newer version found is only said to be out; Download update or magpie update downloads it"))
+		}
 		return nil
 	}
-	fmt.Println("automatic updates are on", muted.Render("· magpie looks for a newer version every "+every+" and downloads it"))
+	if s.NoAutoDownload {
+		fmt.Println("automatic updates are on", muted.Render("· magpie looks for a newer version every "+every+" and says it is out; Download update or magpie update downloads it (magpie update auto download: at once)"))
+		return nil
+	}
+	fmt.Println("automatic updates are on", muted.Render("· magpie looks for a newer version every "+every+" and downloads it (magpie update auto notify: only says it is out)"))
 	return nil
 }
 

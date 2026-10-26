@@ -61,4 +61,10 @@ func TestPanelOnEverySpaceOnMac(t *testing.T) {
 	if b&(application.MacWindowCollectionBehaviorMoveToActiveSpace|application.MacWindowCollectionBehaviorFullScreenPrimary) != 0 {
 		t.Errorf("panel collection behaviour %d moves to the active Space or goes full screen itself", b)
 	}
+	// shown without activating magpie: activated, the Mac took the user to
+	// the Space of magpie's other windows, off the full-screen app's
+	mac := panelOptions("darwin", "").Mac
+	if mac.WindowClass != application.MacWindowClassPanel || !mac.PanelPreferences.NonActivating {
+		t.Errorf("the panel is window class %d, non-activating %v; want a non-activating panel", mac.WindowClass, mac.PanelPreferences.NonActivating)
+	}
 }

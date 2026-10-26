@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
@@ -49,10 +51,14 @@ type Provider struct {
 	Name string `json:"name"`
 	// Was are ids the provider had before it was renamed (see Rename):
 	// a model still picked by one of them reaches it.
-	Was    []string `json:"was,omitempty"`
-	Icon   string   `json:"icon,omitempty"`
-	Preset string   `json:"preset,omitempty"` // preset this was created from, if any
-	Key    string   `json:"key"`              // API key, as typed by the user
+	Was []string `json:"was,omitempty"`
+	// Gave are ids it had that another provider took after it (a rename
+	// onto one, a provider added under one), each with when: the calls
+	// recorded under such an id before then were this one's (Renames).
+	Gave   []Gave `json:"gave,omitempty"`
+	Icon   string `json:"icon,omitempty"`
+	Preset string `json:"preset,omitempty"` // preset this was created from, if any
+	Key    string `json:"key"`              // API key, as typed by the user
 
 	// AccessKeyID and SecretAccessKey are a Volcengine account's access
 	// key (TakesVolcAccessKey), what Ark tells its Coding or Agent Plan's
@@ -189,6 +195,12 @@ type Provider struct {
 	// still stands over it. RestCapOff (-1): no rest at all after a
 	// failure that says nothing of why, a rate limit's as the gateway's own.
 	RestCap int `json:"restCap,omitempty"`
+	// LimitRestOff keeps its keys and accounts asked when the vendor says
+	// they are out of quota or answers 429 (zoecats on Discord: a local
+	// aggregator says "quota exhausted" for a moment while it switches
+	// upstreams, and a rest of half an hour held every request back until
+	// magpie restarted). Off by default: such a refusal rests it as ever.
+	LimitRestOff bool `json:"limitRestOff,omitempty"`
 
 	// PriceRate is what the provider charges against the official price
 	// (ITea312, #819): a relay that bills 0.8× or 1.5× of it. It scales the
@@ -227,6 +239,15 @@ type Provider struct {
 	// fitting, which a backend that isn't OpenAI's needs (#350).
 	CodexAsSent bool `json:"codexAsSent,omitempty"`
 
+	// AdditionalTools says the provider's Responses API takes an
+	// additional_tools input item, as OpenAI's does: a deferred tool an
+	// Anthropic client's tool search loaded goes to it in such an item
+	// where the search loaded it, not in the top-level tools, which keeps
+	// the prompt's cached prefix (#2660). OpenAI's own API is sent one
+	// without it; another vendor isn't unless this is set, since xAI's
+	// turns the item away (#350).
+	AdditionalTools bool `json:"additionalTools,omitempty"`
+
 	// NativeCompaction has Codex's compaction_trigger go to the provider
 	// as Codex sent it, and the compaction the provider writes back go to
 	// Codex as it came (#1099), where magpie otherwise asks the model for
@@ -250,9 +271,10 @@ type Provider struct {
 	PassUserAgent bool `json:"passUserAgent,omitempty"`
 
 	// PinUpstream, on the Cline API, has its DeepSeek models answered only
-	// by DeepSeek's own API (White Immortal on Discord): Cline routes a
-	// model through an AI gateway that may serve it from any host, and
-	// DeepSeek's own keeps its prompt cache. See ClinePin.
+	// by DeepSeek's own API (White Immortal on Discord) and its GLM models
+	// only by Z.ai's (sdytman on Discord): Cline routes a model through an
+	// AI gateway that may serve it from any host, and the maker's own
+	// keeps its prompt cache. See ClinePin.
 	PinUpstream bool `json:"pinUpstream,omitempty"`
 
 	// AuthHeader is which header the key goes in on a third-party
@@ -271,6 +293,13 @@ type Provider struct {
 	// run locally, or Ollama's cloud models, pass a request on to a vendor.
 	// See SkipsRedaction.
 	Unredacted bool `json:"unredacted,omitempty"`
+
+	// InsecureTLS has magpie take the certificate of the provider's own
+	// HTTPS host as it is, unchecked (#2383, fangzhengjin: a vLLM on the
+	// LAN, Ollama behind a self-signed cert). Only a provider the user
+	// added takes it (TakesInsecureTLS), and only for the hosts of its own
+	// base URLs (UncheckedHosts); see Via.
+	InsecureTLS bool `json:"insecureTLS,omitempty"`
 
 	// Proxy is the proxy magpie's requests to this provider go through
 	// (#237: Codex through one, a vendor at home without): "" follows
@@ -313,6 +342,10 @@ type Provider struct {
 	// magpie knows need neither.
 	BalanceURL  string `json:"balanceURL,omitempty"`
 	BalancePath string `json:"balancePath,omitempty"`
+	// BalanceMethod is how BalanceURL is asked: "" (or GET), or POST with
+	// no body, for an endpoint that answers only a POST (#2368). Any other
+	// is refused when the balance is read (balanceMethodOf).
+	BalanceMethod string `json:"balanceMethod,omitempty"`
 	// BalanceToken is what a vendor tells the whole account's balance to,
 	// where a key is told only what is left on itself: AiHubMix's system
 	// access token, or a new-api relay's for its /api/user/self named in
@@ -347,6 +380,15 @@ type Provider struct {
 	// listed since is served beside picks that held every one listed then
 	// (withNewlyListed), and one listed then and left unpicked stays out.
 	PickedFrom []string `json:"pickedFrom,omitempty"`
+	// Delisted are picks the provider's list stopped listing (dropGonePicks):
+	// out of Models, so not served, until a list has them again, when they
+	// go back among the picks (relistPicks). A plugin's list shrinks for a
+	// while and comes back (多喝热水 on Discord: Our Free Model lists its
+	// account channels' models only once its service has read them after a
+	// restart, and a free pool it finds down leaves its list until it is
+	// up), and the user's picks came back with it no more. Every save keeps
+	// it but for what it picks again; Select none clears it.
+	Delisted []string `json:"delisted,omitempty"`
 	// RefreshEvery, for a provider of the user's own, is how often the
 	// gateway fetches its model list by itself ("6h", "1d"; none, only when
 	// asked), as Fetch models does (#2135). See autolist.go.
@@ -569,10 +611,12 @@ func All() []Provider {
 // clone is p with its settings unshared: slices, maps and pointers copied.
 func (p Provider) clone() Provider {
 	p.Was = slices.Clone(p.Was)
+	p.Gave = slices.Clone(p.Gave)
 	p.Keys = slices.Clone(p.Keys)
 	p.Fallback = slices.Clone(p.Fallback)
 	p.Models = slices.Clone(p.Models)
 	p.PickedFrom = slices.Clone(p.PickedFrom)
+	p.Delisted = slices.Clone(p.Delisted)
 	p.AutoInclude = slices.Clone(p.AutoInclude)
 	p.Headers = maps.Clone(p.Headers)
 	p.ExtraBody = maps.Clone(p.ExtraBody)
@@ -616,17 +660,7 @@ var AllBuilt atomic.Int64
 func allProviders() []Provider {
 	AllBuilt.Add(1)
 	f := load()
-	stored := f.Providers
-	picks := map[string]Provider{}
-	var out []Provider
-	for _, p := range stored {
-		p = normalize(p)
-		if !hasEndpoint(p) {
-			picks[p.ID] = p
-			continue
-		}
-		out = append(out, p)
-	}
+	out, picks := ownOf(f)
 	for _, a := range Accounts() {
 		if _, taken := find(out, a.ID); taken || picks[a.ID].Hidden {
 			continue
@@ -643,6 +677,21 @@ func allProviders() []Provider {
 	return ordered(out, f.Order)
 }
 
+// ownOf is f's providers of the user's own, and the model picks it keeps
+// for the signed-in accounts by id.
+func ownOf(f file) (own []Provider, picks map[string]Provider) {
+	picks = map[string]Provider{}
+	for _, p := range f.Providers {
+		p = normalize(p)
+		if !hasEndpoint(p) {
+			picks[p.ID] = p
+			continue
+		}
+		own = append(own, p)
+	}
+	return own, picks
+}
+
 // withPicks is the signed-in account a with what the user set on its
 // provider (pk, as providers.json keeps it): its models, routing, limits
 // and queue. The account the agent is signed in to gets them in All, and
@@ -650,7 +699,7 @@ func allProviders() []Provider {
 // the provider keeps the same settings (#1899: a second WorkBuddy AI
 // account queued 62s with the wait set to 1s).
 func withPicks(a, pk Provider) Provider {
-	a.PickedFrom = pk.PickedFrom
+	a.PickedFrom, a.Delisted = pk.PickedFrom, pk.Delisted
 	a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.KeepLogin, a.KeepLoginAs, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.KeepLogin, pk.KeepLoginAs, pk.Contexts, pk.Family
 	a.SwitchOnly = pk.SwitchOnly
 	a.Sink, a.NoModels = pk.Sink, pk.NoModels
@@ -661,6 +710,9 @@ func withPicks(a, pk Provider) Provider {
 	a.MaxConcurrency, a.PinUpstream = pk.MaxConcurrency, pk.PinUpstream
 	a.AccountConcurrency, a.QueueLimit, a.QueueWait = pk.AccountConcurrency, pk.QueueLimit, pk.QueueWait
 	a.MaxRPM = pk.MaxRPM
+	// the extra body fields written for it, which a ChatGPT account's
+	// requests take (WithExtraBody, magpie-releases#18)
+	a.ExtraBody = pk.ExtraBody
 	return a
 }
 
@@ -756,6 +808,9 @@ func Save(p Provider) error {
 	if p.ID == strings.TrimSuffix(GroupPrefix, "/") {
 		return errors.New(`"group" starts the ids of routing groups; pick another id`)
 	}
+	if p.ID == autoID && !stored(p.ID) { // one saved before keeps it (autoRefsOn)
+		return errAutoID
+	}
 	if err := settings.CheckProxy(p.Proxy); err != nil {
 		return err
 	}
@@ -775,7 +830,7 @@ func Save(p Provider) error {
 		if p.ID == "kiro" {
 			key = p.Key
 		}
-		p = Provider{ID: p.ID, Key: key, Models: p.Models, NoModels: p.NoModels, PickedFrom: p.PickedFrom, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, Contexts: p.Contexts, Family: p.Family, Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, MaxConcurrency: p.MaxConcurrency, AccountConcurrency: p.AccountConcurrency, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM, QuotaRest: p.QuotaRest, QuotaResetAt: p.QuotaResetAt, RestCap: p.RestCap, PinUpstream: p.PinUpstream, NativeCompaction: p.NativeCompaction, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID), Tucked: tuckedAccount(p.ID)}
+		p = Provider{ID: p.ID, Key: key, Models: p.Models, NoModels: p.NoModels, PickedFrom: p.PickedFrom, Delisted: p.Delisted, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, Contexts: p.Contexts, Family: p.Family, Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, MaxConcurrency: p.MaxConcurrency, AccountConcurrency: p.AccountConcurrency, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM, QuotaRest: p.QuotaRest, QuotaResetAt: p.QuotaResetAt, RestCap: p.RestCap, PinUpstream: p.PinUpstream, NativeCompaction: p.NativeCompaction, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID), Tucked: tuckedAccount(p.ID)}
 	} else {
 		p.AccountProxies = keyProxies(p) // a provider of keys proxies each key apart
 		if subscriptionID(p.ID) && !stored(p.ID) {
@@ -791,6 +846,9 @@ func Save(p Provider) error {
 				return errors.New("Azure OpenAI needs your resource's endpoint, e.g. https://<resource>.openai.azure.com")
 			}
 			return errors.New("a provider needs a base URL")
+		}
+		if p.InsecureTLS && !p.TakesInsecureTLS() {
+			return fmt.Errorf("%s is a preset's: only a provider you added with your own base URL can skip the certificate check", p.Name)
 		}
 		if strings.Contains(p.Decide, WorkspaceID) {
 			return errors.New("Bailian's decision model is asked at your workspace's host: give its workspace ID (workspace=… or the editor's Workspace ID), or pick the Token Plan")
@@ -809,12 +867,26 @@ func Save(p Provider) error {
 		was = &f.Providers[i]
 	}
 	p.PickedFrom = listedWith(p, was)
+	p.Delisted = delistedWith(p, was)
 	if was != nil {
 		if p.Was == nil {
 			p.Was = was.Was
 		}
+		if p.Gave == nil {
+			p.Gave = was.Gave
+		}
+		if sameStored(*was, p) {
+			// Save pressed on an editor left as it was: providers.json
+			// would be written byte for byte as it is, and its write
+			// handed the catalog to every agent again (agent.SyncCatalog),
+			// seconds of CPU with many agents set up (#1962, witt-bit)
+			return nil
+		}
 		f.Providers[i] = p
 	} else {
+		// a new provider under an id another had: what was recorded under
+		// it until now stays that one's
+		giveID(f.Providers, -1, p.ID, time.Now())
 		f.Providers = append(f.Providers, p)
 	}
 	if err := store(f); err != nil {
@@ -828,9 +900,44 @@ func Save(p Provider) error {
 	return nil
 }
 
+// sameStored is whether a and b are written to providers.json alike.
+func sameStored(a, b Provider) bool {
+	x, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	y, err := json.Marshal(b)
+	return err == nil && bytes.Equal(x, y)
+}
+
+// delistedWith is what p.Delisted is saved as: what was set aside before,
+// as an editor sends none and couldn't show them to unpick, less what p
+// picks again; none after Select none, or the vendor's list picked in
+// place of picks (no picks saved over some).
+func delistedWith(p Provider, was *Provider) []string {
+	if p.ServesNone() || len(p.Models) == 0 && was != nil && len(was.Models) > 0 {
+		return nil
+	}
+	d := p.Delisted
+	if d == nil && was != nil {
+		d = was.Delisted
+	}
+	d = slices.DeleteFunc(slices.Clone(d), func(id string) bool { return slices.Contains(p.Models, id) })
+	if len(d) == 0 {
+		return nil
+	}
+	return d
+}
+
 // listedWith is what p.PickedFrom is saved as: none without picks; what was
 // kept with the picks when they are the same picks; and the models listed
-// now when the picks are new, as the user picked them from that list.
+// now when the picks are new, as the user picked them from that list. While
+// some picks are set aside, the list is known to be short, so those listed
+// when the picks were saved before are kept too: a model the user saw and
+// left unpicked isn't new when the list that left it out for a while has it
+// again (an Our Free Model channel not read yet when the picks were saved).
+// A list short of no pick is taken as it is: what it left out and lists
+// again later is new (TestClaudePicksOfEveryModelTakeOnesListedSince).
 func listedWith(p Provider, was *Provider) []string {
 	if len(p.Models) == 0 {
 		return nil
@@ -845,6 +952,13 @@ func listedWith(p Provider, was *Provider) []string {
 	var ids []string
 	for _, m := range from.Available() {
 		ids = append(ids, m.ID)
+	}
+	if was != nil && len(ids) > 0 && len(delistedWith(p, was)) > 0 {
+		for _, id := range was.PickedFrom {
+			if !slices.Contains(ids, id) {
+				ids = append(ids, id)
+			}
+		}
 	}
 	return ids
 }
@@ -1104,7 +1218,12 @@ func Delete(id string) error {
 		return fmt.Errorf("no provider %q", id)
 	}
 	f.Providers = keep
-	return store(f)
+	if err := store(f); err != nil {
+		return err
+	}
+	// its StepFun sign-in goes with it, not to a provider added later
+	// under the same id
+	return forgetStepFun(id)
 }
 
 // keyOptional is true for local servers, which usually have no key.
@@ -1188,12 +1307,13 @@ func normalize(p Provider) Provider {
 			p.Decide = pr.Decide
 		}
 	}
-	// an oMLX or MLX-Serve provider saved before its preset had System One (#1641)
-	// asks it where its chat completions are, at whatever port it was given
-	if (p.Preset == OMLXPreset || p.Preset == MLXServePreset) && p.Decide == "" && p.Chat != "" {
+	// an oMLX, MLX-Serve or Ollama provider saved before its preset had
+	// System One (#1641; Nanka on Discord) asks it where its chat
+	// completions are, at whatever address it was given
+	if (p.Preset == OMLXPreset || p.Preset == MLXServePreset || p.Preset == "ollama" || p.Preset == "ollama-cloud") && p.Decide == "" && p.Chat != "" {
 		p.Decide = p.Chat
 	}
-	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted {
+	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted && p.Routing != FreeFirst && !PluginRouting(p.Routing) {
 		p.Routing = ""
 	}
 	if !slices.Contains(Affinities, p.Affinity) {
@@ -1227,6 +1347,8 @@ func normalize(p Provider) Provider {
 	p.azureEndpoints()
 	// OpenCode Zen's or Go's other APIs, beside the one it was given (#1215)
 	p.openCodeEndpoints()
+	// Bedrock Mantle's other APIs, beside the one it was given
+	p.mantleEndpoints()
 	// a preset's provider keeps its headers too: the preset gives the
 	// endpoints and catalog, the headers say which workspace or app it is
 	p.Headers = cleanHeaders(p.Headers)
@@ -1452,6 +1574,10 @@ func claudeModel(model string) bool {
 	return strings.HasPrefix(m, "claude") || bedrockClaude(m)
 }
 
+// ClaudeModel is claudeModel for another package: whether model, after any
+// vendor prefix, is one of Anthropic's Claude models by its name.
+func ClaudeModel(model string) bool { return claudeModel(model) }
+
 // openAIModel is whether model is one of OpenAI's own by its name: a GPT,
 // a Codex or an o-series model, after any vendor prefix.
 func openAIModel(model string) bool {
@@ -1466,11 +1592,11 @@ func openAIModel(model string) bool {
 // OpenAI's API or Copilot's; Anthropic's Messages for a Claude model
 // where that is served; Chat where that is served. "" when every
 // request is translated anyway: a sign-in served through its agent's own
-// API (Claude Code's binary, Cursor, Devin, Kiro, Code Assist).
+// API (Claude Code's binary, Devin, Code Assist).
 func (p Provider) Native(model string) Protocol {
 	if p.Account != nil {
 		switch p.Account.Agent {
-		case "claude", "cursor", "devin", "kiro":
+		case "claude", "devin":
 			return ""
 		}
 	}
@@ -1527,18 +1653,94 @@ func (p Provider) Where() string {
 // which routes and caches by conversation and turns away requests that do
 // not name one in x-opencode-session.
 func (p Provider) IsOpenCode() bool {
-	h := p.Host()
-	return h == "opencode.ai" || strings.HasSuffix(h, ".opencode.ai")
+	return OpenCodeURL("//" + p.Host()) // its port, if it names one, aside
 }
 
-// IsBedrock reports whether the provider is Amazon Bedrock's runtime: made
-// from its preset, or at its host.
+// IsBedrock reports whether the provider is Amazon Bedrock: its runtime
+// (bedrock-runtime.{region}.amazonaws.com) or its Mantle endpoint
+// (bedrock-mantle.{region}.api.aws), made from either's preset or at
+// either's host. The two take the same Bedrock API key and share what
+// Bedrock asks of a request: x-api-key alone on Messages, its own names
+// for Anthropic's betas, no metadata.user_id, max_completion_tokens on
+// chat completions, Claude on Messages and OpenAI's GPT models on
+// Responses first. What only the runtime does (no list of models) is the
+// preset's; what only Mantle does is IsBedrockMantle's.
 func (p Provider) IsBedrock() bool {
-	if p.Preset == "bedrock" {
+	if p.Preset == "bedrock" || p.IsBedrockMantle() {
 		return true
 	}
 	h := p.Host()
 	return strings.HasPrefix(h, "bedrock-runtime.") && strings.HasSuffix(h, ".amazonaws.com")
+}
+
+// IsBedrockMantle reports whether the provider is Amazon Bedrock's Mantle
+// endpoint (@marktoown on X): made from its preset, or added by its
+// address at bedrock-mantle.{region}.api.aws.
+func (p Provider) IsBedrockMantle() bool {
+	return p.Preset == "bedrock-mantle" || mantleHost(p.Host())
+}
+
+// mantleHost is a host of Bedrock's Mantle endpoint.
+func mantleHost(h string) bool {
+	return strings.HasPrefix(h, "bedrock-mantle.") && strings.HasSuffix(h, ".api.aws")
+}
+
+// mantleOpenAI is a model Mantle serves on its OpenAI APIs under
+// /openai/v1 rather than /v1, as the model's card says: OpenAI's closed
+// GPT models (GPT-6 Sol, GPT-5.5) and xAI's Grok. gpt-oss, Gemma and the
+// other open models are at /v1. Asked at the other one, Mantle answers
+// "model `x` isn't supported on this route".
+func mantleOpenAI(model string) bool {
+	return bedrockGPT(model) || strings.HasPrefix(strings.ToLower(model), "xai.")
+}
+
+// MantleBase is the base a request for model goes to on Mantle's chat
+// completions or Responses API, given a Mantle provider's base for it
+// (IsBedrockMantle): one ending /v1 or /openai/v1 goes at whichever of the
+// two serves the model, or at the other when other is set (the model was
+// refused at the first, so the gateway learned its prefix). A base ending
+// otherwise, one the user typed, is given back as it is.
+func MantleBase(base, model string, other bool) string {
+	root, ok := strings.CutSuffix(strings.TrimRight(strings.TrimSpace(base), "/"), "/v1")
+	if !ok {
+		return base
+	}
+	root = strings.TrimSuffix(root, "/openai")
+	if mantleOpenAI(model) != other {
+		return root + "/openai/v1"
+	}
+	return root + "/v1"
+}
+
+// mantleEndpoints fills in the APIs of Bedrock's Mantle endpoint a
+// provider added by its address was saved without: chat completions and
+// Responses at /v1, Messages at /anthropic, as the preset gives them. A
+// chat or Responses URL given at /openai/v1 is moved to /v1, where Mantle
+// lists its models (/openai/v1/models is 404); the gateway still asks each
+// model at the prefix that serves it (MantleBase). Any other URL the user
+// gave an API keeps it.
+func (p *Provider) mantleEndpoints() {
+	if p.Preset != "" && p.Preset != "bedrock-mantle" {
+		return
+	}
+	root := ""
+	for _, b := range []string{p.Chat, p.Responses, p.Anthropic} {
+		if u, err := url.Parse(strings.TrimSpace(b)); err == nil && u.Scheme != "" && mantleHost(strings.ToLower(u.Hostname())) {
+			root = u.Scheme + "://" + u.Host
+			break
+		}
+	}
+	if root == "" {
+		return
+	}
+	for _, b := range []*string{&p.Chat, &p.Responses} {
+		if strings.TrimRight(strings.TrimSpace(*b), "/") == root+"/openai/v1" {
+			*b = root + "/v1"
+		}
+	}
+	p.Chat = cmp.Or(p.Chat, root+"/v1")
+	p.Responses = cmp.Or(p.Responses, p.Chat)
+	p.Anthropic = cmp.Or(p.Anthropic, root+"/anthropic")
 }
 
 // bedrockClaude is a Bedrock id of a Claude model: a model id

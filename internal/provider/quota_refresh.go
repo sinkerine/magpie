@@ -95,6 +95,8 @@ func forgetLoginReading(l Login) {
 // Quotas has it.
 func RefreshUsage(ctx context.Context, provider, user string) {
 	refreshCards(ctx, provider, user)
+	// the menu bar shows the same card: it reads it again now (#2357)
+	toldUsage()
 }
 
 // RefreshReport is RefreshUsage answering the cards it read, as

@@ -73,7 +73,7 @@ func Collect() (*Bundle, error) {
 		b.Instructions.Sets[i].File = ""
 	}
 	for _, s := range l.sets() {
-		if text := readText(l.textPath(s.ID)); text != "" {
+		if text := setText(l.textPath(s.ID)); text != "" {
 			b.Texts[s.ID] = text
 		}
 	}

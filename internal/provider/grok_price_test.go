@@ -104,19 +104,22 @@ func TestCursorGrokFastPrice(t *testing.T) {
 			t.Errorf("ListPrice(grok-4.6-fast) = %+v; want unpriced", pr)
 		}
 	}
-	// elsewhere a fast id is not Cursor's fast mode
+	// elsewhere a fast id is not Cursor's fast mode (Grok's own
+	// grok-4.7-build-fast is priced as Grok's, TestGrokBuildFastPrice)
 	grok := Provider{ID: "grok", Name: "Grok", Account: &Account{plugin: &plugin.Provider{ID: "grok"}}}
-	for _, id := range []string{"grok-4.7-fast", "grok-4.7-build-fast"} {
+	for _, id := range []string{"grok-4.7-fast", "grok-4.7-low-fast"} {
 		if pr, ok := grok.ListPrice(id); ok {
 			t.Errorf("grok ListPrice(%q) = %+v; want unpriced", id, pr)
 		}
+	}
+	for _, id := range []string{"grok-4.7-fast", "grok-4.7-build-fast"} {
 		if pr, ok := MakerPrice(id); ok {
 			t.Errorf("MakerPrice(%q) = %+v; want unpriced", id, pr)
 		}
 	}
 }
 
-// A window the id names without a k (grokWindowLabel writes a window that
+// A window the id names without a k (the grok plugin writes a window that
 // no multiple of 1000 is as bare digits) is priced as its model, as one
 // spelled with a k is.
 func TestGrokWindowWithoutKListPrice(t *testing.T) {
@@ -200,5 +203,56 @@ func TestFactoryFastPrice(t *testing.T) {
 	other := Provider{ID: "claude", Name: "Claude", Account: &Account{Agent: "claude"}}
 	if pr, ok := other.ListPrice("claude-opus-5-5-fast"); ok {
 		t.Errorf("claude ListPrice(claude-opus-5-5-fast) = %+v; want unpriced", pr)
+	}
+}
+
+// A Grok account's fast variant, grok-4.7-build-fast, is priced at twice
+// grok-4.7, every tier with it, as xAI sells it (https://x.ai/news/grok-4-7:
+// "a fast variant with twice the output speed at twice the price"),
+// whether the built-in or the Grok plugin serves it: a routing group of
+// Cursor's and Grok's Grok 4.7 fast counted no cost for Grok's calls
+// (TradingLife on Discord). Elsewhere the id stays unpriced.
+func TestGrokBuildFastPrice(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
+	// as models.dev's xai lists it (2026-10-15)
+	os.WriteFile(catalog.CachePath(), []byte(`{
+	  "xai":{"id":"xai","models":{
+	    "grok-4.7":{"id":"grok-4.7","cost":{"input":2,"output":6,"cache_read":0.5,
+	      "tiers":[{"input":4,"output":12,"cache_read":1,"tier":{"type":"context","size":200000}}]}}}}}`), 0o644)
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+
+	builtin := Provider{ID: "grok", Name: "Grok (SuperGrok)", Account: &Account{Agent: "grok"}}
+	moved := Provider{ID: "grok", Name: "Grok (SuperGrok)", Account: &Account{plugin: &plugin.Provider{ID: "grok"}}}
+	for _, p := range []Provider{builtin, moved} {
+		for _, id := range []string{"grok-4.7-build-fast", "GROK-4.7-Build-Fast", "grok-4.7-build-fast@500k"} {
+			pr, ok := p.ListPrice(id)
+			if !ok || pr.Input != 4 || pr.Output != 12 || pr.CacheRead != 1 {
+				t.Errorf("%q ListPrice(%q) = %+v, %v; want twice grok-4.7's, $4/$12/$1", p.PluginProvider(), id, pr, ok)
+				continue
+			}
+			if long := pr.At(300000); long.Input != 8 || long.Output != 24 || long.CacheRead != 2 {
+				t.Errorf("%q ListPrice(%q) past 200k = %+v; want $8/$24/$2", p.PluginProvider(), id, long)
+			}
+		}
+		// the model itself keeps its own price
+		if pr, ok := p.ListPrice("grok-4.7"); !ok || pr.Input != 2 {
+			t.Errorf("ListPrice(grok-4.7) = %+v, %v; want $2", pr, ok)
+		}
+		// a fast variant of a model no catalog prices stays unpriced
+		if pr, ok := p.ListPrice("grok-4.6-build-fast"); ok {
+			t.Errorf("ListPrice(grok-4.6-build-fast) = %+v; want unpriced", pr)
+		}
+	}
+	// not a Grok account: not Grok Build's fast variant
+	for _, p := range []Provider{{ID: "grok"}, {ID: "cursor", Account: &Account{Agent: "cursor"}}} {
+		if pr, ok := p.ListPrice("grok-4.7-build-fast"); ok {
+			t.Errorf("%s ListPrice(grok-4.7-build-fast) = %+v; want unpriced", p.ID, pr)
+		}
 	}
 }

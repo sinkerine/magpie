@@ -5,10 +5,12 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/tidwall/gjson"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -194,6 +196,62 @@ func unsealed(schema json.RawMessage) json.RawMessage {
 	return out
 }
 
+// asksSealing is a Responses request whose tools mark a parameter
+// "encrypted" (MultiAgentV2's spawn_agent message): an upstream that
+// honours the mark answers the call with that argument sealed.
+func asksSealing(body []byte) bool {
+	if !bytes.Contains(body, []byte(`"encrypted"`)) {
+		return false
+	}
+	var q struct {
+		Tools []struct {
+			Parameters json.RawMessage `json:"parameters"`
+			Tools      []struct {
+				Parameters json.RawMessage `json:"parameters"`
+			} `json:"tools"`
+		} `json:"tools"`
+	}
+	if decodeJSON(body, &q) != nil {
+		return false
+	}
+	var mark func(any) bool
+	mark = func(v any) bool {
+		switch x := v.(type) {
+		case map[string]any:
+			if b, ok := x["encrypted"].(bool); ok && b {
+				return true
+			}
+			for _, c := range x {
+				if mark(c) {
+					return true
+				}
+			}
+		case []any:
+			for _, c := range x {
+				if mark(c) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	marked := func(schema json.RawMessage) bool {
+		var v any
+		return bytes.Contains(schema, []byte(`"encrypted"`)) && decodeJSON(schema, &v) == nil && mark(v)
+	}
+	for _, t := range q.Tools {
+		if marked(t.Parameters) {
+			return true
+		}
+		for _, nt := range t.Tools {
+			if marked(nt.Parameters) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func flatName(namespace, name string) string {
 	return provider.FlatName(namespace, name)
 }
@@ -213,6 +271,7 @@ type rRequest struct {
 	PromptCacheKey    string          `json:"prompt_cache_key,omitempty"`
 	Include           []string        `json:"include,omitempty"`
 	ClientMetadata    json.RawMessage `json:"client_metadata,omitempty"`
+	AccessPrograms    json.RawMessage `json:"access_programs,omitempty"`
 	Text              json.RawMessage `json:"text,omitempty"`
 	Reasoning         *struct {
 		Effort  string `json:"effort,omitempty"`
@@ -257,7 +316,7 @@ func parseResponses(body []byte) (*Request, error) {
 	}
 	r := &Request{Model: q.Model, System: q.Instructions, MaxTokens: q.MaxOutputTokens, Temp: q.Temperature,
 		TopP: q.TopP, Stream: q.Stream, Parallel: q.ParallelToolCalls, Fast: q.ServiceTier == "priority" || q.ServiceTier == "ultrafast", Ultrafast: q.ServiceTier == "ultrafast", Tier: q.ServiceTier, CacheKey: q.PromptCacheKey, Include: q.Include,
-		ClientMetadata: sentRaw(q.ClientMetadata)}
+		ClientMetadata: sentRaw(q.ClientMetadata), AccessPrograms: q.AccessPrograms}
 	r.Text, r.Format = textFormat(sentRaw(q.Text))
 	if q.Reasoning != nil {
 		r.Effort = effortOf(q.Reasoning.Effort)
@@ -535,11 +594,11 @@ func joinToolRuns(body []byte) []byte {
 		return body
 	}
 	var q map[string]json.RawMessage
-	if decodeJSON(body, &q) != nil {
+	if decodeJSONView(body, &q) != nil {
 		return body
 	}
-	var input []json.RawMessage
-	if decodeJSON(q["input"], &input) != nil {
+	input, isList := inputList(q["input"])
+	if !isList {
 		return body
 	}
 	type item struct {
@@ -549,7 +608,7 @@ func joinToolRuns(body []byte) []byte {
 	}
 	items := make([]item, len(input))
 	for i, raw := range input {
-		if decodeJSON(raw, &items[i]) != nil {
+		if decodeJSONView(raw, &items[i]) != nil {
 			items[i] = item{}
 		}
 	}
@@ -637,11 +696,11 @@ func joinToolRuns(body []byte) []byte {
 // requiring paired outputs still need the delivered text, without a fake call ID.
 func orphanedToolOutputs(body []byte) []byte {
 	var q map[string]json.RawMessage
-	if decodeJSON(body, &q) != nil {
+	if decodeJSONView(body, &q) != nil {
 		return body
 	}
-	var input []json.RawMessage
-	if decodeJSON(q["input"], &input) != nil {
+	input, isList := inputList(q["input"])
+	if !isList {
 		return body
 	}
 	changed := false
@@ -658,7 +717,7 @@ func orphanedToolOutputs(body []byte) []byte {
 			CallID string          `json:"call_id"`
 			Output json.RawMessage `json:"output"`
 		}
-		if decodeJSON(raw, &item) != nil {
+		if decodeJSONView(raw, &item) != nil {
 			flush()
 			inCalls = false
 			out = append(out, raw)
@@ -731,11 +790,11 @@ func pairToolItems(body []byte) []byte {
 		return body
 	}
 	var q map[string]json.RawMessage
-	if decodeJSON(body, &q) != nil {
+	if decodeJSONView(body, &q) != nil {
 		return body
 	}
-	var input []json.RawMessage
-	if decodeJSON(q["input"], &input) != nil {
+	input, isList := inputList(q["input"])
+	if !isList {
 		return body
 	}
 	type item struct {
@@ -745,7 +804,7 @@ func pairToolItems(body []byte) []byte {
 	items := make([]item, len(input))
 	answered := map[string]bool{}
 	for i, raw := range input {
-		if decodeJSON(raw, &items[i]) != nil {
+		if decodeJSONView(raw, &items[i]) != nil {
 			items[i] = item{}
 		}
 		if t := items[i].Type; (t == "function_call_output" || t == "custom_tool_call_output") && items[i].CallID != "" {
@@ -855,11 +914,11 @@ func withReasoningText(body []byte) []byte {
 		return body
 	}
 	var q map[string]json.RawMessage
-	if decodeJSON(body, &q) != nil {
+	if decodeJSONView(body, &q) != nil {
 		return body
 	}
-	var items []json.RawMessage
-	if decodeJSON(q["input"], &items) != nil {
+	items, isList := inputList(q["input"])
+	if !isList {
 		return body
 	}
 	changed := false
@@ -871,7 +930,7 @@ func withReasoningText(body []byte) []byte {
 			Summary []rText `json:"summary"`
 			Content []rText `json:"content"`
 		}
-		if decodeJSON(raw, &it) != nil {
+		if decodeJSONView(raw, &it) != nil {
 			continue
 		}
 		kinds[i] = stepKindOf(it.Type, it.Role)
@@ -887,11 +946,11 @@ func withReasoningText(body []byte) []byte {
 			b.WriteString(noReasoning)
 		}
 		var m map[string]json.RawMessage
-		if decodeJSON(raw, &m) != nil {
+		if decodeJSONView(raw, &m) != nil {
 			continue
 		}
 		m["content"], _ = json.Marshal([]map[string]string{{"type": "reasoning_text", "text": b.String()}})
-		if nb, err := json.Marshal(m); err == nil {
+		if nb, err := marshalJSON(m); err == nil {
 			items[i], changed = nb, true
 		}
 	}
@@ -902,8 +961,8 @@ func withReasoningText(body []byte) []byte {
 	if !changed {
 		return body
 	}
-	q["input"], _ = json.Marshal(items)
-	nb, err := json.Marshal(q)
+	q["input"], _ = marshalJSON(items)
+	nb, err := marshalJSON(q)
 	if err != nil {
 		return body
 	}
@@ -1035,6 +1094,25 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	// sealed reasoning, and may refuse an item without it.
 	replay := replaysReasoning(model, host)
 	var input []any
+	// a deferred tool a result loaded goes in an additional_tools item
+	// after that result and the results beside it, once, where the
+	// upstream takes one (Request.LoadedInPlace, #2660)
+	deferred := map[string]Tool{}
+	placed := map[string]bool{}
+	if r.LoadedInPlace {
+		for _, t := range r.Tools {
+			if t.Deferred {
+				deferred[t.Name] = t
+			}
+		}
+	}
+	var loaded []any
+	flushLoaded := func() {
+		if len(loaded) > 0 {
+			input = append(input, map[string]any{"type": "additional_tools", "role": "developer", "tools": loaded})
+			loaded = nil
+		}
+	}
 	// a second answer to one call is left out, as the Chat and Messages
 	// builds leave it (dropSecondAnswers)
 	for _, m := range dropSecondAnswers(r.Messages) {
@@ -1043,6 +1121,7 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 			if len(content) == 0 {
 				return
 			}
+			flushLoaded()
 			input = append(input, map[string]any{"type": "message", "role": m.Role, "content": content})
 			content = nil
 		}
@@ -1072,14 +1151,17 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 					// a Responses API's own sealed reasoning goes back as
 					// it came: id, summary and encrypted_content (#1445)
 					flushMsg()
+					flushLoaded()
 					input = append(input, p.Sealed)
 				} else if replay && p.Text != "" {
 					flushMsg()
+					flushLoaded()
 					input = append(input, map[string]any{"type": "reasoning", "summary": []any{},
 						"content": []map[string]any{{"type": "reasoning_text", "text": p.Text}}})
 				}
 			case ToolCall:
 				flushMsg()
+				flushLoaded()
 				id := p.ID
 				if id == "" {
 					id = "call_" + newID()
@@ -1104,10 +1186,17 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 					output = items
 				}
 				input = append(input, map[string]any{"type": "function_call_output", "call_id": p.CallID, "output": output})
+				for _, name := range p.Loads {
+					if t, ok := deferred[name]; ok && !placed[name] {
+						placed[name] = true
+						loaded = append(loaded, responsesTool(t))
+					}
+				}
 			}
 		}
 		flushMsg()
 	}
+	flushLoaded()
 	if replay {
 		// each step that makes a call, or follows a tool output, leads with
 		// its reasoning, or with a space's (#1592, #1822)
@@ -1134,6 +1223,9 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	out := map[string]any{"model": model, "input": input, "stream": r.Stream, "store": false}
 	if len(r.ClientMetadata) > 0 {
 		out["client_metadata"] = r.ClientMetadata
+	}
+	if len(r.AccessPrograms) > 0 {
+		out["access_programs"] = r.AccessPrograms
 	}
 	if len(r.Text) > 0 || r.Format != nil {
 		text := map[string]any{}
@@ -1193,14 +1285,10 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	if len(r.Tools) > 0 || r.WebSearch {
 		var tools []map[string]any
 		for _, t := range r.Tools {
-			// strict is said, as Codex says it: left out, the ChatGPT
-			// backend holds the schema to strict mode's rules and refuses a
-			// pattern with a lookaround (MiniMax Code's path, #383)
-			tool := map[string]any{"type": "function", "name": t.Name, "description": t.Description, "strict": t.Strict}
-			if len(t.Schema) > 0 {
-				tool["parameters"] = t.Schema
+			if placed[t.Name] {
+				continue // offered where it was loaded
 			}
-			tools = append(tools, tool)
+			tools = append(tools, responsesTool(t))
 		}
 		if r.WebSearch {
 			tools = append(tools, map[string]any{"type": "web_search"})
@@ -1210,7 +1298,9 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 				include = append(include, "web_search_call.action.sources")
 			}
 		}
-		out["tools"] = tools
+		if len(tools) > 0 {
+			out["tools"] = tools
+		}
 		switch {
 		case r.ToolChoice == "auto" || r.ToolChoice == "none" || r.ToolChoice == "required":
 			out["tool_choice"] = r.ToolChoice
@@ -1220,6 +1310,14 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 		if r.Parallel != nil {
 			out["parallel_tool_calls"] = *r.Parallel
 		}
+	} else if r.ToolChoice == "none" {
+		// tools turned off with none declared (Chat's "none", Anthropic's
+		// {"type":"none"}, Gemini's NONE) still says so here, as a
+		// Responses client's own request would, for a provider plugin that
+		// adds a server-side tool (Grok's x_search) to tell it from no
+		// choice (#3110). Only a plugin is sent it (the gateway leaves it
+		// out for a vendor, which has no use for it: xAI turns it away).
+		out["tool_choice"] = "none"
 	}
 	if len(include) > 0 {
 		out["include"] = include
@@ -1231,6 +1329,18 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	// the lone call, "No tool output found for function call <id>", on
 	// every turn after it too (#2222)
 	return pairToolItems(b)
+}
+
+// responsesTool is t as a Responses function tool. strict is said, as
+// Codex says it: left out, the ChatGPT backend holds the schema to strict
+// mode's rules and refuses a pattern with a lookaround (MiniMax Code's
+// path, #383).
+func responsesTool(t Tool) map[string]any {
+	tool := map[string]any{"type": "function", "name": t.Name, "description": t.Description, "strict": t.Strict}
+	if len(t.Schema) > 0 {
+		tool["parameters"] = t.Schema
+	}
+	return tool
 }
 
 type rUsage struct {
@@ -1264,32 +1374,95 @@ func (u Usage) responses() map[string]any {
 
 // responsesDecoder turns a Responses stream into events.
 //
-// A function call's arguments are given once the call is done, not as
-// their deltas come: the deltas can leave out what the finished call holds
-// (#613: Codex's spawn_agent came back with arguments {} where the request
-// was translated, though the upstream's finished call had them), and what
-// was sent of a call's arguments can't be taken back.
+// A function call's arguments are given as their deltas come: a model
+// writing a patch or a command for minutes is seen writing it (echo_ts on
+// Discord: Codex on Copilot, translated for its web_search, saw nothing
+// until the call was done). The deltas can leave out what the finished
+// call holds (#613: Codex's spawn_agent came back with arguments {} where
+// the request was translated, though the upstream's finished call had
+// them), and what was sent of a call's arguments can't be taken back. So
+// the deltas that would make the arguments whole JSON wait for the call's
+// done events (jsonWhole), and the call is given what they add to it.
 type responsesDecoder struct {
 	started bool
 	called  bool            // a function call was streamed
 	calling bool            // a function call is open
-	args    strings.Builder // the open call's argument deltas
+	sent    strings.Builder // the open call's argument deltas given so far
+	held    string          // its deltas since they made whole JSON, not given yet
+	whole   jsonWhole       // where its deltas stand in their JSON
 	full    string          // the open call's arguments as its done events give them
 }
 
-// endCall gives the open call's arguments: the deltas, or what its done
-// events give where that holds more.
+// argsDelta gives an open call's argument delta, or holds it when with
+// it the deltas are whole JSON, which the done events may yet replace.
+func (d *responsesDecoder) argsDelta(delta string, emit func(Event)) {
+	if d.whole.feed(delta) {
+		d.held += delta
+		return
+	}
+	text := d.held + delta
+	d.held = ""
+	d.sent.WriteString(text)
+	if text != "" {
+		emit(Event{Kind: KToolArgs, Text: text})
+	}
+}
+
+// endCall gives the rest of the open call's arguments: what was held, or
+// what its done events give past what was sent where they hold more.
 func (d *responsesDecoder) endCall(emit func(Event)) {
 	if !d.calling {
 		return
 	}
 	d.calling = false
-	args := pickArgs(d.args.String(), d.full)
-	d.args.Reset()
-	d.full = ""
-	if args != "" {
-		emit(Event{Kind: KToolArgs, Text: args})
+	sent := d.sent.String()
+	rest := d.held
+	if args := pickArgs(sent+d.held, d.full); strings.HasPrefix(args, sent) {
+		rest = args[len(sent):]
 	}
+	d.sent.Reset()
+	d.held, d.full, d.whole = "", "", jsonWhole{}
+	if rest != "" {
+		emit(Event{Kind: KToolArgs, Text: rest})
+	}
+}
+
+// jsonWhole follows a stream of JSON text, a piece at a time, for whether
+// what came so far is a whole object or array.
+type jsonWhole struct {
+	depth    int
+	str, esc bool
+	began    bool
+}
+
+// feed reads the next piece and says whether the text is whole after it.
+func (j *jsonWhole) feed(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case j.esc:
+			j.esc = false
+		case j.str:
+			if c == '\\' {
+				j.esc = true
+			} else if c == '"' {
+				j.str = false
+			}
+		case c == '"':
+			j.str = true
+			if j.depth == 0 {
+				j.began = false
+			}
+		case c == '{' || c == '[':
+			j.depth++
+			j.began = true
+		case c == '}' || c == ']':
+			j.depth--
+		case c != ' ' && c != '\t' && c != '\n' && c != '\r' && j.depth == 0:
+			j.began = false // a value that isn't one, or after one
+		}
+	}
+	return j.began && j.depth == 0 && !j.str
 }
 
 // pickArgs is the fuller of a call's arguments as streamed and as its done
@@ -1363,7 +1536,7 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 		emit(Event{Kind: KThink, Text: ev.Delta})
 	case "response.function_call_arguments.delta":
 		if d.calling {
-			d.args.WriteString(ev.Delta)
+			d.argsDelta(ev.Delta, emit)
 		} else {
 			emit(Event{Kind: KToolArgs, Text: ev.Delta})
 		}
@@ -1406,7 +1579,12 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 			if ev.Response.Error != nil {
 				msg = ev.Response.Error.Message
 			}
-			emit(Event{Kind: KError, Text: cmp.Or(msg, streamErrorText(data)), Code: refusedCode(data)})
+			status, said := requestRefused(data)
+			code, fs, fsaid := filterRefused(data)
+			if status == 0 {
+				status, said = fs, fsaid
+			}
+			emit(Event{Kind: KError, Text: cmp.Or(msg, streamErrorText(data)), Code: code, Status: status, Said: said})
 			return nil
 		}
 		stop := "stop"
@@ -1433,9 +1611,46 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 		if ev.Error != nil {
 			msg = cmp.Or(ev.Error.Message, msg)
 		}
-		emit(Event{Kind: KError, Text: cmp.Or(msg, streamErrorText(data)), Code: refusedCode(data)})
+		status, said := requestRefused(data)
+		code, fs, fsaid := filterRefused(data)
+		if status == 0 {
+			status, said = fs, fsaid
+		}
+		emit(Event{Kind: KError, Text: cmp.Or(msg, streamErrorText(data)), Code: code, Status: status, Said: said})
 	}
 	return nil
+}
+
+// requestRefused is 400 and the vendor's error, as {"error":{…}}, when a
+// Responses stream's error event or failed response says the request
+// itself is at fault (type invalid_request_error): the ChatGPT backend
+// answers an access program the workspace doesn't have with a 200 stream
+// whose error event is access_program_not_enabled (magpie-releases#18).
+// Asked again, on this account or another, it is refused the same way, so
+// it is neither retried nor resumed, and a client answered whole gets its
+// code and param. Read by the error object's type, never by its words.
+func requestRefused(data string) (int, json.RawMessage) {
+	for _, path := range []string{"error", "response.error"} {
+		e := gjson.Get(data, path)
+		if e.IsObject() && e.Get("type").String() == "invalid_request_error" {
+			return http.StatusBadRequest, json.RawMessage(`{"error":` + e.Raw + `}`)
+		}
+	}
+	return 0, nil
+}
+
+// saidError puts the type, code and param of the vendor's own error (an
+// Event's Said) on the error a stream encoder writes, so a request the
+// vendor refused reads as refused (invalid_request_error) to the agent and
+// to the hold that decides whether to ask again, not as magpie's api_error
+// (magpie-releases#18). Without Said it is left as it was.
+func saidError(failed map[string]any, said json.RawMessage) {
+	e := gjson.GetBytes(said, "error")
+	for _, k := range []string{"type", "code", "param"} {
+		if v := e.Get(k); v.Type == gjson.String && v.String() != "" {
+			failed[k] = v.String()
+		}
+	}
 }
 
 // responsesEncoder writes events as a Responses stream. Codex reads the
@@ -1462,6 +1677,18 @@ type responsesEncoder struct {
 	// collector's last part isn't it once a hidden thinking block (signed
 	// with no text, or redacted) has come after the call (#1786)
 	call Part
+	// input reads a custom tool's input out of its call's arguments as
+	// they come
+	input customStream
+	// a message's output_item.done, and the events after it, wait here
+	// until its phase is known (phase.go, #2437)
+	heldMsg map[string]any
+	held    []heldEvent
+}
+
+type heldEvent struct {
+	typ    string
+	fields map[string]any
 }
 
 // callTo names the tool a function_call item is to as the client knows it:
@@ -1509,10 +1736,37 @@ func itemPrefix(item map[string]any) string {
 }
 
 func (e *responsesEncoder) send(typ string, fields map[string]any) {
+	if e.heldMsg != nil {
+		e.held = append(e.held, heldEvent{typ, fields})
+		if len(e.held) > heldMost {
+			e.release("")
+		}
+		return
+	}
+	e.write(typ, fields)
+}
+
+func (e *responsesEncoder) write(typ string, fields map[string]any) {
 	fields["type"] = typ
 	fields["sequence_number"] = e.seq
 	e.seq++
 	e.w.event(typ, fields)
+}
+
+// release sends the waiting message's events, the message given phase
+// (or none, for "").
+func (e *responsesEncoder) release(phase string) {
+	if e.heldMsg == nil {
+		return
+	}
+	if phase != "" {
+		e.heldMsg["phase"] = phase
+	}
+	held := e.held
+	e.heldMsg, e.held = nil, nil
+	for _, h := range held {
+		e.write(h.typ, h.fields)
+	}
 }
 
 func (e *responsesEncoder) response(status string, extra map[string]any) map[string]any {
@@ -1566,7 +1820,10 @@ func (e *responsesEncoder) closeAs(sealed json.RawMessage) {
 		e.send("response.output_text.done", map[string]any{"item_id": e.itemID, "output_index": e.item, "content_index": 0, "text": t, "logprobs": []any{}})
 		part := map[string]any{"type": "output_text", "text": t, "annotations": []any{}, "logprobs": []any{}}
 		e.send("response.content_part.done", map[string]any{"item_id": e.itemID, "output_index": e.item, "content_index": 0, "part": part})
-		item = map[string]any{"id": e.itemID, "type": "message", "role": "assistant", "status": "completed", "content": []map[string]any{part}}
+		m := map[string]any{"id": e.itemID, "type": "message", "role": "assistant", "status": "completed", "content": []map[string]any{part}}
+		// its done waits for what comes next to say its phase
+		e.release(phaseCommentary)
+		item, e.heldMsg = m, m
 	case Thinking:
 		t := e.text.String()
 		e.send("response.reasoning_summary_text.done", map[string]any{"item_id": e.itemID, "output_index": e.item, "summary_index": 0, "text": t})
@@ -1582,10 +1839,15 @@ func (e *responsesEncoder) closeAs(sealed json.RawMessage) {
 			args = "{}"
 		}
 		p := e.call
-		if q := e.named[p.Name]; !q.Search && !q.Custom {
+		item = callTo(map[string]any{"id": e.itemID, "type": "function_call", "status": "completed", "call_id": p.ID, "arguments": args}, p.Name, e.named)
+		switch q := e.named[p.Name]; {
+		case q.Custom:
+			// as OpenAI ends a custom tool's input deltas
+			input, _ := item.(map[string]any)["input"].(string)
+			e.send("response.custom_tool_call_input.done", map[string]any{"item_id": e.itemID, "output_index": e.item, "input": input})
+		case !q.Search:
 			e.send("response.function_call_arguments.done", callTo(map[string]any{"item_id": e.itemID, "output_index": e.item, "call_id": p.ID, "arguments": args}, p.Name, e.named))
 		}
-		item = callTo(map[string]any{"id": e.itemID, "type": "function_call", "status": "completed", "call_id": p.ID, "arguments": args}, p.Name, e.named)
 	}
 	e.send("response.output_item.done", map[string]any{"output_index": e.item, "item": item})
 	e.output = append(e.output, item)
@@ -1594,6 +1856,9 @@ func (e *responsesEncoder) closeAs(sealed json.RawMessage) {
 
 func (e *responsesEncoder) openItem(k Kind, prefix string, item map[string]any) {
 	e.closeItem()
+	if k != Thinking {
+		e.release(phaseCommentary)
+	}
 	e.item++
 	e.open, e.itemID = k, prefix+newID()
 	if k == Thinking && e.thinkID != "" {
@@ -1661,6 +1926,7 @@ func (e *responsesEncoder) event(ev Event) {
 		// and sources, as Anthropic's encoder does, without inventing
 		// earlier in-progress events or citation offsets in the answer.
 		e.closeItem()
+		e.release(phaseCommentary)
 		e.item++
 		item := responsesSearchItem(ev.Text, ev.Hits)
 		e.send("response.output_item.added", map[string]any{"output_index": e.item, "item": item})
@@ -1676,24 +1942,34 @@ func (e *responsesEncoder) event(ev Event) {
 		item := callTo(map[string]any{"type": "function_call", "call_id": ev.ID, "arguments": ""}, ev.Name, e.named)
 		e.openItem(ToolCall, itemPrefix(item), item)
 		e.call = Part{Kind: ToolCall, ID: ev.ID, Name: ev.Name}
+		e.input = customStream{}
 		e.col.add(ev)
 		return
 	case KToolArgs:
 		if e.open == ToolCall && ev.Text != "" {
 			e.text.WriteString(ev.Text)
-			// a custom tool's input is whole only once its arguments are:
-			// it goes in the item when that is done
-			if !e.named[e.call.Name].Custom {
+			switch q := e.named[e.call.Name]; {
+			case q.Custom:
+				// a custom tool's input, as it is read out of the
+				// arguments: what the model writes of a patch is seen as
+				// it writes it, as from OpenAI
+				if in := e.input.feed(ev.Text); in != "" {
+					e.send("response.custom_tool_call_input.delta", map[string]any{"item_id": e.itemID, "output_index": e.item, "delta": in})
+				}
+			default:
 				e.send("response.function_call_arguments.delta", map[string]any{"item_id": e.itemID, "output_index": e.item, "delta": ev.Text})
 			}
 		}
 	case KError:
 		e.closeItem()
+		e.release("")
 		code := "server_error"
 		if ev.Code != "" {
 			code = ev.Code
 		}
-		e.send("response.failed", map[string]any{"response": e.response("failed", map[string]any{"error": map[string]any{"code": code, "message": ev.Text}})})
+		failed := map[string]any{"code": code, "message": ev.Text}
+		saidError(failed, ev.Said)
+		e.send("response.failed", map[string]any{"response": e.response("failed", map[string]any{"error": failed})})
 	}
 	e.col.add(ev)
 }
@@ -1705,7 +1981,8 @@ func (e *responsesEncoder) keepalive() {
 		e.start(Event{}) // response.created and response.in_progress
 		return
 	}
-	e.send("response.in_progress", map[string]any{"response": e.response("in_progress", nil)})
+	// past what's waiting: a keepalive held back keeps nothing alive
+	e.write("response.in_progress", map[string]any{"response": e.response("in_progress", nil)})
 }
 
 func (e *responsesEncoder) finish() {
@@ -1724,6 +2001,10 @@ func (e *responsesEncoder) finish() {
 		}
 		extra["incomplete_details"] = map[string]any{"reason": reason}
 	}
+	if status == "completed" {
+		e.release(phaseFinal)
+	}
+	e.release("")
 	e.send(typ, map[string]any{"response": e.response(status, extra)})
 }
 
@@ -1796,6 +2077,7 @@ func renderResponses(res Result, model string, named map[string]nsTool) []byte {
 		// as the stream says it (#248)
 		status, incomplete = "incomplete", map[string]any{"reason": "content_filter"}
 	}
+	phaseOutput(output, status == "completed")
 	b, _ := json.Marshal(map[string]any{"id": id, "object": "response", "created_at": time.Now().Unix(), "status": status,
 		"model": model, "output": output, "usage": res.Usage.responses(), "incomplete_details": incomplete,
 		"parallel_tool_calls": true, "tool_choice": "auto", "tools": []any{}, "error": nil})

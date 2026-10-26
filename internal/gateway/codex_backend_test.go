@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +78,174 @@ func TestCodexOwnModelPassesThrough(t *testing.T) {
 	if len(q.Input) != 3 || q.Input[0]["type"] != "message" || !strings.Contains(string(got), "did X, next Y") ||
 		q.Input[1]["encrypted_content"] != "openai-own" {
 		t.Errorf("input: %s", got)
+	}
+}
+
+// codexChatGPTAuth signs this test's Codex in to a synthetic ChatGPT
+// account. CODEX_HOME is the only auth.json it reads.
+func codexChatGPTAuth(t *testing.T, email string) {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "codex-home")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", dir)
+	claims, err := json.Marshal(map[string]any{"email": email})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp, err := json.Marshal(map[string]any{"exp": time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := func(payload []byte) string {
+		return "h." + base64.RawURLEncoding.EncodeToString(payload) + ".s"
+	}
+	auth, err := json.Marshal(map[string]any{
+		"auth_mode": "chatgpt",
+		"tokens": map[string]string{
+			"id_token":      token(claims),
+			"access_token":  token(exp),
+			"refresh_token": "rt-synthetic",
+			"account_id":    "acct-synthetic",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), auth, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider.ForgetAccounts()
+	t.Cleanup(provider.ForgetAccounts)
+}
+
+// A turn relayed on Codex's own ChatGPT sign-in is that codex account's
+// in the ledger. Recorded as openai with no account, the card's window
+// (keyed codex + the email) never sees it. The Routing view still calls
+// the seat openai, and the row is still not a lead's answerer (#1367).
+func TestCodexOwnModelRecordedAsCodexAccount(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":9,"output_tokens":2}}}`))
+	})
+	codexChatGPTAuth(t, "me@example.com")
+	s := New()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	req.Header.Set("session_id", "lead-own")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	u := usage.Load(time.Time{})
+	if len(u) != 1 || u[0].Provider != "codex" || u[0].ProviderAccount != "me@example.com" || u[0].Input != 9 || u[0].Output != 2 {
+		t.Fatalf("usage %+v", u)
+	}
+	if strings.Contains(u[0].Host, " as ") {
+		t.Fatalf("relay host names an account, so it would count as a routed answer: %q", u[0].Host)
+	}
+	if a := loggedAnswers("lead-own"); len(a) != 0 {
+		t.Fatalf("own sign-in answered a lead: %+v", a)
+	}
+	st := s.Trace(t.Context(), 0, 0)
+	if len(st.Routes) != 1 || len(st.Routes[0].Usage) != 1 || st.Routes[0].Usage[0].Provider != "openai" {
+		t.Fatalf("routing view %+v", st.Routes)
+	}
+}
+
+// An API-key call stays openai with no account, even while a ChatGPT
+// sign-in is on disk: that spend is not the subscription card's.
+func TestCodexAPIKeyRecordedAsOpenAI(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":4,"output_tokens":1}}}`))
+	}))
+	t.Cleanup(up.Close)
+	was := codexAPIBase
+	codexAPIBase = up.URL + "/v1"
+	t.Cleanup(func() { codexAPIBase = was })
+	codexChatGPTAuth(t, "me@example.com")
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer sk-synthetic")
+	New().Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	u := usage.Load(time.Time{})
+	if len(u) != 1 || u[0].Provider != "openai" || u[0].ProviderAccount != "" || u[0].Input != 4 {
+		t.Fatalf("usage %+v", u)
+	}
+}
+
+// A compaction signed by another account is that account's, not the
+// sign-in the request would have relayed on. A request naming another
+// ChatGPT account than the sign-in magpie reads (a Codex in WSL, or
+// under another CODEX_HOME) is not put on that sign-in, and with no
+// sign-in to name it stays openai, so no row is half a codex account.
+func TestCodexServedNamesTheAccountThatSigned(t *testing.T) {
+	on := &provider.Provider{ID: "codex", Account: &provider.Account{Agent: "codex", User: "spare@example.com"}}
+	id, acct := codexServed(provider.CodexBase, http.Header{}, on)
+	if id != "codex" || acct != "spare@example.com" {
+		t.Fatalf("stand-in: %s %s", id, acct)
+	}
+	setHome(t, t.TempDir())
+	codexChatGPTAuth(t, "me@example.com")
+	h := http.Header{}
+	h.Set("chatgpt-account-id", "acct-synthetic")
+	if id, acct = codexServed(provider.CodexBase, h, nil); id != "codex" || acct != "me@example.com" {
+		t.Fatalf("its own account: %s %s", id, acct)
+	}
+	h.Set("chatgpt-account-id", "acct-elsewhere")
+	if id, acct = codexServed(provider.CodexBase, h, nil); id != "openai" || acct != "" {
+		t.Fatalf("another account's token: %s %s", id, acct)
+	}
+	t.Setenv("CODEX_HOME", t.TempDir())
+	provider.ForgetAccounts()
+	if id, acct = codexServed(provider.CodexBase, http.Header{}, nil); id != "openai" || acct != "" {
+		t.Fatalf("no sign-in: %s %s", id, acct)
+	}
+}
+
+// Codex's own sign-in relay is not a lead's answerer, under the name it
+// was logged by before (openai) or the codex account it is logged by now.
+// A row an account answered — host "as email", or another provider, or
+// /v1 — still is. One codex row is not counted twice.
+func TestCodexOwnRelayAnswersNoLead(t *testing.T) {
+	setHome(t, t.TempDir())
+	// usage.Path follows the first home a process reads; -count keeps
+	// writing there, so each run's sessions are its own.
+	stamp := strconv.FormatInt(time.Now().UnixNano(), 10)
+	now := time.Now()
+	row := func(name, prov, account, host, endpoint string) string {
+		t.Helper()
+		session := name + "-" + stamp
+		usage.Append(usage.Record{
+			Time: now, Agent: "codex", Provider: prov, Host: host, ProviderAccount: account,
+			Model: "gpt-5.5", Input: 9, Output: 2, Status: 200, Endpoint: endpoint, Session: session,
+		})
+		return session
+	}
+	relay := row("lead-relay", "openai", "", provider.HostOf(provider.CodexBase), CodexPath+"/responses")
+	row("lead-relay", "codex", "me@example.com", provider.HostOf(provider.CodexBase), CodexPath+"/responses")
+	if a := loggedAnswers(relay); len(a) != 0 {
+		t.Fatalf("own sign-in answered a lead: %+v", a)
+	}
+	routed := row("lead-routed", "codex", "me@example.com", "chatgpt.com as me@example.com", CodexPath+"/responses")
+	if a := loggedAnswers(routed); len(a) != 1 || a[0].provider != "codex" || a[0].who != "codex@me@example.com" {
+		t.Fatalf("routed account: %+v", a)
+	}
+	v1 := row("lead-v1", "codex", "me@example.com", "chatgpt.com as me@example.com", "/v1/responses")
+	if a := loggedAnswers(v1); len(a) != 1 || a[0].who != "codex@me@example.com" {
+		t.Fatalf("/v1 account: %+v", a)
+	}
+	other := row("lead-other", "sub2api", "", "relay.example.com", CodexPath+"/responses")
+	if a := loggedAnswers(other); len(a) != 1 || a[0].provider != "sub2api" {
+		t.Fatalf("relay: %+v", a)
 	}
 }
 
@@ -968,5 +1137,25 @@ func TestCodexModelListOwnOnlyForFailover(t *testing.T) {
 	New().Handler().ServeHTTP(rec, req)
 	if got := rec.Header().Get("X-Models-Etag"); rec.Code != 200 || !codexcat.Tagged(got, provider.CodexOwnListTag()) {
 		t.Errorf("%d X-Models-Etag %q", rec.Code, got)
+	}
+}
+
+// A lead a provider answered before it was renamed was answered by the
+// id it has now, the one its candidates go by (cybercaius).
+func TestRenamedProviderAnsweredItsLead(t *testing.T) {
+	setHome(t, t.TempDir())
+	if err := provider.Save(provider.Provider{ID: "myrelay", Name: "My relay", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"gpt-5.5"}}); err != nil {
+		t.Fatal(err)
+	}
+	session := "lead-renamed-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	usage.Append(usage.Record{
+		Time: time.Now(), Agent: "codex", Provider: "myrelay", Host: "relay.example.com", ProviderKeyID: "fp",
+		Model: "gpt-5.5", Input: 9, Output: 2, Status: 200, Endpoint: CodexPath + "/responses", Session: session,
+	})
+	if err := provider.Rename("myrelay", "newrelay"); err != nil {
+		t.Fatal(err)
+	}
+	if a := loggedAnswers(session); len(a) != 1 || a[0].provider != "newrelay" || a[0].who != "newrelay#fp" {
+		t.Fatalf("answers %+v", a)
 	}
 }

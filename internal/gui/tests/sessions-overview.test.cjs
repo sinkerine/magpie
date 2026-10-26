@@ -65,7 +65,9 @@ function serve(lang, seen, ctl = {}) {
       const cwd = q.get("cwd");
       const tops = [0, 1, 2].map((i) => top(i, cwd || (i ? "/work/beta" : "/work/alpha")));
       return json({ count: cwd ? 7 : 42, median: 120000, p90: 880000, days: days.map((d) => d.usage.length ? 2 : 0),
-        top: { tokens: tops, cost: [...tops].reverse(), active: tops.slice(0, 2) },
+        // the last by cost: a Pi subagent's session seen only through the
+        // gateway, with no folder and no prompt recorded (#2285)
+        top: { tokens: tops, cost: [...tops].reverse().concat({ ...top(9, ""), key: "pi:sub-9", agent: "pi", id: "sub-9", title: "", gateway: true, cost: 0.5, models: ["deepseek-v4-pro"] }), active: tops.slice(0, 2) },
         messages: days.map((d) => d.usage.length ? 30 : 0), output: days.map(() => 0),
         shape: {
           messages: { edges: [1, 6, 16, 31, 61, 121], counts: [3, 10, 14, 9, 4, 2], total: 42 },
@@ -97,8 +99,10 @@ function serve(lang, seen, ctl = {}) {
 }
 
 const want = {
-  en: { median: "median 120K · p90 880K", share: /\d+% in alpha/, busiest: /^Busiest at \S+ 09:00$/, detail: "Time", idLine: "Session ID", none: "Active time isn't kept by model." },
-  zh: { median: "中位 120K · p90 880K", share: /alpha 占 \d+%/, busiest: /^最忙：\S+ 09:00$/, detail: "时间", idLine: "会话 ID", none: "活跃时长不按模型统计。" },
+  en: { median: "median 120K · p90 880K", share: /\d+% in alpha/, busiest: /^Busiest at \S+ 09:00$/, detail: "Time", idLine: "Session ID", none: "Active time isn't kept by model.",
+    gwName: "(prompt not recorded)", gwSub: /^Gateway session · pi · deepseek-v4-pro · /, gwTip: /Record gateway conversations/ },
+  zh: { median: "中位 120K · p90 880K", share: /alpha 占 \d+%/, busiest: /^最忙：\S+ 09:00$/, detail: "时间", idLine: "会话 ID", none: "活跃时长不按模型统计。",
+    gwName: "（未记录提示词）", gwSub: /^网关会话 · pi · deepseek-v4-pro · /, gwTip: /记录网关对话/ },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -249,6 +253,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#sessTop .segs .opt").nth(1).click();
         assert.equal(await page.locator("#sessTop .sess-top .name").first().innerText(), "Top session 2");
         assert.equal(await page.evaluate(() => localStorage.getItem("magpie.sessTop")), "cost");
+        // a session only the gateway saw says so, not "(no prompt)" with no folder (#2285)
+        const gw = page.locator("#sessTop .sess-top").last();
+        assert.equal(await gw.locator(".name").innerText(), want[lang].gwName);
+        assert.match(await gw.locator(".sub").innerText(), want[lang].gwSub);
+        assert.match(await gw.locator(".sub").getAttribute("title"), want[lang].gwTip);
+        assert.equal(await page.locator("#sessTop .sess-top").first().locator(".sub").getAttribute("title"), "/work/beta");
       });
 
       await t.test("a project picked from its bar, the page left where it was", async () => {

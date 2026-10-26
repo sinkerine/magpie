@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -351,19 +353,137 @@ func InstallAsAdmin(staged, bundle string) error {
 // Relaunch opens bundle again once this process (pid) has exited: with its
 // window when window is set, else only its menu bar icon (`tray`, as a
 // login launch), which a restart by itself uses while no window was up.
+// Each try, and what it came to, is written to relaunch.log in magpie's
+// own folder.
 func Relaunch(bundle string, window bool) error {
-	script := fmt.Sprintf(`while kill -0 %d 2>/dev/null; do sleep 0.2; done; %s`, os.Getpid(), relaunchOpen(bundle, window))
+	return runAfterExit(os.Getpid(), relaunchCommand(bundle, window, relaunchLog()))
+}
+
+// openWaits are the pauses, in seconds, between tries of the relaunch's
+// open: about 13s in all. Just after magpie exits, LaunchServices can
+// still hold it as running and send the open to the process that is gone,
+// and open fails (-600, procNotFound; seen with the screen locked). Tried
+// once, nothing started magpie again until the user did, nine hours later.
+var openWaits = []string{"0.5", "1", "1", "2", "2", "3", "4"}
+
+// relaunchLogName is the file in magpie's folder the relaunch writes each
+// try of its open to, and the start it falls back to: the shell that runs
+// them has no output anyone sees, and a magpie that never came back left
+// only the system log to say why.
+const relaunchLogName = "relaunch.log"
+
+// relaunchLog is the relaunch's log file, made ready to append to; once it
+// is past 64KB the last one is kept as relaunch.log.old. "" when magpie's
+// folder can't be made: the tries then go unwritten.
+func relaunchLog() string {
+	h, err := appdir.Home()
+	if err != nil || h == "" {
+		return ""
+	}
+	dir := appdir.Config()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return ""
+	}
+	p := filepath.Join(dir, relaunchLogName)
+	if fi, err := os.Stat(p); err == nil && fi.Size() > 64<<10 {
+		os.Rename(p, p+".old")
+	}
+	return p
+}
+
+// relaunchCommand is the shell command Relaunch runs once magpie has
+// exited: open, tried again while it fails, and, when it never worked,
+// the bundle's own executable run straight, as the login launch agent
+// runs it. With the screen locked, magpie stayed closed after an update
+// even with the 13s of tries (molvqingtai, after fb23bca5c): LaunchServices
+// can go on refusing the open for as long as the session is locked, and a
+// program run by its path needs nothing from it to start.
+func relaunchCommand(bundle string, window bool, log string) string {
+	return relaunchScript(bundle, window, log, openWaits)
+}
+
+// relaunchScript is relaunchCommand with the pauses between opens.
+func relaunchScript(bundle string, window bool, log string, waits []string) string {
+	if log == "" {
+		log = os.DevNull
+	}
+	exe := filepath.Join(bundle, "Contents", "MacOS", bundleExecutable(bundle))
+	run := shellQuote(exe)
+	for _, a := range RelaunchArgs(window, "") {
+		run += " " + shellQuote(a)
+	}
+	var b strings.Builder
+	b.WriteString("log=" + shellQuote(log) + "; ")
+	b.WriteString(`note() { echo "$(date '+%Y-%m-%d %H:%M:%S %z') $*" >> "$log" 2>/dev/null; }; `)
+	// open's own exit status and what it said, on one line
+	b.WriteString(`try() { n=$((n+1)); e=$(` + relaunchOpen(bundle, window) + ` 2>&1 >/dev/null); s=$?; note "open try $n: exit $s $(printf '%s' "$e" | tr '\n' ' ')"; return $s; }; `)
+	b.WriteString("n=0; note " + shellQuote("magpie has exited; opening "+bundle) + "; ")
+	b.WriteString(retried("try", waits))
+	b.WriteString(" || { note \"open gave up after $n tries; starting \"" + shellQuote(run) + "; ")
+	b.WriteString("[ -x " + shellQuote(exe) + " ] || { note \"no executable at \"" + shellQuote(exe) + "; exit 1; }; ")
+	b.WriteString("exec " + run + " </dev/null >/dev/null 2>&1; }")
+	return b.String()
+}
+
+// bundleExecutableKey finds the program an app's Info.plist names.
+var bundleExecutableKey = regexp.MustCompile(`<key>CFBundleExecutable</key>\s*<string>([^<]+)</string>`)
+
+// bundleExecutable is the name of the program in bundle's Contents/MacOS:
+// the one its Info.plist names, else this one's own when it runs from
+// that bundle, else magpie.
+func bundleExecutable(bundle string) string {
+	if b, err := os.ReadFile(filepath.Join(bundle, "Contents", "Info.plist")); err == nil {
+		if m := bundleExecutableKey.FindSubmatch(b); m != nil {
+			if name := strings.TrimSpace(html.UnescapeString(string(m[1]))); name != "" && !strings.ContainsRune(name, '/') {
+				return name
+			}
+		}
+	}
+	if exe, err := Executable(); err == nil && filepath.Dir(exe) == filepath.Join(bundle, "Contents", "MacOS") {
+		return filepath.Base(exe)
+	}
+	return "magpie"
+}
+
+// retried is a shell command that runs command until it succeeds, sleeping
+// each of waits in turn after a failure; the last try's status is its own.
+func retried(command string, waits []string) string {
+	if len(waits) == 0 {
+		return command
+	}
+	return fmt.Sprintf("for w in %s; do %s && exit 0; sleep $w; done; %s", strings.Join(waits, " "), command, command)
+}
+
+// runAfterExit starts a shell that runs command once pid has exited. The
+// shell is in a session of its own: launchd ends the process group of a
+// job whose process exits, so one left in magpie's group was killed as
+// magpie quit and the new version never opened. That is the launch agent
+// of Open at login without AbandonProcessGroup (ee16c657), and, on macOS
+// 13 at least, the job LaunchServices runs an app in when it is opened from
+// the Dock or Finder, which magpie can't set that key on (#2362).
+func runAfterExit(pid int, command string) error {
+	script := fmt.Sprintf(`while kill -0 %d 2>/dev/null; do sleep 0.2; done; %s`, pid, command)
 	cmd := proc.Command("/bin/sh", "-c", script)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
+	detach(cmd)
 	return cmd.Start()
 }
 
-// relaunchOpen is the open command Relaunch runs for bundle.
+// relaunchOpen is the open command Relaunch runs for bundle. -n asks
+// LaunchServices for a new instance: without it, open looks the app up
+// among those running first, and just after magpie exits LaunchServices
+// can still have the gone process registered as magpie. open then sends
+// it a reopen Apple event (aevt/rapp) rather than launching the bundle,
+// and fails with -600, procNotFound ("Specified target process … does
+// not exist", "LAUNCH: Launch failed in CSUI"; Linka's log on Discord,
+// macOS 27.0.1, v0.1.1308), as often as it is tried. A magpie that is in
+// fact up still has the one instance: the new process finds the instance
+// lock held and hands over to it (runningAlready in internal/gui).
 func relaunchOpen(bundle string, window bool) string {
 	if window {
-		return fmt.Sprintf("open %q", bundle)
+		return fmt.Sprintf("open -n %q", bundle)
 	}
-	return fmt.Sprintf("open %q --args tray", bundle)
+	return fmt.Sprintf("open -n %q --args tray", bundle)
 }
 
 // ReplaceBinary puts the release's build for this binary where the
@@ -428,9 +548,15 @@ func InstallBinary(staged, exe string) error {
 func InstallBinaryAside(staged, exe string) (string, error) {
 	var old string
 	if runtime.GOOS == "windows" {
-		if err := canStart(staged); err != nil {
-			os.Remove(staged)
-			return "", &BlockedError{Err: err}
+		// tried once per download: a restart clicked again after a failed
+		// one doesn't start it again, which would have an antivirus that
+		// checks a program as it starts hold it again for the move below
+		if !trialled.passed(staged) {
+			if err := canStart(staged); err != nil {
+				os.Remove(staged)
+				return "", &BlockedError{Err: err}
+			}
+			trialled.note(staged)
 		}
 		// A running .exe cannot be overwritten, but it can be moved aside.
 		// What the last update moved aside may still be running too (a
@@ -444,6 +570,11 @@ func InstallBinaryAside(staged, exe string) (string, error) {
 		}
 	}
 	if err := moveIn(staged, exe); err != nil {
+		if heldOpen(err) {
+			// the reason and what to do, shown as is in the version row
+			// and the Update pill's tooltip, without the paths
+			err = &saidError{fmt.Sprintf("couldn't put the new version in place of %s: another program still has the download open (often an antivirus checking it): let magpie through it and restart to update again, or download the new version and put it in place of this one", filepath.Base(exe)), err}
+		}
 		if old != "" {
 			if restoreErr := moveIn(old, exe); restoreErr != nil {
 				return "", errors.Join(err, fmt.Errorf("couldn't restore %s from %s: %w", filepath.Base(exe), old, restoreErr))
@@ -456,6 +587,16 @@ func InstallBinaryAside(staged, exe string) (string, error) {
 	return old, nil
 }
 
+// saidError is err said in other words: what is shown, err what
+// errors.Is and errors.As find.
+type saidError struct {
+	said string
+	err  error
+}
+
+func (e *saidError) Error() string { return e.said }
+func (e *saidError) Unwrap() error { return e.err }
+
 // renameFile is os.Rename; tests make it fail.
 var renameFile = os.Rename
 
@@ -463,6 +604,69 @@ var renameFile = os.Rename
 // an antivirus scanning it or a sync client (OneDrive) reading it holds it
 // open, which Windows won't rename under, for a moment, and lets go.
 var asideWaits = []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond, 1500 * time.Millisecond}
+
+// heldFor is how long a file Windows says another program holds open is
+// waited for, past asideWaits, the last pause repeated: an antivirus that
+// checks a new program as it starts may hold a 50 MB download longer than
+// asideWaits' three seconds, and a restart that gave up then would fail
+// the same way on every click, each click's trial start having it checked
+// again (白菜 on Discord). The user clicked restart and sees "Restarting…"
+// meanwhile. A var for tests.
+var heldFor = 30 * time.Second
+
+// waitHeld is whether to try again after try i (from 0) failed with err,
+// begun at start, sleeping first when so: through asideWaits for any error
+// retry allows, then on while err is a file held open, up to heldFor.
+func waitHeld(i int, err error, start time.Time, retry bool) bool {
+	if !retry {
+		return false
+	}
+	if i < len(asideWaits) {
+		time.Sleep(asideWaits[i])
+		return true
+	}
+	if !heldOpen(err) || len(asideWaits) == 0 {
+		return false
+	}
+	pause := asideWaits[len(asideWaits)-1]
+	if time.Since(start)+pause > heldFor {
+		return false
+	}
+	time.Sleep(pause)
+	return true
+}
+
+// trialled is the download canStart last let through, by path, size and
+// time written, so a restart tried again on it doesn't start it again.
+var trialled trialNote
+
+type trialNote struct {
+	mu   sync.Mutex
+	path string
+	size int64
+	mod  time.Time
+}
+
+func (n *trialNote) passed(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.path == path && n.size == fi.Size() && n.mod.Equal(fi.ModTime())
+}
+
+func (n *trialNote) note(path string) {
+	fi, err := os.Stat(path)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if err != nil {
+		n.path = ""
+		return
+	}
+	n.path, n.size, n.mod = path, fi.Size(), fi.ModTime()
+}
 
 // Windows' errors for a file another program holds open without letting
 // it be renamed.
@@ -478,12 +682,12 @@ const (
 // after the process has ended, and a move made at once failed the first
 // install of every update (#2272). Any other failure is returned at once.
 func moveIn(from, exe string) error {
-	var err error
+	start := time.Now()
 	for i := 0; ; i++ {
-		if err = os.Rename(from, exe); err == nil || i == len(asideWaits) || !heldOpen(err) {
+		err := os.Rename(from, exe)
+		if err == nil || !waitHeld(i, err, start, heldOpen(err)) {
 			return err
 		}
-		time.Sleep(asideWaits[i])
 	}
 }
 
@@ -500,18 +704,18 @@ func heldOpen(err error) bool {
 // so a failed installation can put the running exe back.
 func moveAside(exe string) (string, error) {
 	var err error
+	start := time.Now()
 	for i := 0; ; i++ {
 		old := oldName(exe)
 		if err = renameFile(exe, old); err == nil {
 			return old, nil
 		}
-		if errors.Is(err, fs.ErrNotExist) || i == len(asideWaits) {
-			break
-		}
 		if i == 0 {
 			os.Chmod(exe, 0o755) // a read-only exe: the attribute off
 		}
-		time.Sleep(asideWaits[i])
+		if !waitHeld(i, err, start, !errors.Is(err, fs.ErrNotExist)) {
+			break
+		}
 	}
 	why := err.Error()
 	var le *os.LinkError
@@ -741,3 +945,31 @@ func (c *counter) Read(p []byte) (int, error) {
 
 // Alive reports whether the process pid is still running.
 func Alive(pid int) bool { return alive(pid) }
+
+// OpenBeside opens bundle now, a new instance beside this one (open -n),
+// tried again while open fails: a restart that hands the gateway over
+// (internal/handoff) starts the new version before this one quits. With
+// window, its window; else its menu bar icon only, as Relaunch.
+func OpenBeside(bundle string, window bool) error {
+	cmd := proc.Command("/bin/sh", "-c", retried(openBeside(bundle, window), openWaits))
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
+	detach(cmd)
+	return cmd.Start()
+}
+
+// openBeside is the open command OpenBeside runs for bundle.
+func openBeside(bundle string, window bool) string {
+	if window {
+		return fmt.Sprintf("open -n %q", bundle)
+	}
+	return fmt.Sprintf("open -n %q --args tray", bundle)
+}
+
+// StartBeside starts exe now, beside this process, as RelaunchBinary's
+// args say: the new version of a restart that hands the gateway over. It
+// isn't told to wait for this one (MAGPIE_REPLACES): it takes the gateway
+// from it while it runs.
+func StartBeside(exe string, window bool, view string) error {
+	_, _, err := launch(exe, RelaunchArgs(window, view), os.Environ())
+	return err
+}

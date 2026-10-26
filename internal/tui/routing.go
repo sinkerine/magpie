@@ -34,7 +34,7 @@ func (m *model) reloadGroups() {
 	m.grow = clamp(m.grow, len(m.groups))
 }
 
-var routings = []string{"", provider.Ordered, provider.Rotate, provider.LeastUsed, provider.Pace, provider.Weighted, provider.Manual}
+var routings = []string{"", provider.Ordered, provider.Rotate, provider.LeastUsed, provider.Pace, provider.Weighted, provider.FreeFirst, provider.Manual}
 
 func routingName(v string) string {
 	switch v {
@@ -48,6 +48,8 @@ func routingName(v string) string {
 		return "weekly pace"
 	case provider.Weighted:
 		return "by weight"
+	case provider.FreeFirst:
+		return "free first"
 	case provider.Manual:
 		return "manual"
 	}
@@ -199,7 +201,7 @@ func memberOptions(skip []string, self string) []agent.Option {
 		// agents see too (a provider kept for routing groups, a group's
 		// with listed=no, #1783), as the Routing view's picker offers
 		for _, e := range provider.Served() {
-			if slices.Contains(skip, e.ID) || e.ID == provider.GroupPrefix+self {
+			if slices.Contains(skip, e.ID) || slices.Contains(skip, provider.CanonicalRef(e.ID)) || e.Group != "" && e.Group == self {
 				continue
 			}
 			note := e.Name
@@ -293,7 +295,8 @@ func (m *model) openClassifier(g provider.Group) {
 // ruleHint is what a rule is typed as.
 const ruleHint = `use=<model>, and any of: tokens=200k · images · effort=on|low|medium|high|xhigh|max · agents=codex,claude
 intent="a quick question" (the group's classifier=<model> tells it) · compact
-time=09:00-18:00 (local; 22:00-08:00 runs past midnight) · days=mon-fri · folders=~/work/acme,~/oss · except-folders=~/old · at=<n> for its place
+time=09:00-18:00 (22:00-08:00 runs past midnight) · days=mon-fri · tz=Asia/Shanghai (this computer's zone if none) · folders=~/work/acme,~/oss · except-folders=~/old · at=<n> for its place
+use-effort=low|medium|high|xhigh|max: the reasoning the model is asked for, whatever the agent asked
 or pause=<model> time=… days=… agents=… folders=… except-folders=…: the model is left out of the group then, not even a fallback`
 
 // openRule asks for a rule: a new one, or rule i (from 0) typed again.
@@ -324,6 +327,7 @@ func putRule(g *provider.Group, i int, line string) error {
 	if err != nil {
 		return err
 	}
+	r.InZoneHere()
 	if classifier != "" {
 		g.Classifier = classifier
 	}
@@ -413,7 +417,7 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openClassifier(g)
 	case "E", "F":
 		// the model's own effort and fast mode, whatever the agent asks
-		if onRule || n == 0 || strings.HasPrefix(g.Members[m.gsel], provider.GroupPrefix) {
+		if onRule || n == 0 || provider.IsGroupRef(g.Members[m.gsel]) {
 			return m, nil
 		}
 		id := g.Members[m.gsel]
@@ -520,7 +524,7 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.confirm != "member/"+id {
 			m.confirm = "member/" + id
 			m.flash, m.flashOK = "press d again to take "+id+" out", false
-			if slices.ContainsFunc(g.Rules, func(r provider.Rule) bool { return r.Use == id }) {
+			if slices.ContainsFunc(g.Rules, func(r provider.Rule) bool { _, kept := r.Without(id); return !kept }) {
 				m.flash += " and its rules"
 			}
 			return m, nil
@@ -529,7 +533,14 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.gsel = clamp(m.gsel, all-1)
 		return m, saveGroup(g.ID, func(g *provider.Group) error {
 			g.Members = slices.DeleteFunc(g.Members, func(x string) bool { return x == id })
-			g.Rules = slices.DeleteFunc(g.Rules, func(r provider.Rule) bool { return r.Use == id })
+			// a rule that sends to others too keeps them
+			var rules []provider.Rule
+			for _, r := range g.Rules {
+				if r, kept := r.Without(id); kept {
+					rules = append(rules, r)
+				}
+			}
+			g.Rules = rules
 			return nil
 		}, id+" taken out")
 	}
@@ -556,7 +567,7 @@ func (m model) viewGroups() string {
 	}
 	nameW, idW := 0, 0
 	for _, g := range m.groups {
-		nameW, idW = max(nameW, lipgloss.Width(dash(g.Name))), max(idW, lipgloss.Width(provider.GroupPrefix+g.ID))
+		nameW, idW = max(nameW, lipgloss.Width(dash(g.Name))), max(idW, lipgloss.Width(g.Ref()))
 	}
 	visible := max(3, m.h-7)
 	start := 0
@@ -575,7 +586,7 @@ func (m model) viewGroups() string {
 		if i == m.grow {
 			marker, name = sCursor.Render("▸ "), sNameOn.Render(padRight(dash(g.Name), nameW))
 		}
-		line := pad + marker + name + "  " + sFaint.Render(padRight(provider.GroupPrefix+g.ID, idW))
+		line := pad + marker + name + "  " + sFaint.Render(padRight(g.Ref(), idW))
 		if g.Hidden {
 			b.WriteString(line + "\n")
 			continue
@@ -611,7 +622,7 @@ func (m model) viewGroup() string {
 	var b strings.Builder
 	b.WriteString(m.header("routing", g.Name))
 	b.WriteString("\n\n")
-	head := []string{provider.GroupPrefix + g.ID, groupRouting(g), staysName(g.Affinity)}
+	head := []string{g.Ref(), groupRouting(g), staysName(g.Affinity)}
 	if g.Context > 0 {
 		head = append(head, "context "+fmtTokens(g.Context))
 	}
@@ -626,7 +637,10 @@ func (m model) viewGroup() string {
 	}
 	b.WriteString(pad + "  " + sMuted.Render(strings.Join(head, " · ")) + "\n\n")
 	b.WriteString(pad + "  " + sFaint.Render("models · the first that can take a request gets it") + "\n")
-	for i, id := range g.Members {
+	hits := provider.PatternHits(g)
+	memFrom, memTo, ruleFrom, ruleTo := groupWindow(len(g.Members), len(g.Rules), m.gsel, m.groupRows(g, len(hits)))
+	for i := memFrom; i < memTo; i++ {
+		id := g.Members[i]
 		marker, name := "  ", sText.Render(id)
 		if i == m.gsel {
 			marker, name = sCursor.Render("▸ "), sNameOn.Render(id)
@@ -641,7 +655,7 @@ func (m model) viewGroup() string {
 	}
 	// patterns find models in the catalog each time (#766): how many now,
 	// and one that finds none said so rather than left an empty list
-	if hits := provider.PatternHits(g); len(hits) > 0 {
+	if len(hits) > 0 {
 		b.WriteString("\n" + pad + "  " + sFaint.Render("patterns · every model they match now, after those named") + "\n")
 		for _, h := range hits {
 			n := sMuted.Render(fmt.Sprintf(" · %d model%s", h.Models, plural(h.Models)))
@@ -655,14 +669,19 @@ func (m model) viewGroup() string {
 	if len(g.Rules) == 0 {
 		b.WriteString(pad + "  " + sMuted.Render("none · n adds one") + "\n")
 	}
-	for i, r := range g.Rules {
-		marker, use := "  ", sText.Render(r.Use)
+	for i := ruleFrom; i < ruleTo; i++ {
+		r := g.Rules[i]
+		uses := strings.Join(r.Uses(), ", ") // in order: the next when one can't take it
+		marker, use := "  ", sText.Render(uses)
 		if len(g.Members)+i == m.gsel {
-			marker, use = sCursor.Render("▸ "), sNameOn.Render(r.Use)
+			marker, use = sCursor.Render("▸ "), sNameOn.Render(uses)
 		}
 		arrow := " → "
 		if r.Pause {
 			arrow = " → pause "
+		}
+		if r.UseEffort != "" {
+			use += sMuted.Render(" at ") + sText.Render(r.UseEffort)
 		}
 		b.WriteString(pad + marker + sFaint.Render(fmt.Sprintf("%d  ", i+1)) + sMuted.Render(strings.Join(r.Conditions(), " · ")+arrow) + use + "\n")
 	}
@@ -670,4 +689,45 @@ func (m model) viewGroup() string {
 		b.WriteString("\n" + pad + "  " + sFaint.Render("classifier ") + sText.Render(dash(g.Classifier)) + sFaint.Render(" · tells which intent a message is") + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// groupRows is how many members and rules the group page has room for:
+// the terminal's height less every other line View draws around them —
+// the header, the group's line, the section titles, the patterns, the
+// classifier, and the blank line, the status and the two lines of keys
+// under them, as a short group's page has. A group with
+// more than that would otherwise scroll its header and the row picked
+// off the top and freeze the page, as the library page did (#2220) and
+// the agents page before it (#2428).
+func (m model) groupRows(g provider.Group, hits int) int {
+	fixed := 7 + 6 // above the members and between them and the rules; below the body
+	if hits > 0 {
+		fixed += 2 + hits
+	}
+	if len(g.Rules) == 0 {
+		fixed++
+	}
+	if slices.ContainsFunc(g.Rules, func(r provider.Rule) bool { return r.Intent != "" }) {
+		fixed += 2
+	}
+	return max(3, m.h-fixed)
+}
+
+// groupWindow picks the members [memFrom, memTo) and rules [ruleFrom,
+// ruleTo) to draw in rows lines, the row picked among them: a pick among
+// the members keeps the first rules below it as room allows, a pick
+// among the rules keeps the members' tail above it. Members and rules
+// share one cursor, sel, the rules counted after the members.
+func groupWindow(members, rules, sel, rows int) (memFrom, memTo, ruleFrom, ruleTo int) {
+	if members+rules <= rows {
+		return 0, members, 0, rules
+	}
+	if sel < members {
+		memFrom = max(0, sel+1-rows)
+		memTo = min(members, memFrom+rows)
+		return memFrom, memTo, 0, min(rules, rows-(memTo-memFrom))
+	}
+	ruleTo = min(rules, sel-members+1)
+	ruleFrom = max(0, ruleTo-rows)
+	return max(0, members-(rows-(ruleTo-ruleFrom))), members, ruleFrom, ruleTo
 }

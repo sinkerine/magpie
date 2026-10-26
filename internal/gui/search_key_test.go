@@ -91,3 +91,42 @@ func TestSearchAPIBaseURLFromSettings(t *testing.T) {
 		t.Fatalf("vendors' own addresses %v", bases)
 	}
 }
+
+// Settings sends the search APIs' new order and an API switched on or off
+// (#2286); one off is listed off, keeps its key, and isn't asked.
+func TestSearchAPIOrderAndOffFromSettings(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	post := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		Handler(nil, nil).ServeHTTP(rec, httptest.NewRequest("POST", "/api/settings/search-api", strings.NewReader(body)))
+		return rec
+	}
+	for _, b := range []string{`{"vendor":"tavily","key":"tvly-1"}`, `{"vendor":"exa","key":"e-1"}`, `{"arrange":["exa","tavily"]}`, `{"vendor":"tavily","on":false}`} {
+		if rec := post(b); rec.Code != 200 {
+			t.Fatalf("%s: %d %s", b, rec.Code, rec.Body)
+		}
+	}
+	var s settingsJSON
+	searchState(&s)
+	if len(s.SearchAPIs) != 2 || s.SearchAPIs[0].Vendor != "exa" || s.SearchAPIs[0].Off || s.SearchAPIs[1].Vendor != "tavily" || !s.SearchAPIs[1].Off || s.SearchAPIs[1].Key == "" {
+		t.Fatalf("%+v", s.SearchAPIs)
+	}
+	if as := provider.SearchAPIs(); len(as) != 1 || as[0].Vendor != "exa" {
+		t.Fatalf("asked %+v", as)
+	}
+	for _, bad := range []string{`{"arrange":["exa","google"]}`, `{"vendor":"brave","on":true}`} {
+		if rec := post(bad); rec.Code < 400 {
+			t.Errorf("%s taken: %d", bad, rec.Code)
+		}
+	}
+	if rec := post(`{"vendor":"tavily","on":true}`); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if as := provider.SearchAPIs(); len(as) != 2 || as[1].Vendor != "tavily" {
+		t.Fatalf("switched on %+v", as)
+	}
+}

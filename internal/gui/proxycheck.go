@@ -5,7 +5,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -17,8 +20,14 @@ import (
 // way magpie's requests leave. One request to Cloudflare's trace page goes
 // as a vendor request would (the proxy Settings, *_PROXY or the system
 // names), and one goes direct; each says the address Cloudflare saw it
-// from and the country. Different addresses say the proxy is taking the
-// requests; the same address says they leave as if there were none.
+// from and the country, and the request through the proxy says whether
+// its connection went to the proxy. Different addresses say the proxy is
+// taking the requests. The same address with the connection made to the
+// proxy says it took them too, but both leave by one exit: a TUN or
+// system VPN can send even the direct request through the same proxy
+// (#2369, Emt-lin), so the address can't tell the two paths apart. The
+// same address with the connection made elsewhere says the proxy was
+// passed by.
 
 // proxyTraceURL is the page asked; a test points it at its own server.
 var proxyTraceURL = "https://www.cloudflare.com/cdn-cgi/trace"
@@ -27,12 +36,16 @@ var proxyTraceURL = "https://www.cloudflare.com/cdn-cgi/trace"
 const proxyTraceTimeout = 10 * time.Second
 
 // proxyLeg is one of the two requests: the address and country Cloudflare
-// saw it from, how long it took, or why it failed.
+// saw it from, how long it took, or why it failed. Proxied, on the request
+// through the proxy, is whether the connection that carried it went to
+// the proxy in force, which an exit address shared with the direct
+// request can't say.
 type proxyLeg struct {
-	IP    string `json:"ip,omitempty"`
-	Loc   string `json:"loc,omitempty"`
-	Ms    int64  `json:"ms,omitempty"`
-	Error string `json:"error,omitempty"`
+	IP      string `json:"ip,omitempty"`
+	Loc     string `json:"loc,omitempty"`
+	Ms      int64  `json:"ms,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Proxied bool   `json:"proxied,omitempty"`
 }
 
 // proxyCheck is the answer: the proxy in force (redacted) and where it came
@@ -55,12 +68,72 @@ func checkProxy(ctx context.Context, client *http.Client, via context.Context, t
 	if through {
 		out.Through = &proxyLeg{}
 		wg.Add(1)
-		go func() { defer wg.Done(); *out.Through = traceLeg(via, client) }()
+		go func() { defer wg.Done(); *out.Through = throughLeg(via, client) }()
 	}
 	wg.Add(1)
 	go func() { defer wg.Done(); out.Direct = traceLeg(netproxy.With(ctx, "direct"), client) }()
 	wg.Wait()
 	return out
+}
+
+// throughLeg is traceLeg through the proxy ctx's requests take
+// (netproxy.Func), with Proxied set when the answer came over a
+// connection to that proxy. A proxy the trace page is passed by (a
+// bypass list naming it) leaves Proxied false.
+func throughLeg(ctx context.Context, client *http.Client) proxyLeg {
+	var remote net.Addr
+	trace := &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) {
+		if i.Conn != nil {
+			remote = i.Conn.RemoteAddr()
+		}
+	}}
+	leg := traceLeg(httptrace.WithClientTrace(ctx, trace), client)
+	if leg.Error != "" || remote == nil {
+		return leg
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, proxyTraceURL, nil)
+	if err != nil {
+		return leg
+	}
+	if p, err := netproxy.Func(req); err == nil && p != nil {
+		leg.Proxied = connectedTo(ctx, remote, p)
+	}
+	return leg
+}
+
+// connectedTo is whether remote, a connection's far end, is the proxy p:
+// its port, and its address or one its name resolves to.
+func connectedTo(ctx context.Context, remote net.Addr, p *url.URL) bool {
+	host, port, err := net.SplitHostPort(remote.String())
+	if err != nil {
+		return false
+	}
+	want := p.Port()
+	if want == "" {
+		want = map[string]string{"http": "80", "https": "443", "socks5": "1080", "socks5h": "1080"}[p.Scheme]
+	}
+	if port != want {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if pip := net.ParseIP(p.Hostname()); pip != nil {
+		return pip.Equal(ip)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, p.Hostname())
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if a.IP.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // traceLeg makes one request to the trace page and reads its ip= and loc=

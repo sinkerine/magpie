@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -36,14 +37,21 @@ func init() {
 // VisionAgent is the User-Agent of the descriptions magpie asks for.
 const VisionAgent = "magpie-vision/1"
 
-const visionTimeout = 2 * time.Minute
+// visionTimeout is how long the vendor has to describe an image, from when
+// the request went out to it (each try's own), and visionWaitMost how long
+// a description may take in all, the waits for a slot or a resting provider
+// with it (sideDeadline, #2318): a reasoning model describing a dense
+// screenshot can take more than two minutes by itself.
+var visionTimeout, visionWaitMost = 3 * time.Minute, 10 * time.Minute
 
 // visionParallel is how many images of a request are described at once.
 const visionParallel = 4
 
-// sightsKept is how many descriptions are kept: an agent sends a
-// conversation's images again every turn.
-const sightsKept = 256
+// sightsKept is how many descriptions are kept, the least recently used
+// dropped first: an agent sends a conversation's images again every turn,
+// and a long Computer Use one holds hundreds of screenshots (fflake33).
+// A description is a few kilobytes.
+const sightsKept = 2048
 
 const visionSystem = `You describe images for an AI model that cannot see them. It will answer the user from your description alone, so leave nothing out that it may need.
 - Transcribe all text exactly as written, keeping its layout: code, terminal output, error messages, logs, UI labels, menus, file names, numbers.
@@ -138,6 +146,26 @@ func missingSeerNote() string {
 	return ""
 }
 
+// textOnlyNote is what a request turned away for its image says of why
+// magpie takes the model for text-only and where that is changed, so the
+// reader turns on the model's switch rather than trying another model or
+// reinstalling the agent (KimYx0207 on X, over mark_li21's Codex paste): the
+// user's own answer, else what the provider's list says; for a group, that
+// none of its members is marked as taking images.
+func textOnlyNote(p provider.Provider, model string, group string) string {
+	if group != "" {
+		return fmt.Sprintf("; no model in the group %s is marked as taking images: turn on Accepts images for one that does, in its provider's Names & levels in magpie", group)
+	}
+	name := p.Name
+	if name == "" {
+		name = p.ID
+	}
+	if v, ok := provider.ImageOverride(p.ID, model); ok && !v {
+		return fmt.Sprintf("; Accepts images is turned off for it in magpie, in Providers → %s → Names & levels", name)
+	}
+	return fmt.Sprintf("; %s's model list marks it as not taking images: if it does, turn on Accepts images for it in magpie, in Providers → %s → Names & levels", name, name)
+}
+
 // noSeerNote is what a request turned away for an image says of why no
 // model described it: the picked one is missing, Image recognition is
 // off, or none of the models the user enabled can see.
@@ -200,7 +228,7 @@ func autoVision() (string, bool) {
 		if bestReady && t > bestTier {
 			continue
 		}
-		m, cost, ready := smallModelWhere(p, sees)
+		m, cost, ready := smallModelWhere(p, "sees", seesAt(p.ID))
 		if m == "" {
 			continue
 		}
@@ -234,7 +262,7 @@ func autoSpent(model string) error {
 	}
 	when := ""
 	if !back.IsZero() {
-		when = " until " + back.Local().Format("Jan 2 15:04")
+		when = " until " + heldClock(back, time.Now())
 	}
 	return fmt.Errorf("%s is out of its allowance%s, as is every other model magpie could describe it with, and none is asked until one is back", model, when)
 }
@@ -249,6 +277,20 @@ func autoDescribes() bool {
 // sees is whether a model takes images.
 func sees(m catalog.Model) bool {
 	return m.Images && (m.ImageInput == nil || *m.ImageInput)
+}
+
+// seesAt is sees for provider pid's models, the user's answer first
+// (provider.SetModelImage, magpie model spec --vision): a model they
+// marked text-only is never picked to describe images, and one they
+// marked as seeing is. smallKept is stamped by settings.json too, so a
+// change is read on the next pick.
+func seesAt(pid string) func(catalog.Model) bool {
+	return func(m catalog.Model) bool {
+		if v, ok := provider.ImageOverride(pid, m.ID); ok {
+			return v
+		}
+		return sees(m)
+	}
 }
 
 // sight is a description, once it is done.
@@ -267,6 +309,12 @@ func (s *Server) describe(ctx context.Context, model, src string) (string, error
 	key := hex.EncodeToString(sum[:])
 	s.sightMu.Lock()
 	if e, ok := s.sights[key]; ok {
+		// used again, so the last to go: a long conversation's first
+		// images, still sent every turn, outlast those of conversations
+		// that have ended
+		if i := slices.Index(s.sightOrder, key); i >= 0 {
+			s.sightOrder = append(append(s.sightOrder[:i:i], s.sightOrder[i+1:]...), key)
+		}
 		s.sightMu.Unlock()
 		select {
 		case <-e.done:
@@ -311,7 +359,7 @@ func (s *Server) askVisionWith(ctx context.Context, model, src, system, text str
 	if err := autoSpent(model); err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.WithValue(ctx, describingKey{}, true), visionTimeout)
+	ctx, cancel := sideDeadline(context.WithValue(ctx, describingKey{}, true), "image description", visionTimeout, visionWaitMost)
 	defer cancel()
 	req := map[string]any{
 		"model":  model,
@@ -345,8 +393,11 @@ func (s *Server) askVisionWith(ctx context.Context, model, src, system, text str
 	}
 	w := httptest.NewRecorder()
 	s.serve(w, r, provider.Chat, body)
+	if t, ok := sideTimeout(ctx); ok {
+		return "", t
+	}
 	if ctx.Err() != nil {
-		return "", fmt.Errorf("no answer in %s", visionTimeout)
+		return "", ctx.Err()
 	}
 	var out struct {
 		Choices []struct {
@@ -431,16 +482,11 @@ func (s *Server) seenBody(ctx context.Context, proto provider.Protocol, body []b
 
 // smallModelWhere is smallModel among the provider's models that keep
 // holds, what it costs, and whether it has allowance left (smallReady);
-// "" when there is none.
-func smallModelWhere(p provider.Provider, keep func(catalog.Model) bool) (string, float64, bool) {
-	id, ready := smallReady(p, keep, provider.Chat)
-	if id == "" {
+// "" when there is none. kind names keep (keptSmallCands).
+func smallModelWhere(p provider.Provider, kind string, keep func(catalog.Model) bool) (string, float64, bool) {
+	c, ready := smallReadyOf(p, keptSmallCands(p, kind, keep), provider.Chat)
+	if c.id == "" {
 		return "", 0, false
 	}
-	for _, m := range p.Exposed() {
-		if m.ID == id && m.Price != nil {
-			return id, m.Price.Input + m.Price.Output, ready
-		}
-	}
-	return id, 1e9, ready
+	return c.id, c.cost, ready
 }

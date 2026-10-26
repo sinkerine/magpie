@@ -49,7 +49,8 @@ import (
 // defining it, nor a tool_removal or a message's tool_reference: 422
 // "messages[1].content: unknown variant `tool_removal`". A provider that
 // refuses one is sent none of them (withoutDeferredTools); Kimi, whose 400
-// names nothing, is never sent them (forwardOnce, #2042).
+// names nothing, is never sent them (forwardOnce, #2042). OpenCode's
+// DeepSeek route also names nothing: 422 "Endpoint is unavailable.".
 //
 // ToolSearch's answer is a tool_result whose content is tool_reference
 // blocks alone. OpenDesign's Anthropic endpoint can't read one: 422 "Failed
@@ -332,9 +333,9 @@ func hasDeferredTools(body []byte) bool {
 }
 
 // withoutDeferredTools is body without the deferred-tool blocks in its
-// messages, and without a message they leave empty. The tools stay in the
-// request's own tools list, so a vendor that doesn't defer tools still
-// offers the model every one. A tool_result's tool_reference stays: it is
+// messages, and without a message they leave empty. Definitions carried
+// only inline join the request's own tools list; a definition already on
+// that list wins. A tool_result's tool_reference stays: it is
 // the tool's answer, and Kimi and DeepSeek take it. A body with none is
 // sent as it was.
 func withoutDeferredTools(body []byte) []byte {
@@ -343,10 +344,16 @@ func withoutDeferredTools(body []byte) []byte {
 	}
 	var v struct {
 		Messages []json.RawMessage `json:"messages"`
+		Tools    []json.RawMessage `json:"tools"`
 	}
 	if json.Unmarshal(body, &v) != nil {
 		return body
 	}
+	have := make(map[string]bool, len(v.Tools))
+	for _, tool := range v.Tools {
+		have[gjson.GetBytes(tool, "name").String()] = true
+	}
+	tools := v.Tools
 	out := make([]json.RawMessage, 0, len(v.Messages))
 	for _, raw := range v.Messages {
 		c := gjson.GetBytes(raw, "content")
@@ -356,6 +363,13 @@ func withoutDeferredTools(body []byte) []byte {
 		}
 		var kept []json.RawMessage
 		for _, b := range c.Array() {
+			if b.Get("type").String() == "tool_addition" && b.Get("tool.type").String() == "tool_definition" {
+				def := b.Get("tool.definition")
+				if name := def.Get("name"); def.IsObject() && name.Type == gjson.String && name.String() != "" && !have[name.String()] {
+					tools = append(tools, json.RawMessage(def.Raw))
+					have[name.String()] = true
+				}
+			}
 			if !deferredBlock(b.Get("type").String()) {
 				kept = append(kept, json.RawMessage(b.Raw))
 			}
@@ -382,13 +396,33 @@ func withoutDeferredTools(body []byte) []byte {
 		}
 		out = append(out, b)
 	}
-	return withFields(body, map[string]any{"messages": out})
+	fields := map[string]any{"messages": out}
+	if len(tools) != len(v.Tools) {
+		fields["tools"] = tools
+	}
+	return withFields(body, fields)
 }
 
 // toolLoadedText is what a model is told of a tool ToolSearch loaded, where
 // the tool_reference that names it can't go as it is.
 func toolLoadedText(name string) string {
 	return "Tool " + name + " is loaded and can be called now."
+}
+
+// toolRefs are the tools a tool_result's content names in tool_reference
+// blocks, as Claude Code's ToolSearch answers, in their order.
+func toolRefs(content json.RawMessage) []string {
+	if !bytes.Contains(content, []byte(`"tool_reference"`)) {
+		return nil
+	}
+	var names []string
+	gjson.ParseBytes(content).ForEach(func(_, b gjson.Result) bool {
+		if n := b.Get("tool_name").String(); b.Get("type").String() == "tool_reference" && n != "" {
+			names = append(names, n)
+		}
+		return true
+	})
+	return names
 }
 
 // refsOnly is a tool_result's content that is tool_reference blocks and

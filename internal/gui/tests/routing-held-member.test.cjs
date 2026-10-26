@@ -93,7 +93,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // free@x.test, whose plan doesn't list grok-4.7, isn't drawn
         assert(!rows.some((r) => r.who === "free@x.test"));
         assert.equal(rows[3].st, [await say("{n} available", { n: 1 }), await say("{n} held", { n: 2 })].join(" · "));
-        // nothing spills at either width
+        // nothing spills at either width, measured once the narrow layout
+        // is on: client.js sets its classes a frame after it observes a
+        // width, the box's first and then the list's, and the list can be
+        // drawn the wide way at 0px until then (#2252)
+        if (width < 560) await page.locator(".rt.max560 .rt-accts.max460").waitFor();
         const spills = await page.locator(".rt-accts li").evaluateAll((els) => els.filter((e) => e.getBoundingClientRect().right > document.documentElement.clientWidth + 0.5).map((e) => e.textContent.slice(0, 40)));
         assert.deepEqual(spills, []);
         assert.deepEqual(errors, []);

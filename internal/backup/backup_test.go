@@ -74,7 +74,8 @@ func setUp(t *testing.T) {
 			BalanceToken: "balance-acme", AccessKeyID: "AK-acme", SecretAccessKey: "SK-acme",
 			Keys:    []provider.KeyAccount{{Name: "second", Key: "sk-acme-2"}},
 			Headers: map[string]string{"X-Team": "a", "X-Api-Key": "hdr-secret"}},
-		{ID: "beta", Name: "Beta", Chat: "https://beta.example.com/v1", Key: "sk-beta", BalanceToken: "balance-beta"},
+		// one of the user's whose certificate isn't checked (#2383)
+		{ID: "beta", Name: "Beta", Chat: "https://beta.example.com/v1", Key: "sk-beta", BalanceToken: "balance-beta", InsecureTLS: true},
 	} {
 		if err := provider.Save(p); err != nil {
 			t.Fatal(err)
@@ -124,6 +125,9 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil || p.Key != "sk-acme" || len(p.Keys) != 1 || p.BalanceToken != "balance-acme" || p.Headers["X-Api-Key"] != "hdr-secret" ||
 		p.AccessKeyID != "AK-acme" || p.SecretAccessKey != "SK-acme" {
 		t.Fatalf("acme: %+v %v", p, err)
+	}
+	if b, err := provider.Find("beta"); err != nil || !b.InsecureTLS {
+		t.Fatalf("beta's unchecked certificate not restored: %+v %v", b, err)
 	}
 	name, _ := strings.CutPrefix(p.Icon, "file:")
 	if _, err := os.Stat(provider.IconFile(name)); err != nil {

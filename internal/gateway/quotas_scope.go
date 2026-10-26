@@ -146,7 +146,9 @@ func writeCards(w http.ResponseWriter, r *http.Request, s *quotaScope) {
 	writeJSON(w, 200, map[string]any{"object": "list", "data": cs})
 }
 
-// quotas is qs as the key may be told them.
+// quotas is qs as the key may be told them. A window's whole (Holds,
+// #2333) is left out: it is reckoned from every call routed through the
+// account, other keys' and the owner's too, which a held key is not told.
 func (s *quotaScope) quotas(qs []provider.Quota) []provider.Quota {
 	if s == nil {
 		return qs
@@ -154,6 +156,12 @@ func (s *quotaScope) quotas(qs []provider.Quota) []provider.Quota {
 	out := []provider.Quota{}
 	for _, q := range qs {
 		if q.From == "" && s.card(q.Provider, q.User) {
+			ws := make([]provider.QuotaSpan, len(q.Windows))
+			for i, w := range q.Windows {
+				w.Holds, w.HoldsWhy = nil, ""
+				ws[i] = w
+			}
+			q.Windows = ws
 			out = append(out, q)
 		}
 	}

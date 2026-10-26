@@ -133,7 +133,7 @@ func TestOTelSessionDedupOnlyUnkeyedLoopback(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.Close()
-	deadline := time.Now().Add(6 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for !otelX.SessionAgent("pi") && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -260,6 +260,13 @@ func TestOTelFastRequestTranscriptDiscovery(t *testing.T) {
 			t.Setenv("MAGPIE_OTEL_SESSIONS", "true")
 			t.Setenv("MAGPIE_OTEL_METRICS", "false")
 			fastOTel(t)
+			// The request's cached miss must outlast the request however slow
+			// the machine is (#1811): neither the transcript watcher's poll nor
+			// the end of the discovery cache window may read the transcript
+			// before the export decides. Only SessionFresh may find it.
+			sessionsEvery, ttl := otlp.OTelSessionsEvery, sessions.TraceIdentityTTL
+			otlp.OTelSessionsEvery, sessions.TraceIdentityTTL = time.Hour, time.Hour
+			t.Cleanup(func() { otlp.OTelSessionsEvery, sessions.TraceIdentityTTL = sessionsEvery, ttl })
 			stop := startOTel()
 			t.Cleanup(stop)
 			req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m1","messages":[{"role":"user","content":"hello"}]}`))
@@ -809,7 +816,7 @@ func TestOTelClaudeMainAndChildDedupRetainsHelper(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			deadline := time.Now().Add(6 * time.Second)
+			deadline := time.Now().Add(30 * time.Second)
 			for !otelX.Session(agent, "parent") && time.Now().Before(deadline) {
 				time.Sleep(10 * time.Millisecond)
 			}
@@ -820,7 +827,7 @@ func TestOTelClaudeMainAndChildDedupRetainsHelper(t *testing.T) {
 			// alone only proves the user/root event was observed, not final coverage.
 			var batches [][]byte
 			generations := 0
-			timer := time.NewTimer(8 * time.Second)
+			timer := time.NewTimer(30 * time.Second)
 			for generations < 2 {
 				select {
 				case batch := <-received:

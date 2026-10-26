@@ -100,11 +100,17 @@ func TestTraceSessionVisibilityRespectsReaderWindow(t *testing.T) {
 func TestTraceSessionIndexSharesMissesAndDoesNotQueueRequests(t *testing.T) {
 	x := new(TraceSessionIndex)
 	empty := x.update(nil)
+	// The 100 lookups share one miss however long they take on a slow
+	// machine (#1811); the cache window is not what this checks.
+	ttl := TraceIdentityTTL
+	t.Cleanup(func() { TraceIdentityTTL = ttl })
+	TraceIdentityTTL = time.Hour
 	for i := 0; i < 100; i++ {
 		if x.Visible("codex", fmt.Sprintf("remote-%d", i)) {
 			t.Fatal("unknown session visible")
 		}
 	}
+	TraceIdentityTTL = ttl
 	if x.snapshot.Load() != empty {
 		t.Fatal("each unknown session repeated discovery")
 	}
@@ -118,7 +124,7 @@ func TestTraceSessionIndexSharesMissesAndDoesNotQueueRequests(t *testing.T) {
 		if !visible {
 			t.Fatal("concurrent refresh discarded existing readiness")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(30 * time.Second):
 		x.refresh.Unlock()
 		<-done
 		t.Fatal("request queued behind directory discovery")

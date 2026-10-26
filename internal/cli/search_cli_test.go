@@ -2,6 +2,7 @@ package cli
 
 import (
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/yetone/magpie/internal/provider"
@@ -78,5 +79,63 @@ func TestSearchCLIYouWithoutKey(t *testing.T) {
 	}
 	if as := provider.SearchAPIs(); len(as) != 1 || as[0] != (provider.SearchAPI{Vendor: "you"}) {
 		t.Fatalf("%+v", as)
+	}
+}
+
+// magpie search off keeps an API, key and all, out of every search, on
+// puts it back, and move puts it at another place in the order (#2286).
+func TestSearchCLIOffAndMove(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	for _, args := range [][]string{{"add", "tavily", "tvly-1"}, {"add", "exa", "e-1"}, {"add", "brave", "b-1"}} {
+		if err := searchCmd(args); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+	}
+	vendors := func(as []provider.SearchAPI) (vs []string) {
+		for _, a := range as {
+			vs = append(vs, a.Vendor)
+		}
+		return vs
+	}
+	if err := searchCmd([]string{"off", "exa"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := vendors(provider.SearchAPIs()); !slices.Equal(got, []string{"tavily", "brave"}) {
+		t.Fatalf("exa off, asked %v", got)
+	}
+	if s := provider.StoredSearchAPIs(); len(s) != 3 || s[1].Key != "e-1" {
+		t.Fatalf("off lost the key: %+v", s)
+	}
+	// a new key leaves it off
+	if err := searchCmd([]string{"add", "exa", "e-2"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := vendors(provider.SearchAPIs()); !slices.Equal(got, []string{"tavily", "brave"}) {
+		t.Fatalf("a new key switched exa on: %v", got)
+	}
+	if err := searchCmd([]string{"off", "google"}); err == nil {
+		t.Error("switched off one not set up")
+	}
+	if err := searchCmd([]string{"on", "exa"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := searchCmd([]string{"move", "brave", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := vendors(provider.SearchAPIs()); !slices.Equal(got, []string{"brave", "tavily", "exa"}) {
+		t.Fatalf("after move %v", got)
+	}
+	if err := searchCmd([]string{"move", "brave", "3"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := vendors(provider.SearchAPIs()); !slices.Equal(got, []string{"tavily", "exa", "brave"}) {
+		t.Fatalf("after move to last %v", got)
+	}
+	for _, bad := range [][]string{{"move", "brave", "4"}, {"move", "brave", "0"}, {"move", "brave"}, {"move", "google", "1"}} {
+		if err := searchCmd(bad); err == nil {
+			t.Errorf("%v taken", bad)
+		}
 	}
 }

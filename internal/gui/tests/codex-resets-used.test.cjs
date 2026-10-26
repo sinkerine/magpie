@@ -123,6 +123,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const psel = '.pq-autoreset[data-user="Me@example.com"]';
       await panel.locator('#ptabs [data-ptab="usage"]').click();
       await panel.locator(psel).waitFor();
+      // measured on the cards drawn from the tab's own read (#2360)
+      await panel.waitForFunction(() => !quotasLoading);
       assert.match(await text(panel.locator(psel + " .ar-used")), w.last);
       assert(await fits(panel, psel + " .ar-used", ".pq-card"), "the line fits the panel's card");
       assert.deepEqual(errors, []);

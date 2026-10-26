@@ -210,48 +210,90 @@ func TestRTKRemove(t *testing.T) {
 	}
 }
 
-// TestRTKOpenCode2: rtk's OpenCode plugin is written for OpenCode 1, and
-// OpenCode 2 refuses to load it (rtk-ai/rtk#4311), so with an OpenCode 2
-// here rtk isn't given to OpenCode; one given before can still be taken out.
-// An OpenCode 1 still gets it.
+// openCodeRTK is an rtk on PATH that says it is version and, for
+// rtk init -g --opencode, writes the plugin that version writes: up to 0.51
+// one for OpenCode 1 only (hooks/opencode/rtk.ts at v0.51.0), from 0.52 one
+// default object with OpenCode 2's id and setup() (rtk-ai/rtk#4187, the
+// file at v1.0.1).
+func openCodeRTK(version string) string {
+	plugin := `export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {`
+	if !older(version, 0, 52) {
+		plugin = `const RtkOpenCodePlugin = {
+  id: "rtk",
+  async setup(ctx: any) {},
+  async server() {},
+}
+export default RtkOpenCodePlugin`
+	}
+	return `#!/bin/sh
+case "$1" in
+--version) echo "rtk ` + version + `"; exit 0 ;;
+esac
+shift 2
+case "$*" in
+"--opencode --auto-patch") /bin/mkdir -p "$XDG_CONFIG_HOME/opencode/plugins"; /bin/cat > "$XDG_CONFIG_HOME/opencode/plugins/rtk.ts" <<'PLUGIN'
+` + plugin + `
+PLUGIN
+;;
+*) echo "unknown: $*" >&2; exit 2 ;;
+esac
+`
+}
+
+// TestRTKOpenCode2: OpenCode 2 refuses the OpenCode 1 plugin rtk wrote up
+// to 0.51 (rtk-ai/rtk#4311), and loads the one rtk 0.52 on writes
+// (rtk-ai/rtk#4187; #2295, witt-bit, on rtk 1.0.1). So with an OpenCode 2
+// here an older rtk isn't run for OpenCode, and one given before can still
+// be taken out; a newer rtk is, and its plugin is on. An old plugin left
+// from before an rtk update counts as off once rtk can write the new one,
+// and switching it on writes that over it. An OpenCode 1 gets rtk from
+// either.
 func TestRTKOpenCode2(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the fakes are shell scripts")
 	}
 	h := sandbox(t)
 	bin := filepath.Join(h, "bin")
-	testenv.Program(t, filepath.Join(bin, "rtk"), fakeRTK)
+	rtk := func(version string) {
+		t.Helper()
+		testenv.Program(t, filepath.Join(bin, "rtk"), openCodeRTK(version))
+	}
 	opencode := func(version string) {
 		t.Helper()
 		testenv.Program(t, filepath.Join(bin, "opencode"), "#!/bin/sh\necho "+version+"\n")
 	}
 	t.Setenv("PATH", bin)
 	plugin := filepath.Join(h, ".config", "opencode", "plugins", "rtk.ts")
-	blocked := func() string {
+	row := func() RTKAgent {
 		t.Helper()
 		for _, a := range ReadRTK().Agents {
 			if a.ID == "opencode" {
-				return a.Blocked
+				return a
 			}
 		}
 		t.Fatal("opencode isn't listed")
-		return ""
+		return RTKAgent{}
 	}
 
 	// what each prints for --version
+	rtk("0.51.0")
 	opencode("opencode v2.0.18")
-	if b := blocked(); !strings.Contains(b, "OpenCode 2.0.18") {
+	if b := row().Blocked; !strings.Contains(b, "OpenCode 2.0.18") || !strings.Contains(b, "0.51.0") {
 		t.Fatalf("blocked: %q", b)
 	}
 	_, err := SetRTK("opencode", true)
-	if err == nil || !strings.Contains(err.Error(), "doesn't support OpenCode 2") {
-		t.Fatalf("switched on for OpenCode 2: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "needs RTK 0.52 or newer") {
+		t.Fatalf("rtk 0.51 switched on for OpenCode 2: %v", err)
 	}
 	if exists(plugin) {
-		t.Fatal("rtk's plugin was written for OpenCode 2")
+		t.Fatal("rtk 0.51's plugin was written for OpenCode 2")
 	}
-	// one written before (by an older magpie, or rtk init by hand) goes
-	write(t, plugin, "x")
+	// one written before (by an older magpie, or rtk init by hand) is on,
+	// and goes
+	write(t, plugin, "export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {\n")
+	if !row().On {
+		t.Fatal("an old plugin under OpenCode 2 and rtk 0.51 isn't listed as on, so it can't be taken out")
+	}
 	if _, err := SetRTK("opencode", false); err != nil {
 		t.Fatal(err)
 	}
@@ -259,15 +301,59 @@ func TestRTKOpenCode2(t *testing.T) {
 		t.Fatal("rtk's plugin is still there")
 	}
 
-	opencode("1.18.32")
-	if b := blocked(); b != "" {
-		t.Fatalf("OpenCode 1 blocked: %q", b)
+	// rtk 1.0.1 writes a plugin OpenCode 2 loads
+	rtk("1.0.1")
+	if a := row(); a.Blocked != "" || a.On {
+		t.Fatalf("rtk 1.0.1, OpenCode 2: blocked %q, on %v", a.Blocked, a.On)
+	}
+	if _, err := SetRTK("opencode", true); err != nil {
+		t.Fatalf("rtk 1.0.1 not given to OpenCode 2: %v", err)
+	}
+	if !contains(plugin, "setup(") || !row().On {
+		t.Fatal("OpenCode 2 didn't get rtk 1.0.1's plugin")
+	}
+	if _, err := SetRTK("opencode", false); err != nil || exists(plugin) {
+		t.Fatalf("rtk 1.0.1's plugin not taken out: %v", err)
+	}
+	// rtk 0.52 is the first that writes it
+	rtk("0.52.0")
+	if b := row().Blocked; b != "" {
+		t.Fatalf("rtk 0.52.0 blocked for OpenCode 2: %q", b)
+	}
+
+	// rtk updated over an old plugin: it's off until switched on, which
+	// writes the new one
+	rtk("1.0.1")
+	write(t, plugin, "export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {\n")
+	if row().On {
+		t.Fatal("OpenCode 1's plugin under OpenCode 2 is listed as on")
 	}
 	if _, err := SetRTK("opencode", true); err != nil {
 		t.Fatal(err)
 	}
-	if !exists(plugin) {
-		t.Fatal("OpenCode 1 didn't get rtk's plugin")
+	if !contains(plugin, "setup(") {
+		t.Fatal("the old plugin wasn't written over")
+	}
+	if err := os.Remove(plugin); err != nil {
+		t.Fatal(err)
+	}
+
+	// OpenCode 1 gets rtk from an old rtk and a new one
+	for _, v := range []string{"0.51.0", "1.0.1"} {
+		rtk(v)
+		opencode("1.18.32")
+		if b := row().Blocked; b != "" {
+			t.Fatalf("OpenCode 1 blocked with rtk %s: %q", v, b)
+		}
+		if _, err := SetRTK("opencode", true); err != nil {
+			t.Fatal(err)
+		}
+		if !exists(plugin) || !row().On {
+			t.Fatalf("OpenCode 1 didn't get rtk %s's plugin", v)
+		}
+		if _, err := SetRTK("opencode", false); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

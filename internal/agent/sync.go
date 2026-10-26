@@ -45,9 +45,14 @@ func SyncCatalog() {
 		// the catalog built once for every agent's lists, not for each
 		// look-up of each (thousands at magpie's start, with 30 providers)
 		release := provider.Hold()
+		renaming := setToFoundGroups()
 		for _, a := range All() {
 			if a.Sync != nil {
 				_ = synced(a.Sync)
+			}
+			// a field magpie set to a found group's id before (autoref.go)
+			if renaming[a.ID] {
+				a.renameFoundGroups()
 			}
 		}
 		release()
@@ -60,6 +65,52 @@ func SyncCatalog() {
 		syncing.again = false
 		syncing.Unlock()
 	}
+}
+
+// soon counts the SyncCatalogSoon rounds not done yet. Not a WaitGroup:
+// a save may start one while a command's end waits for them.
+var soon struct {
+	sync.Mutex
+	n    int
+	idle *sync.Cond
+}
+
+func init() { soon.idle = sync.NewCond(&soon.Mutex) }
+
+// SyncCatalogSoon is SyncCatalog behind the caller, which is what
+// catalog.Changed is set to: a group or a provider saved answers at once,
+// and the agents' files follow a moment later. The sync builds every
+// agent's lists and writes the ones that differ. On Windows a file another
+// program holds open refuses the rename over it, and steady.Rename waits
+// half a second on each such file before giving up; in WSL each file is
+// read and written through wsl.exe and \\wsl.localhost. A save that waited
+// on it took seconds now and then on Windows, while an agent was at work
+// (CyberCaius on Discord: 路由组和供应商编辑保存有时候保存会卡很久). A sync
+// already running takes the change in its next round, as SyncCatalog does.
+func SyncCatalogSoon() {
+	soon.Lock()
+	soon.n++
+	soon.Unlock()
+	go func() {
+		defer func() {
+			soon.Lock()
+			if soon.n--; soon.n == 0 {
+				soon.idle.Broadcast()
+			}
+			soon.Unlock()
+		}()
+		SyncCatalog()
+	}()
+}
+
+// SyncCatalogSettled waits for every SyncCatalogSoon round started so far:
+// a command that saved something ends with the agents' files written.
+func SyncCatalogSettled() {
+	soon.Lock()
+	for soon.n > 0 {
+		soon.idle.Wait()
+	}
+	soon.Unlock()
 }
 
 // syncJSON rewrites the value at key of a JSON file, if the file has one
@@ -221,6 +272,13 @@ func mergeKept(have, want map[string]any, own []string) map[string]any {
 	}
 	for k, h := range have {
 		if slices.Contains(own, k) {
+			// magpie's key for the gateway, where the user put a key of
+			// the gateway's own instead: theirs stays (keyHolds)
+			if hs, ok := h.(string); ok {
+				if ws, ok := want[k].(string); ok && hs != ws && keyHolds(hs, ws) {
+					out[k] = hs
+				}
+			}
 			continue
 		}
 		w, ok := want[k]

@@ -3,8 +3,9 @@
 // answering 401 "x-api-key 和 Authorization 不可以同时存在"): the editor has a
 // Key header row, Both, x-api-key or Authorization: Bearer, opening as it
 // was saved or learned; Save posts the pick. A relay with only a Chat
-// address has no row until an Anthropic one is typed. Anthropic's own API
-// (bothAuth false) and a signed-in account have none. In English and
+// address has no row until an Anthropic one is typed, and none for
+// Anthropic's own or Bedrock Mantle's. Anthropic's own API (bothAuth false)
+// and a signed-in account have none. In English and
 // Chinese, and at a phone's width.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
@@ -13,6 +14,13 @@ const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
+// the editor folds what few need under Advanced, this field among them:
+// opened as a reader would, unless something set in it opened it already
+const unfold = async (page) => {
+  const adv = page.locator(".editor details.advanced");
+  await adv.waitFor({ state: "attached" });
+  if (!(await adv.evaluate((d) => d.open))) await adv.locator(":scope > summary").click();
+};
 const relay = {
   id: "relay", name: "Relay", icon: "generic", chat: "", responses: "", anthropic: "https://relay.example.com", catalog: "",
   models: [{ id: "claude-haiku-4-5", name: "Claude Haiku 4.5", on: true }], agents: [], fallback: [], headers: {},
@@ -80,6 +88,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.route("**/*", serve(lang, posts));
       await page.goto("http://magpie.test/?view=providers");
       await page.locator(".row.provider", { hasText: name }).first().click();
+      await unfold(page);
       await page.locator(".editor .bar").waitFor();
       return { page, errors, posts };
     };
@@ -130,6 +139,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await seg(page).isVisible(), true, "the row comes with an Anthropic address");
       await url.fill("https://api.anthropic.com");
       assert.equal(await seg(page).isVisible(), false, "Anthropic's own takes x-api-key alone");
+      await url.fill("https://relay.example.com");
+      assert.equal(await seg(page).isVisible(), true);
+      await url.fill("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+      assert.equal(await seg(page).isVisible(), false, "Bedrock Mantle's takes x-api-key alone (@marktoown on X)");
       await url.fill("");
       const saved = await save(page, posts);
       assert.equal("authHeader" in saved.body, false, "not said with no Anthropic address");
@@ -143,6 +156,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal("authHeader" in saved.body, false);
       await page.locator(".editor .bar").getByRole("button", { name: lang === "zh" ? "取消" : "Cancel", exact: true }).click().catch(() => {});
       await page.locator(".row.provider", { hasText: "Codex" }).first().click();
+      await unfold(page);
       await page.locator(".editor .bar").waitFor();
       assert.equal(await seg(page).count(), 0);
       assert.deepEqual(errors, []);

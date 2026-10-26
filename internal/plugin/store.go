@@ -34,6 +34,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
@@ -228,6 +229,7 @@ func save(l List) error {
 	if err := lastgood.Keep(listPath(), lastgood.JSON, 0o600); err != nil {
 		return err
 	}
+	defer filememo.Forget() // what follows plugins.json looks again (Written)
 	if err := writeWhole(listPath(), append(b, '\n')); err != nil {
 		return err
 	}
@@ -360,8 +362,20 @@ func Target(spec string) string {
 }
 
 // Add installs a plugin and adds it to the list, in place of one of the
-// same package. A package is installed with its scripts left unrun.
-func Add(ctx context.Context, spec string) (Entry, error) { return add(ctx, spec, "") }
+// same package. A package is installed with its scripts left unrun. A
+// community plugin's short or shown name (workbuddy, WorkBuddy) is its
+// package (resolve); the entry gives the package installed.
+func Add(ctx context.Context, spec string) (Entry, error) {
+	spec, err := resolve(ctx, strings.TrimSpace(spec))
+	if err != nil {
+		return Entry{}, err
+	}
+	return add(ctx, spec, "")
+}
+
+// AddExact is Add of a spec that is a package's own (another computer's
+// plugins.json), installed as written, never taken for a name.
+func AddExact(ctx context.Context, spec string) (Entry, error) { return add(ctx, spec, "") }
 
 // add is Add, an npm package installed at the version given when there is
 // one (installAt), its spec kept as given.
@@ -463,10 +477,16 @@ func notPlugin(target string) error {
 	if err != nil || !st.IsDir() || IsPi(target) {
 		return nil
 	}
+	if Gateway(target) != "" {
+		return nil
+	}
 	if f, _ := Middleware(target); f != "" {
 		return nil
 	}
 	if f, _ := Agent(target); f != "" {
+		return nil
+	}
+	if w, _ := Window(target); w != nil {
 		return nil
 	}
 	var pkg struct {
@@ -631,7 +651,7 @@ func SetOptions(name string, opts map[string]any) error {
 	if i < 0 {
 		// a short name, as the community's READMEs write it: param-override
 		// for @magpie-community/middleware-param-override
-		i = slices.IndexFunc(l.Plugins, func(x Entry) bool { return ShortName(Name(x.Spec)) == name })
+		i = slices.IndexFunc(l.Plugins, func(x Entry) bool { return Called(Name(x.Spec), name) })
 	}
 	if i < 0 {
 		return fmt.Errorf("no plugin %q", name)
@@ -649,14 +669,34 @@ func SetOptions(name string, opts map[string]any) error {
 
 // ShortName is a package's name without its scope and the words every
 // package of its kind has: model-map for @magpie-community/middleware-model-map,
-// zed for @magpie-community/opencode-zed-auth. A plugin added from a folder
-// is named by its path, which on Windows ends after a backslash.
+// zed for @magpie-community/opencode-zed-auth, calc for
+// @magpie-community/tools-calc (so its tools are calc_eval, as from its
+// folder). A plugin added from a folder is named by its path, which on
+// Windows ends after a backslash.
 func ShortName(pkg string) string {
+	pkg = bareName(pkg)
+	for _, kind := range []string{"middleware-", "opencode-", "tools-", "page-", "agent-"} {
+		if strings.HasPrefix(pkg, kind) && len(pkg) > len(kind) {
+			pkg = pkg[len(kind):]
+			break
+		}
+	}
+	return strings.TrimSuffix(pkg, "-auth")
+}
+
+// bareName is a package's name without its scope, or a folder's last part.
+func bareName(pkg string) string {
 	if i := strings.LastIndexAny(pkg, `/\`); i >= 0 {
 		pkg = pkg[i+1:]
 	}
-	pkg = strings.TrimPrefix(strings.TrimPrefix(pkg, "middleware-"), "opencode-")
-	return strings.TrimSuffix(pkg, "-auth")
+	return pkg
+}
+
+// Called says whether a user's name for a plugin names this package: its
+// short name, or its name without the scope, which was its short name
+// before tools-, page- and agent- were taken off (agent-aider).
+func Called(pkg, name string) bool {
+	return name != "" && (ShortName(pkg) == name || bareName(pkg) == name)
 }
 
 // install puts an npm package into plugins/ with bun add, its scripts
@@ -685,8 +725,10 @@ func install(ctx context.Context, spec string) error {
 	// a @magpie-community package or version npm doesn't have (a new
 	// one waits for an owner to publish it there) comes from the
 	// community repo's dist branch; one Bun's minimumReleaseAge holds
-	// back stays held, as the user's bunfig asks
-	if name, version, ok := distWanted(spec); ok && err != nil && !minAge.MatchString(err.Error()) {
+	// back stays held, as the user's bunfig asks, and a bun this machine
+	// can't run at all can't add it from there either
+	var ue *BunUnstartableError
+	if name, version, ok := distWanted(spec); ok && err != nil && !minAge.MatchString(err.Error()) && !errors.As(err, &ue) {
 		if derr := installDist(ctx, bun, name, version); derr != nil {
 			return fmt.Errorf("%w (and from the community repo's dist branch: %v)", err, derr)
 		}
@@ -694,6 +736,7 @@ func install(ctx context.Context, spec string) error {
 	}
 	if err == nil {
 		pruneDist()
+		pruneInstallCache()
 	}
 	return err
 }
@@ -705,6 +748,9 @@ func bunAdd(ctx context.Context, bun, spec string) error {
 	if err != nil {
 		if hint := missingLibs(string(out)); hint != "" {
 			return fmt.Errorf("bun add %s: %s: %w", spec, hint, err)
+		}
+		if ue := wontLoad(bun, err); ue != nil {
+			return fmt.Errorf("bun add %s: %w", spec, ue)
 		}
 		return fmt.Errorf("bun add %s: %v: %s", spec, cantStart(bun, err), lastLines(string(out), 6))
 	}
@@ -874,6 +920,9 @@ func reinstall(ctx context.Context, spec string) error {
 	if err != nil {
 		if hint := missingLibs(string(out)); hint != "" {
 			return fmt.Errorf("bun update %s: %s: %w", name, hint, err)
+		}
+		if ue := wontLoad(bun, err); ue != nil {
+			return fmt.Errorf("bun update %s: %w", name, ue)
 		}
 		return fmt.Errorf("bun update %s: %v: %s", name, cantStart(bun, err), lastLines(string(out), 6))
 	}

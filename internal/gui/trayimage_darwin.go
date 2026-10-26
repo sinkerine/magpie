@@ -6,6 +6,7 @@ package gui
 #cgo CFLAGS: -x objective-c
 #cgo LDFLAGS: -framework AppKit
 #include <stdlib.h>
+#include <string.h>
 #import <Cocoa/Cocoa.h>
 
 typedef struct {
@@ -376,6 +377,39 @@ static int mpFrame(const void *bird, int len) {
 	return ok;
 }
 
+// mpTipOn is the button's tooltip, none for "": the text as given, its
+// lines kept, as AppKit shows a tooltip's.
+static void mpTipOn(NSStatusBarButton *b, NSString *s) {
+	b.toolTip = s.length ? s : nil;
+}
+
+// mpTip puts the tooltip on magpie's status item; 0 while the item isn't
+// up yet. Wails (v3.0.0-beta.24) leaves SetTooltip a no-op on macOS
+// ("Tooltips not supported on macOS").
+static int mpTip(const char *tip) {
+	__block int ok = 0;
+	@autoreleasepool {
+		NSString *s = [NSString stringWithUTF8String:tip];
+		dispatch_sync(dispatch_get_main_queue(), ^{
+			NSStatusBarButton *b = mpButton();
+			if (b == nil) return;
+			mpTipOn(b, s);
+			ok = 1;
+		});
+	}
+	return ok;
+}
+
+// mpTipShown is the tooltip a status bar button given tip shows, for
+// tests, which have no status item nor main queue to ask.
+static char *mpTipShown(const char *tip) {
+	@autoreleasepool {
+		NSStatusBarButton *b = [[[NSStatusBarButton alloc] initWithFrame:NSMakeRect(0, 0, 22, 22)] autorelease];
+		mpTipOn(b, [NSString stringWithUTF8String:tip]);
+		return strdup(b.toolTip ? b.toolTip.UTF8String : "");
+	}
+}
+
 // mpHide forgets the cells; the icon Wails sets next puts the bird back.
 static void mpHide(void) {
 	dispatch_async(dispatch_get_main_queue(), ^{
@@ -554,6 +588,24 @@ func trayImageFrame(bird []byte) bool {
 	b, n := cBytes(bird)
 	defer C.free(b)
 	return C.mpFrame(b, n) != 0
+}
+
+// trayTipNative puts the tooltip on the menu bar item, where Wails' own
+// SetTooltip does nothing; false while the item isn't up yet, to be tried
+// again. A var for tests, which have no main queue for it to wait on.
+var trayTipNative = func(tip string) bool {
+	cs := C.CString(tip)
+	defer C.free(unsafe.Pointer(cs))
+	return C.mpTip(cs) != 0
+}
+
+// trayTipShown is the tooltip a menu bar button given tip shows.
+func trayTipShown(tip string) string {
+	cs := C.CString(tip)
+	defer C.free(unsafe.Pointer(cs))
+	out := C.mpTipShown(cs)
+	defer C.free(unsafe.Pointer(out))
+	return C.GoString(out)
 }
 
 // trayImageHide takes the cells down; the icon set next is the bird alone.

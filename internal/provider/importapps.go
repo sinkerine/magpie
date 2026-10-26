@@ -1,7 +1,7 @@
 package provider
 
 // Providers another app has already set up — CC Switch, Alma, Claude Code's
-// own settings — offered for the user to bring over: each source is read
+// own settings, OpenCode's sign-ins — offered for the user to bring over: each source is read
 // (never written), every entry turned into the provider magpie would add,
 // and matched against what is already here, so the picker can say which are
 // new, which are already in, and which would take an id that is in use.
@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"maps"
 	"net"
 	"net/url"
@@ -25,7 +26,7 @@ import (
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/settings"
-	_ "modernc.org/sqlite"
+	_ "github.com/yetone/magpie/internal/sqlitedb"
 )
 
 // AppSource is one app magpie can import from, with what it holds.
@@ -72,23 +73,37 @@ type AppPick struct {
 }
 
 // appReaders are the apps magpie knows, by name as the picker lists them.
+// One asked is read only when the user opens the import, never by the
+// Providers page's own look for configurations (DiscoverSources):
+// OpenCode's auth.json holds every sign-in OpenCode has, not only keys.
 var appReaders = []struct {
 	id, name string
 	path     func() string
 	read     func(path string) ([]AppImport, error)
+	asked    bool
 }{
-	{"alma", "Alma", almaPath, readAlma},
-	{"cc-switch", "CC Switch", ccSwitchPath, readCCSwitch},
-	{"claude-code", "Claude Code", claudeSettingsPath, readClaudeSettings},
-	{"codex", "Codex", codexConfigPath, readCodexConfig},
+	{"alma", "Alma", almaPath, readAlma, false},
+	{"cc-switch", "CC Switch", ccSwitchPath, readCCSwitch, false},
+	{"claude-code", "Claude Code", claudeSettingsPath, readClaudeSettings, false},
+	{"codex", "Codex", codexConfigPath, readCodexConfig, false},
+	{"opencode", "OpenCode", openCodeAuthPath, readOpenCodeAuth, true},
 }
 
-// ImportSources reads every app magpie can import from.
-func ImportSources() []AppSource {
+// ImportSources reads every app magpie can import from, as the user asked.
+func ImportSources() []AppSource { return importSources(true) }
+
+// DiscoverSources reads the apps the Providers page looks in by itself:
+// those not read only when asked.
+func DiscoverSources() []AppSource { return importSources(false) }
+
+func importSources(asked bool) []AppSource {
 	have := load().Providers
 	used := map[string]bool{} // ids across all sources, so two never collide
 	var out []AppSource
 	for _, r := range appReaders {
+		if r.asked && !asked {
+			continue
+		}
 		s := AppSource{ID: r.id, Name: r.name, Path: r.path(), Items: []AppImport{}}
 		if _, err := os.Stat(s.Path); err == nil {
 			s.Found = true
@@ -97,6 +112,10 @@ func ImportSources() []AppSource {
 				s.Error = err.Error()
 			}
 			s.Items = append(s.Items, settle(items, have, used)...) // [] rather than null when there is nothing
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			// there, as far as anyone can tell, but not to be looked at: not
+			// "not found", which would say the app has nothing
+			s.Found, s.Error = true, err.Error()
 		}
 		out = append(out, s)
 	}
@@ -148,7 +167,7 @@ func ImportFromApps(picks []AppPick) ([]string, error) {
 			}
 			// a key joins a provider only at its own address: one taken
 			// to another host would be sent there
-			if h.Account != nil || !sameProvider(Provider{Key: p.Key, Chat: h.Chat, Responses: h.Responses, Anthropic: h.Anthropic, Headers: h.Headers}, p) {
+			if h.Account != nil || !sameProvider(Provider{Key: p.Key, Chat: h.Chat, Responses: h.Responses, Anthropic: h.Anthropic, Gemini: h.Gemini, Headers: h.Headers}, p) {
 				return added, errorf("%s: %s isn't at %s; add it as a provider of its own", p.Name, h.Name, hostOf(firstURL(p)))
 			}
 			if err := AddKey(it.KeyOf, p.Name, p.Key, ""); err != nil {
@@ -223,8 +242,14 @@ func freeID(id string) string {
 	for _, p := range All() {
 		taken[p.ID] = true
 	}
+	// an id a provider had is taken too: its calls are recorded under it
+	// (Renames), and one added under it would be counted from then on
+	// only, its own history read apart from the renamed one's
 	for _, p := range load().Providers {
 		taken[p.ID] = true
+		for _, w := range p.Was {
+			taken[w] = true
+		}
 	}
 	for n, try := 2, id; ; n++ {
 		if !taken[try] {
@@ -271,7 +296,7 @@ func settle(items []AppImport, have []Provider, used map[string]bool) []AppImpor
 				it.Status, it.Existing = "taken", h.Name
 			}
 			if it.KeyOf == "" && h.Key != "" && sameProvider(Provider{
-				Key: p.Key, Chat: h.Chat, Responses: h.Responses, Anthropic: h.Anthropic, Headers: h.Headers,
+				Key: p.Key, Chat: h.Chat, Responses: h.Responses, Anthropic: h.Anthropic, Gemini: h.Gemini, Headers: h.Headers,
 			}, *p) {
 				it.KeyOf = h.ID
 			}
@@ -313,12 +338,12 @@ func sameProvider(a, b Provider) bool {
 		return false
 	}
 	hosts := map[string]bool{}
-	for _, u := range []string{a.Chat, a.Responses, a.Anthropic, a.Decide} {
+	for _, u := range []string{a.Chat, a.Responses, a.Anthropic, a.Gemini, a.Decide} {
 		if h := hostOf(u); h != "" {
 			hosts[h] = true
 		}
 	}
-	for _, u := range []string{b.Chat, b.Responses, b.Anthropic} {
+	for _, u := range []string{b.Chat, b.Responses, b.Anthropic, b.Gemini} {
 		if hosts[hostOf(u)] {
 			return true
 		}
@@ -335,15 +360,15 @@ func hostOf(raw string) string {
 }
 
 // endpoints are the base URLs an entry names, by protocol.
-type endpoints struct{ chat, responses, anthropic string }
+type endpoints struct{ chat, responses, anthropic, gemini string }
 
 // imported builds the provider for an entry: a preset's when the entry
 // points at one magpie knows (its endpoints whole when the URL is the
 // preset's own, only its name and logo when it is another path on the same
 // host, like a coding plan), a custom one otherwise.
 func imported(name, key string, e endpoints, models []string) (Provider, string) {
-	e.chat, e.responses, e.anthropic = cleanBase(e.chat), cleanBase(e.responses), cleanBase(e.anthropic)
-	for _, u := range []string{e.chat, e.responses, e.anthropic} {
+	e.chat, e.responses, e.anthropic, e.gemini = cleanBase(e.chat), cleanBase(e.responses), cleanBase(e.anthropic), cleanBase(e.gemini)
+	for _, u := range []string{e.chat, e.responses, e.anthropic, e.gemini} {
 		if u == "" {
 			continue
 		}
@@ -355,10 +380,10 @@ func imported(name, key string, e endpoints, models []string) (Provider, string)
 			return Provider{}, "it points at magpie itself"
 		}
 	}
-	if e.chat == "" && e.responses == "" && e.anthropic == "" {
+	if e.chat == "" && e.responses == "" && e.anthropic == "" && e.gemini == "" {
 		return Provider{}, "it has no base URL"
 	}
-	p := Provider{ID: Slug(name), Name: name, Key: key, Chat: e.chat, Responses: e.responses, Anthropic: e.anthropic, Models: models}
+	p := Provider{ID: Slug(name), Name: name, Key: key, Chat: e.chat, Responses: e.responses, Anthropic: e.anthropic, Gemini: e.gemini, Models: models}
 	if p.IsAzure() {
 		// an Azure OpenAI resource, from any app: the preset's, its
 		// endpoints on the resource's v1 API
@@ -432,6 +457,10 @@ func presetAt(e endpoints) (*PresetDef, *Region, bool) {
 		}
 		return hit, exact
 	}
+	// a preset whose endpoints the entry uses wins over an earlier one at
+	// the same host: OpenCode Zen's are on opencode.ai beside OpenCode Go's
+	var first *PresetDef
+	var firstNear *Region
 	for i := range presets {
 		pr := &presets[i]
 		if pr.Kind == KindLocal {
@@ -453,14 +482,13 @@ func presetAt(e endpoints) (*PresetDef, *Region, bool) {
 				near = r
 			}
 		}
-		if hit {
-			return pr, nil, false
-		}
-		if near != nil {
-			return pr, near, false
+		if first == nil && hit {
+			first = pr
+		} else if first == nil && near != nil {
+			first, firstNear = pr, near
 		}
 	}
-	return nil, nil, false
+	return first, firstNear, false
 }
 
 // ---- CC Switch -------------------------------------------------------------
@@ -506,7 +534,16 @@ func readClaudeSettings(path string) ([]AppImport, error) {
 			if b, err := os.ReadFile(filepath.Join(filepath.Dir(Path()), "stash.json")); err == nil {
 				json.Unmarshal(b, &st)
 			}
+			// what routing put aside is what stepping out would put back:
+			// the endpoint, token and main model, and with them the
+			// models of the user's own the tiers and subagents ran on
+			// (claude.env.<VAR>, internal/agent/claude.go)
 			env = map[string]any{"ANTHROPIC_BASE_URL": st["claude.base_url"], "ANTHROPIC_AUTH_TOKEN": st["claude.auth_token"], "ANTHROPIC_MODEL": st["claude.model"]}
+			for k, v := range st {
+				if name, ok := strings.CutPrefix(k, "claude.env."); ok && v != "" {
+					env[name] = v
+				}
+			}
 		}
 	}
 	base, _ := env["ANTHROPIC_BASE_URL"].(string)
@@ -620,7 +657,7 @@ func merge(have []AppImport, it AppImport) []AppImport {
 		if have[i].Skip != "" || h.Key != it.Provider.Key || h.Key == "" || !sameProvider(*h, it.Provider) && hostOf(firstURL(*h)) != hostOf(firstURL(it.Provider)) {
 			continue
 		}
-		for _, f := range []struct{ dst, src *string }{{&h.Chat, &it.Provider.Chat}, {&h.Responses, &it.Provider.Responses}, {&h.Anthropic, &it.Provider.Anthropic}} {
+		for _, f := range []struct{ dst, src *string }{{&h.Chat, &it.Provider.Chat}, {&h.Responses, &it.Provider.Responses}, {&h.Anthropic, &it.Provider.Anthropic}, {&h.Gemini, &it.Provider.Gemini}} {
 			if *f.dst == "" {
 				*f.dst = *f.src
 			}
@@ -633,7 +670,7 @@ func merge(have []AppImport, it AppImport) []AppImport {
 }
 
 func firstURL(p Provider) string {
-	for _, u := range []string{p.Chat, p.Responses, p.Anthropic} {
+	for _, u := range []string{p.Chat, p.Responses, p.Anthropic, p.Gemini} {
 		if u != "" {
 			return u
 		}
@@ -699,14 +736,18 @@ func ccSwitchEntry(e ccEntry) (name, key string, eps endpoints, models []string,
 		}
 	case "gemini":
 		key = str(env, "GEMINI_API_KEY", "GOOGLE_API_KEY")
-		if str(env, "GOOGLE_GEMINI_BASE_URL") != "" {
-			return name, "", eps, nil, "magpie doesn't talk the Gemini protocol to relays yet"
+		// a relay that speaks Gemini's own protocol (#1346): its base is
+		// the provider's Gemini endpoint, as the editor, the TUI and an
+		// import link take one
+		if base := str(env, "GOOGLE_GEMINI_BASE_URL"); base != "" {
+			eps.gemini = geminiCLIBase(base)
+		} else {
+			if key == "" {
+				return name, "", eps, nil, "it is the agent's own sign-in"
+			}
+			pr := Preset("google")
+			eps.chat, eps.responses, eps.anthropic = pr.Chat, pr.Responses, pr.Anthropic
 		}
-		if key == "" {
-			return name, "", eps, nil, "it is the agent's own sign-in"
-		}
-		pr := Preset("google")
-		eps.chat, eps.responses, eps.anthropic = pr.Chat, pr.Responses, pr.Anthropic
 		if m := str(env, "GEMINI_MODEL"); m != "" {
 			models = append(models, m)
 		}
@@ -750,6 +791,19 @@ func ccSwitchEntry(e ccEntry) (name, key string, eps endpoints, models []string,
 		}
 	}
 	return name, key, eps, models, ""
+}
+
+// geminiCLIBase is magpie's Gemini base for Gemini CLI's
+// GOOGLE_GEMINI_BASE_URL. The CLI (@google/genai's getRequestUrlInternal)
+// puts the API version, v1beta, after that base on every request, where
+// magpie's Gemini base already holds it: a relay at
+// https://relay.example.com/gemini is asked at …/gemini/v1beta/models/….
+func geminiCLIBase(u string) string {
+	u = strings.TrimRight(strings.TrimSpace(u), "/")
+	if u == "" || strings.HasSuffix(u, "/v1beta") {
+		return u
+	}
+	return u + "/v1beta"
 }
 
 func mapOf(v any) map[string]any {
@@ -853,11 +907,13 @@ func readAlma(path string) ([]AppImport, error) {
 			}
 		case base == "" && Preset(almaPresets[typ]) != nil:
 			pr := Preset(almaPresets[typ])
-			eps = endpoints{pr.Chat, pr.Responses, pr.Anthropic}
+			eps = endpoints{pr.Chat, pr.Responses, pr.Anthropic, ""}
 		case format == "anthropic" || typ == "anthropic":
 			eps.anthropic = base
 		case format == "gemini" || typ == "google" && base != "":
-			skip = "magpie doesn't talk the Gemini protocol to relays yet"
+			// a relay that speaks Gemini's own protocol (#1346): its base
+			// is the provider's Gemini endpoint
+			eps.gemini = base
 		case responses || format == "openai-responses":
 			eps.responses = base
 		default:

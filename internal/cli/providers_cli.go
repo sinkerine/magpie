@@ -31,7 +31,7 @@ const providerUsage = `usage:
   magpie provider <id>                    show one provider and its models
   magpie provider add <preset> <key>      add a preset vendor   e.g. magpie provider add deepseek sk-…
                                           again, it adds another (deepseek-2); k=v pairs too: id, name, header.X-Foo
-  magpie provider add <name> k=v…         add a custom vendor   k: url, anthropic, responses, gemini, decide, key, models, catalog, icon, header.X-Foo, balance, balance.path, balance.token, models.url, search, user-agent,
+  magpie provider add <name> k=v…         add a custom vendor   k: url, anthropic, responses, gemini, decide, key, models, catalog, icon, header.X-Foo, balance, balance.path, balance.method, balance.token, models.url, search, user-agent,
                                           access.key, access.secret (a Volcengine access key, or a Tencent Cloud SecretId and SecretKey, for its plan's windows)
   magpie provider set <id> k=v…           change a provider's settings, with the same k=v pairs as add;
                                           codex=as-sent sends Codex's Responses requests as Codex sent them
@@ -42,6 +42,9 @@ const providerUsage = `usage:
                                           compaction=native asks the provider Codex's own compaction and hands
                                           Codex its sealed item as it came (a Responses API, a ChatGPT account,
                                           Copilot), compaction=magpie, the default, has magpie summarise
+                                          additional-tools=on sends a tool Claude Code's tool search loads to its
+                                          Responses API where it was loaded (an additional_tools item, which
+                                          keeps the cache); additional-tools=default puts it with the other tools
   magpie provider key <id> <key>          change the API key
   magpie provider icon <id> <file|name>   give a custom provider a picture (PNG, JPEG, SVG…) or a built-in icon
   magpie provider fallback <id> <provider/model>…   where requests go when it's out of quota or down (none clears)
@@ -53,8 +56,8 @@ const providerUsage = `usage:
                                           have the gateway (magpie serve, the app) fetch the list again by itself
                                           once it is that old (at least 10m; off: only when asked)
   magpie provider auto-include <id> [rule…|none]
-                                          rules over a model's id (a glob with *, e.g. 'gpt-*' '*claude*', or
-                                          're:…' a regular expression): the listed models one matches are exposed
+                                          rules over a model's id, in any case (a glob with *, e.g. 'gpt-*' '*claude*',
+                                          or 're:…' a regular expression, where (?-i) makes case matter): the listed models one matches are exposed
                                           now, and each one a later fetch newly lists; picks are only added to
   magpie provider account-models <id> [account|key [ids…|all]]
                                           the models one account or key alone serves; all: every model the provider has
@@ -113,13 +116,17 @@ const providerUsage = `usage:
        magpie provider set my-relay search=yes
                                    (the relay answers Claude Code's WebSearch and Codex's web_search itself:
                                     those go to it as sent, not through magpie's own search)
-       magpie provider add ollama url=http://192.168.1.5:11434/v1 anthropic=http://192.168.1.5:11434
-                                   (Ollama, LM Studio, oMLX or MLX-Serve on another port or computer)
+       magpie provider add lmstudio address=http://192.168.1.5:1234
+       magpie provider set lmstudio address=192.168.1.5:1234
+                                   (Ollama, LM Studio, oMLX or MLX-Serve on another port or computer: each of its
+                                    URLs moves there, keeping its path; address= alone puts it back at the default)
        magpie provider set ollama unmasked=yes
                                    (a model on this computer or the local network: Settings' redaction leaves its
                                     requests as written; not for a local relay that passes them on to a vendor)
        magpie provider add "My Relay" url=https://relay.example.com/v1 key=sk-… balance=https://relay.example.com/api/usage/token balance.path='$data.total_available / 500000'
        magpie provider set my-relay balance.path='(1 - credits.monthlyCredits / 70) %'
+       magpie provider set my-relay balance.method=POST
+                                   (a balance endpoint that answers only a POST: asked with no body)
        magpie provider set my-relay balance=https://relay.example.com/api/user/self balance.path='$data.quota / 500000' balance.token=<access token> header.New-Api-User=<user id>
                                    (a new-api relay's whole account: its access token and user id, from its personal settings)
                                    (balance.path: where the amount is in the reply, or a sum of those with + - * / and
@@ -134,6 +141,41 @@ const providerUsage = `usage:
        magpie provider set opencode-go family=ocgo
        magpie provider set my-relay id=relay   (renames it: groups and agents on my-relay/… move to relay/…)
                                    (family: a tag for which agents are shown its models, see magpie visible)`
+
+// keyColumn is what magpie providers says of p's key or account.
+func keyColumn(p provider.Provider) string {
+	switch {
+	case p.Off:
+		return faint.Render("○ switched off")
+	case p.Account != nil && signedOut(p):
+		// every account in use refused: listed to be signed in again,
+		// as the app's row says, never "signed in"
+		return amber.Render("○ "+p.Account.User+" is signed out") + muted.Render(" · sign in again")
+	case p.Account != nil:
+		return green.Render("●") + " " + muted.Render("signed in as "+p.Account.User)
+	case p.IsVertex() && !p.Ready():
+		// no project an address can be made of (providers.json edited
+		// by hand): nothing is asked, as the app's row says
+		return amber.Render("○ needs a project")
+	case p.IsVertex():
+		// no key: a token minted from the user's Google credentials,
+		// traded for a service account's when it impersonates one
+		who := "Google credentials"
+		if p.Vertex != nil && p.Vertex.Impersonate != "" {
+			who += " as " + p.Vertex.Impersonate
+		}
+		return green.Render("●") + " " + muted.Render(who)
+	case p.Key != "":
+		return green.Render("●") + " " + muted.Render(provider.Mask(p.Key))
+	case p.Ready():
+		return green.Render("●") + " " + muted.Render("no key needed")
+	default:
+		return amber.Render("○ no key")
+	}
+}
+
+// signedOut is Provider.SignedOut, for a test to stand in for.
+var signedOut = provider.Provider.SignedOut
 
 // providers: `magpie providers`
 func providers() error {
@@ -157,30 +199,7 @@ func providers() error {
 		if p.Preset == "" && p.Account == nil {
 			r.name += " " + faint.Render("custom")
 		}
-		switch {
-		case p.Off:
-			r.key = faint.Render("○ switched off")
-		case p.Account != nil:
-			r.key = green.Render("●") + " " + muted.Render("signed in as "+p.Account.User)
-		case p.IsVertex() && !p.Ready():
-			// no project an address can be made of (providers.json edited
-			// by hand): nothing is asked, as the app's row says
-			r.key = amber.Render("○ needs a project")
-		case p.IsVertex():
-			// no key: a token minted from the user's Google credentials,
-			// traded for a service account's when it impersonates one
-			who := "Google credentials"
-			if p.Vertex != nil && p.Vertex.Impersonate != "" {
-				who += " as " + p.Vertex.Impersonate
-			}
-			r.key = green.Render("●") + " " + muted.Render(who)
-		case p.Key != "":
-			r.key = green.Render("●") + " " + muted.Render(provider.Mask(p.Key))
-		case p.Ready():
-			r.key = green.Render("●") + " " + muted.Render("no key needed")
-		default:
-			r.key = amber.Render("○ no key")
-		}
+		r.key = keyColumn(p)
 		n := len(p.Exposed())
 		if t, ok := p.Listed(); ok {
 			r.models = fmt.Sprintf("%d of %d models", n, len(p.Available())) + muted.Render(" · fetched "+ago(t))
@@ -189,6 +208,11 @@ func providers() error {
 		}
 		if u := uses[p.ID]; len(u) > 0 {
 			r.uses = green.Render("← " + strings.Join(u, ", "))
+		}
+		if p.Off {
+			// the user's own switch, kept as they set it: how to undo it
+			// is said beside it, never done for them
+			r.uses = strings.TrimSpace(muted.Render("magpie provider on "+p.ID) + "  " + r.uses)
 		}
 		if e := p.ListError(); e != "" {
 			r.uses += amber.Render("  ! couldn't list its models: " + e)
@@ -234,7 +258,7 @@ func usesByProvider() map[string][]string {
 		}
 		v := a.Fields[0].Get()
 		v = strings.TrimPrefix(v, "magpie/")
-		if strings.HasPrefix(v, provider.GroupPrefix) {
+		if provider.IsGroupRef(v) {
 			continue // a routing group, of no one provider
 		}
 		if pid, _, ok := strings.Cut(v, "/"); ok {
@@ -811,7 +835,7 @@ func showProvider(p provider.Provider) error {
 		from := p.Account.Agent + "'s own sign-in"
 		if p.IsPlugin() {
 			from = p.Name + "'s sign-in"
-			if provider.Moved(p.ID) {
+			if provider.PluginServes(p.ID) {
 				from = p.ID + "'s own sign-in" // as the built-in said
 			}
 		}
@@ -851,6 +875,9 @@ func showProvider(p provider.Provider) error {
 		// where it was asked: a panel's key query when its account query
 		// has no token left to ask with
 		if u, field := provider.BalanceQuery(p); u != "" {
+			if p.BalanceMethod != "" {
+				u = strings.ToUpper(p.BalanceMethod) + " " + u
+			}
 			from = muted.Render("  from " + u + " " + field)
 		}
 		if err != nil {
@@ -864,7 +891,7 @@ func showProvider(p provider.Provider) error {
 		kv("header", k+": "+muted.Render(p.Headers[k]))
 	}
 	if d := p.RefreshInterval(); d > 0 {
-		kv("refresh", "every "+p.RefreshEvery+muted.Render("  the gateway fetches its list by itself"))
+		kv("refresh", "every "+p.RefreshSchedule()+muted.Render("  the gateway fetches its list by itself"))
 	}
 	if len(p.AutoInclude) > 0 {
 		kv("include", strings.Join(p.AutoInclude, " ")+muted.Render("  newly listed models these match are exposed"))
@@ -899,6 +926,29 @@ func showProvider(p provider.Provider) error {
 	return nil
 }
 
+// atAddress moves p's URLs to addr (provider.AtAddress). A provider
+// saved with none, the gateway taking its preset's, is moved from the
+// preset's; an empty addr puts a local server's back at its preset's.
+func atAddress(p *provider.Provider, addr string) error {
+	pr := provider.Preset(p.Preset)
+	if pr != nil && pr.Kind != provider.KindLocal {
+		pr = nil
+	}
+	if pr != nil && (strings.TrimSpace(addr) == "" || p.Chat+p.Responses+p.Anthropic+p.Decide == "") {
+		p.Chat, p.Responses, p.Anthropic, p.Decide = pr.Chat, pr.Responses, pr.Anthropic, pr.Decide
+	}
+	if strings.TrimSpace(addr) == "" {
+		if pr == nil {
+			return fmt.Errorf("address= needs an address, such as http://192.168.1.5:1234")
+		}
+		return nil
+	}
+	if p.Chat+p.Responses+p.Anthropic+p.Decide == "" {
+		return fmt.Errorf("%s has no URL to move: url= gives its base URL", cmp.Or(p.Name, p.ID))
+	}
+	return p.AtAddress(addr)
+}
+
 func applyPairs(p *provider.Provider, pairs []string) error {
 	workspace := ""
 	for _, kv := range pairs {
@@ -906,7 +956,7 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 		if !ok {
 			return fmt.Errorf("expected key=value, got %q\n\n%s", kv, providerUsage)
 		}
-		if p.IsVertex() && slices.Contains([]string{"url", "chat", "openai", "responses", "anthropic", "decide"}, strings.ToLower(k)) {
+		if p.IsVertex() && slices.Contains([]string{"url", "chat", "openai", "responses", "anthropic", "decide", "address"}, strings.ToLower(k)) {
 			// asked only at the address its project and location make, so
 			// that its Google token goes nowhere else: one given here would
 			// be dropped without a word
@@ -921,6 +971,13 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			p.Chat = v
 		case "responses":
 			p.Responses = v
+		case "address":
+			// a local server (Ollama, LM Studio, oMLX …) on another port
+			// or computer: every URL it has moves there, each API keeping
+			// its path, as the window's Server address does
+			if err := atAddress(p, v); err != nil {
+				return err
+			}
 		case "anthropic":
 			p.Anthropic = v
 		case "gemini":
@@ -998,6 +1055,17 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			p.BalanceURL = v
 		case "balance.path":
 			p.BalancePath = v
+		case "balance.method":
+			// GET (the default) or POST, for an endpoint that answers
+			// only a POST (#2368)
+			switch strings.ToUpper(strings.TrimSpace(v)) {
+			case "GET", "":
+				p.BalanceMethod = ""
+			case "POST":
+				p.BalanceMethod = "POST"
+			default:
+				return fmt.Errorf("balance.method=GET|POST, not %q", v)
+			}
 		case "balance.token":
 			p.BalanceToken = v
 		case "access.key":
@@ -1019,6 +1087,18 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 				p.CodexAsSent = false
 			default:
 				return fmt.Errorf("codex=as-sent|default, not %q", v)
+			}
+		case "additional-tools":
+			// on: a tool an Anthropic client's tool search loads goes to
+			// the provider's Responses API in an additional_tools item
+			// where it was loaded, which keeps the cached prefix (#2660)
+			switch strings.ToLower(v) {
+			case "on", "yes":
+				p.AdditionalTools = true
+			case "default", "no", "off":
+				p.AdditionalTools = false
+			default:
+				return fmt.Errorf("additional-tools=on|default, not %q", v)
 			}
 		case "user-agent", "ua":
 			// agent: a request goes with the User-Agent the agent that
@@ -1240,6 +1320,7 @@ func serve() error {
 	// Codex's background app-server, restarted when it has the list from
 	// before a change and no codex session is on it
 	go agent.KeepCodexDaemonCurrent(context.Background())
+	go agent.KeepCodexRolloutsPortable(context.Background())
 	public := advertisedURL()
 	fmt.Println(green.Render("●"), "magpie gateway on", bold.Render(gateway.URL()))
 	fmt.Println(muted.Render("  OpenAI  "), public+"/v1/chat/completions", muted.Render("·"), public+"/v1/responses")
@@ -1893,7 +1974,7 @@ func refreshEveryCmd(rest []string) error {
 		}
 	}
 	if d := p.RefreshInterval(); d > 0 {
-		fmt.Printf("%s · its model list is fetched by the gateway every %s (magpie serve, or the app, running)\n", p.Name, p.RefreshEvery)
+		fmt.Printf("%s · its model list is fetched by the gateway every %s (magpie serve, or the app, running)\n", p.Name, p.RefreshSchedule())
 	} else {
 		fmt.Printf("%s · its model list is fetched only when asked (magpie provider refresh %s, or Fetch models)\n", p.Name, p.ID)
 	}

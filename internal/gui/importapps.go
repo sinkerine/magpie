@@ -33,7 +33,8 @@ func importAppsRoutes(mux *http.ServeMux) {
 			Source      string `json:"source"`
 		}
 		out := []candidate{}
-		for _, s := range provider.ImportSources() {
+		// only the apps looked in unasked: OpenCode waits for the picker
+		for _, s := range provider.DiscoverSources() {
 			for _, it := range s.Items {
 				// Match openImportApps' default selection: disabled entries and
 				// ID collisions without an add-key option need a manual choice.

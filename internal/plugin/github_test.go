@@ -3,10 +3,13 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +22,9 @@ import (
 // repositories), with three more items made from its first — a fork, an
 // archived one and magpie-community's — and someone/word-guard, whose
 // package.json is word-guard's own, a middleware alone; someone/agent-aider,
-// magpie-community's agent-aider package.json and module, an agent alone; alfaoz's
+// magpie-community's agent-aider package.json and module, an agent alone;
+// someone/page-glance, a page alone (internal/gui/testdata/page-plugin's
+// package.json), and someone/page-gone, whose page file isn't there; alfaoz's
 // opencode-see-image (real), whose main is a dist the repository hasn't;
 // and someone/flaky-entry, whose main GitHub doesn't answer for.
 // reads counts what fakeGitHub answered other than searches: package.json,
@@ -62,20 +67,36 @@ func fakeGitHub(t *testing.T, up *atomic.Bool, asked *atomic.Int32) {
 	items = append(items,
 		like("someone/word-guard", map[string]any{"description": "word guard", "stargazers_count": 3, "license": nil}),
 		like("someone/agent-aider", nil),
+		like("someone/page-glance", nil),
+		like("someone/page-gone", nil),
 		like("alfaoz/opencode-see-image", nil),
 		like("someone/flaky-entry", map[string]any{"license": map[string]any{"key": "other", "spdx_id": "NOASSERTION"}}),
 		like("cyberElar/magpie-x-search", nil),
 		like("forker/opencode-claude-auth", map[string]any{"fork": true}),
 		like("old/opencode-old", map[string]any{"archived": true}),
 		like("magpie-community/plugins", nil))
-	r["items"] = items
-	search, _ := json.Marshal(r)
+	// one page of the search, as GitHub cuts it
+	search := func(q url.Values) []byte {
+		per, _ := strconv.Atoi(q.Get("per_page"))
+		page, _ := strconv.Atoi(q.Get("page"))
+		from, to := min(max(page-1, 0)*per, len(items)), len(items)
+		if per > 0 {
+			to = min(from+per, len(items))
+		}
+		b, _ := json.Marshal(map[string]any{"total_count": len(items), "incomplete_results": false, "items": items[from:to]})
+		return b
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		if q.URL.Path != "/search/repositories" {
 			reads.Add(1)
 		}
 		if h := holding.Load(); h != nil && q.URL.Path == h.path {
 			<-h.go_
+		}
+		if q.Header.Get("Authorization") == "Bearer "+staleToken {
+			w.WriteHeader(401)
+			w.Write([]byte(`{"message":"Bad credentials"}`))
+			return
 		}
 		if !up.Load() || q.URL.Path == "/raw/someone/flaky-entry/main/index.js" {
 			http.Error(w, "down", 503)
@@ -86,7 +107,7 @@ func fakeGitHub(t *testing.T, up *atomic.Bool, asked *atomic.Int32) {
 			if got := q.URL.Query().Get("q"); got != "topic:magpie-plugin archived:false fork:false" {
 				t.Errorf("searched %q", got)
 			}
-			w.Write(search)
+			w.Write(search(q.URL.Query()))
 			return
 		}
 		if name, ok := strings.CutPrefix(q.URL.Path, "/npm/"); ok {
@@ -124,6 +145,37 @@ func fakeGitHub(t *testing.T, up *atomic.Bool, asked *atomic.Int32) {
 // Repositories tagged magpie-plugin: each with what its package.json says,
 // in GitHub's order; forks, archived ones and magpie-community's left out.
 // Asked once in six hours; with GitHub down, what it said last.
+// Every page of the search is read: with a page short of what is tagged,
+// the list is the same as from one page, in GitHub's order (HoGee_xxl on X:
+// 59 tagged, and the 9 past GitHub's first page of 50 never showed).
+func taggedList(ctx context.Context) []Tagged {
+	l, _ := TaggedRepos(ctx)
+	return l
+}
+
+func TestTaggedReposEveryPage(t *testing.T) {
+	var up atomic.Bool
+	var asked atomic.Int32
+	up.Store(true)
+	fakeGitHub(t, &up, &asked)
+	was := taggedPage
+	taggedPage = 4
+	t.Cleanup(func() { taggedPage = was })
+
+	var repos []string
+	for _, x := range taggedList(context.Background()) {
+		repos = append(repos, x.Repo)
+	}
+	want := "rynfar/meridian griffinmartin/opencode-claude-auth slkiser/opencode-quota someone/word-guard someone/agent-aider someone/page-glance someone/flaky-entry"
+	if strings.Join(repos, " ") != want {
+		t.Fatalf("repos %v\nwant %s", repos, want)
+	}
+	// 15 items, four to a page
+	if n := asked.Load(); n != 4 {
+		t.Fatalf("asked %d pages, want 4", n)
+	}
+}
+
 func TestTaggedRepos(t *testing.T) {
 	var up atomic.Bool
 	var asked atomic.Int32
@@ -131,7 +183,7 @@ func TestTaggedRepos(t *testing.T) {
 	fakeGitHub(t, &up, &asked)
 	ctx := context.Background()
 
-	l := TaggedRepos(ctx)
+	l := taggedList(ctx)
 	var repos []string
 	for _, x := range l {
 		repos = append(repos, x.Repo)
@@ -141,7 +193,7 @@ func TestTaggedRepos(t *testing.T) {
 	// none would load. magpie-x-search (real, #1327) is on npm from its
 	// repository, but a command alone, an MCP server: npm's copy names no
 	// file to load, and it has no index.js
-	want := "rynfar/meridian griffinmartin/opencode-claude-auth slkiser/opencode-quota someone/word-guard someone/agent-aider someone/flaky-entry"
+	want := "rynfar/meridian griffinmartin/opencode-claude-auth slkiser/opencode-quota someone/word-guard someone/agent-aider someone/page-glance someone/flaky-entry"
 	if strings.Join(repos, " ") != want {
 		t.Fatalf("repos %v\nwant %s", repos, want)
 	}
@@ -168,6 +220,11 @@ func TestTaggedRepos(t *testing.T) {
 	if x := byRepo["someone/agent-aider"]; x.Kind != "agent" || x.Spec != "github:someone/agent-aider" {
 		t.Fatalf("an agent alone: %+v", x)
 	}
+	// a page alone: no module, magpie.page's file in the repository; one
+	// whose file isn't there would show nothing, and isn't listed
+	if x := byRepo["someone/page-glance"]; x.Kind != "page" || x.Spec != "github:someone/page-glance" || x.Package != "magpie-usage-glance" {
+		t.Fatalf("a page alone: %+v", x)
+	}
 	if x := byRepo["someone/word-guard"]; x.Kind != "middleware" || x.Package != "@magpie-community/middleware-word-guard" || x.License != "" {
 		t.Fatalf("a middleware alone: %+v", x)
 	}
@@ -185,7 +242,7 @@ func TestTaggedRepos(t *testing.T) {
 		t.Fatalf("%s isn't a spec Add installs from git", x.Spec)
 	}
 
-	TaggedRepos(ctx)
+	taggedList(ctx)
 	if n := asked.Load(); n != 1 {
 		t.Fatalf("asked %d times in ten minutes", n)
 	}
@@ -197,7 +254,7 @@ func TestTaggedRepos(t *testing.T) {
 	taggedAt = time.Now().Add(-taggedTTL - time.Second)
 	taggedMu.Unlock()
 	before := reads.Load()
-	if l := TaggedRepos(ctx); len(l) != 6 || asked.Load() != 2 {
+	if l := taggedList(ctx); len(l) != 7 || asked.Load() != 2 {
 		t.Fatalf("ten minutes on: asked %d times, %d repos", asked.Load(), len(l))
 	}
 	if n := reads.Load() - before; n != 3 {
@@ -212,7 +269,7 @@ func TestTaggedRepos(t *testing.T) {
 	if err := os.Chtimes(taggedCache(), time.Now(), time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if l := TaggedRepos(ctx); len(l) != 6 || asked.Load() != 1 {
+	if l := taggedList(ctx); len(l) != 7 || asked.Load() != 1 {
 		t.Fatalf("restarted: asked %d times, %d repos", asked.Load(), len(l))
 	}
 
@@ -223,17 +280,36 @@ func TestTaggedRepos(t *testing.T) {
 	}
 	up.Store(false)
 	forget()
-	if l := TaggedRepos(ctx); len(l) != 6 || l[1].Package != "opencode-claude-auth" || asked.Load() != 1 {
-		t.Fatalf("down: %+v", l)
+	// what GitHub said before, and that it couldn't be asked now
+	if l, err := TaggedRepos(ctx); len(l) != 7 || l[1].Package != "opencode-claude-auth" || asked.Load() != 1 || err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("down: %v %+v", err, l)
+	}
+	// the minute it is held, still said
+	if _, err := TaggedRepos(ctx); err == nil {
+		t.Fatal("down, held: no error")
 	}
 
-	// nothing ever kept, GitHub down: none, not an error
+	// nothing ever kept, GitHub down: none, and an error, never none
+	// passed off as GitHub's answer (till on Discord: the section just
+	// wasn't there)
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	taggedMu.Lock()
 	taggedL = nil
 	taggedMu.Unlock()
-	if l := TaggedRepos(ctx); l == nil || len(l) != 0 {
-		t.Fatalf("down, nothing kept: %#v", l)
+	if l, err := TaggedRepos(ctx); l == nil || len(l) != 0 || err == nil {
+		t.Fatalf("down, nothing kept: %v %#v", err, l)
+	}
+	// Try again asks GitHub at once, up again: its answer, no error
+	up.Store(true)
+	TaggedAskAgain()
+	if l, err := TaggedRepos(ctx); len(l) != 7 || err != nil {
+		t.Fatalf("again: %v, %d repos", err, len(l))
+	}
+	// a whole answer stands its ten minutes: Try again doesn't ask
+	before = asked.Load()
+	TaggedAskAgain()
+	if _, err := TaggedRepos(ctx); err != nil || asked.Load() != before {
+		t.Fatalf("again on a whole answer: %v, asked %d", err, asked.Load()-before)
 	}
 
 	// off: GitHub never asked
@@ -243,7 +319,7 @@ func TestTaggedRepos(t *testing.T) {
 	taggedL = nil
 	taggedMu.Unlock()
 	before = asked.Load()
-	if l := TaggedRepos(ctx); len(l) != 0 || asked.Load() != before {
+	if l := taggedList(ctx); len(l) != 0 || asked.Load() != before {
 		t.Fatalf("off: %+v", l)
 	}
 }
@@ -258,7 +334,7 @@ func TestTaggedReposSlowRead(t *testing.T) {
 	up.Store(true)
 	fakeGitHub(t, &up, &asked)
 	ctx := context.Background()
-	if l := TaggedRepos(ctx); len(l) != 6 {
+	if l := taggedList(ctx); len(l) != 7 {
 		t.Fatalf("%d repos", len(l))
 	}
 
@@ -290,9 +366,9 @@ func TestTaggedReposSlowRead(t *testing.T) {
 		return nil
 	}
 	cutAsked := time.Now()
-	l := TaggedRepos(ctx)
+	l := taggedList(ctx)
 	cutDone := time.Now()
-	if x := has(l, "someone/word-guard"); len(l) != 6 || x == nil || x.Kind != "middleware" {
+	if x := has(l, "someone/word-guard"); len(l) != 7 || x == nil || x.Kind != "middleware" {
 		t.Fatalf("slow package.json: %d repos, word-guard %+v", len(l), x)
 	}
 	if n := asked.Load(); n != 2 {
@@ -342,17 +418,17 @@ func TestTaggedReposSlowRead(t *testing.T) {
 	taggedMu.Lock()
 	taggedAt = time.Now().Add(-taggedTTL + taggedRetry)
 	taggedMu.Unlock()
-	TaggedRepos(ctx)
+	taggedList(ctx)
 	if n := asked.Load(); n != 2 {
 		t.Fatalf("asked again at once: %d", n)
 	}
 	time.Sleep(taggedRetry + 100*time.Millisecond)
 	before := reads.Load()
-	l = TaggedRepos(ctx)
+	l = taggedList(ctx)
 	if n := asked.Load(); n != 3 {
 		t.Fatalf("a list cut short kept: asked %d times", n)
 	}
-	if x := has(l, "someone/word-guard"); len(l) != 6 || x == nil || x.Package != "@magpie-community/middleware-word-guard" {
+	if x := has(l, "someone/word-guard"); len(l) != 7 || x == nil || x.Package != "@magpie-community/middleware-word-guard" {
 		t.Fatalf("asked again: %d repos, word-guard %+v", len(l), x)
 	}
 	// flaky-entry's package.json, npm and entry, as ten minutes on
@@ -406,5 +482,67 @@ func TestPkgEntry(t *testing.T) {
 		if got := pkgEntry(json.RawMessage(c.exports), c.main); got != c.want {
 			t.Errorf("pkgEntry(%s, %q) = %q, want %q", c.exports, c.main, got, c.want)
 		}
+	}
+}
+
+// GitHub's search answers but raw.githubusercontent.com doesn't (blocked
+// on the reader's line, as it is in places where api.github.com isn't),
+// and nothing was kept: the list is empty, and the error says how many
+// couldn't be read and why, not that none are tagged (till on Discord:
+// on their desktop the section wasn't there, on their server it had many).
+// One read before is kept and isn't counted.
+// staleToken is a token fakeGitHub answers 401, as GitHub does an
+// expired one.
+const staleToken = "stale-till"
+
+// till on Discord: a stale GITHUB_TOKEN in the environment, which GitHub
+// refuses, left the Plugins page's GitHub section saying "GitHub refused
+// GITHUB_TOKEN" while GitHub answered fine without it. The search is
+// asked again without the token, and the list is GitHub's.
+func TestTaggedReposStaleEnvTokenDropped(t *testing.T) {
+	var up atomic.Bool
+	var asked atomic.Int32
+	up.Store(true)
+	fakeGitHub(t, &up, &asked)
+	t.Setenv("GITHUB_TOKEN", staleToken)
+	t.Setenv("GH_TOKEN", "")
+	l, err := TaggedRepos(context.Background())
+	if err != nil || len(l) != 7 {
+		t.Fatalf("with a stale GITHUB_TOKEN: %v, %d repos", err, len(l))
+	}
+}
+
+func TestTaggedReposUnreadable(t *testing.T) {
+	var up atomic.Bool
+	var asked atomic.Int32
+	up.Store(true)
+	fakeGitHub(t, &up, &asked)
+	ctx := context.Background()
+	rawWas := githubRaw
+	githubRaw = "http://127.0.0.1:1/raw" // nothing listens: refused at once
+	t.Cleanup(func() { githubRaw = rawWas })
+	l, err := TaggedRepos(ctx)
+	var m *TaggedMissing
+	if len(l) != 0 || !errors.As(err, &m) || m.Missing != 12 || !strings.Contains(m.Why.Error(), "127.0.0.1:1") {
+		t.Fatalf("raw unreachable: %v (%+v), %d repos", err, m, len(l))
+	}
+	// Try again, raw back: the list, no error
+	githubRaw = rawWas
+	TaggedAskAgain()
+	if l, err := TaggedRepos(ctx); len(l) != 7 || err != nil {
+		t.Fatalf("again: %v, %d repos", err, len(l))
+	}
+	// asked again, raw gone again: the seven read before are as they were,
+	// and only what was never read counts as missing
+	taggedMu.Lock()
+	taggedAt = time.Time{}
+	taggedMu.Unlock()
+	readMu.Lock()
+	clear(readRepo)
+	readMu.Unlock()
+	githubRaw = "http://127.0.0.1:1/raw"
+	l, err = TaggedRepos(ctx)
+	if len(l) != 7 || !errors.As(err, &m) || m.Missing != 5 {
+		t.Fatalf("raw gone, seven kept: %v (%+v), %d repos", err, m, len(l))
 	}
 }

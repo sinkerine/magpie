@@ -4,8 +4,11 @@ package gui
 
 import "github.com/wailsapp/wails/v3/pkg/application"
 
-// setTrayTip: Wails' SetTooltip does it here.
-func setTrayTip(*application.SystemTray, string) bool { return true }
+// setTrayTip: Wails' SetTooltip does it on Windows; on the Mac, where it
+// does nothing, the tooltip is set on the item's button itself
+// (trayTipNative), or no hover there ever showed the totals or the quotas
+// (NextCommit on Discord).
+func setTrayTip(_ *application.SystemTray, tip string) bool { return trayTipNative(tip) }
 
 // setTrayPassive: only Linux has Omarchy's bar to put the icon in instead.
 func setTrayPassive(*application.SystemTray, bool) bool { return true }

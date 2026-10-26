@@ -360,7 +360,7 @@ func accountRows(ls []provider.Login, now time.Time) []accountRow {
 			// a pool's own windows stand in for the models' drawing on it,
 			// as the usage page shows them
 			for _, w := range provider.PooledWindows(q.Windows) {
-				s := quotaSpan{Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display, Pool: w.Pool}
+				s := quotaSpan{Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display, Text: w.Text, Pool: w.Pool}
 				if s.ResetsAt == nil && w.ResetSecs > 0 {
 					t := now.Add(time.Duration(w.ResetSecs) * time.Second)
 					s.ResetsAt = &t
@@ -382,7 +382,10 @@ func quotaCell(w quotaSpan, now time.Time) string {
 		return name + " unlimited"
 	}
 	cell := fmt.Sprintf("%s %.0f%%", name, w.Used)
-	if w.Display != "" {
+	if w.Text {
+		// a row of text alone has no share to tell
+		cell = name + " " + w.Display
+	} else if w.Display != "" {
 		cell += " (" + w.Display + ")"
 	}
 	if w.ResetsAt != nil {
@@ -438,7 +441,7 @@ func addAccount(agentID string) error {
 			return fmt.Errorf("sign-in canceled")
 		}
 	}
-	if _, plug := provider.PluginOf(agentID); plug || provider.Moved(agentID) {
+	if _, plug := provider.PluginOf(agentID); plug || provider.PluginServes(agentID) {
 		return pluginLogin(context.Background(), agentID, "")
 	}
 	if p, _ := claudeCode.downloaded(); agentID == "claude" && runtime.GOOS != "windows" && claudeCode.own() == "" && p == "" {
@@ -505,6 +508,7 @@ func addAccount(agentID string) error {
 	}
 	switch st.State {
 	case "done":
+		defer sayStillOff(agentID)
 		if st.Again {
 			fmt.Println(green.Render("✓"), st.User, "is already listed — its sign-in was renewed")
 		} else if st.Using {
@@ -530,7 +534,8 @@ const importUsage = "usage: magpie accounts import <codex|claude|antigravity|fac
 // Cockpit Tools', CLIProxyAPI's and Sub2API's exports for ChatGPT; Claude
 // Code's .credentials.json and
 // CLIProxyAPI's for Claude; Antigravity Cockpit's, Antigravity Manager's
-// and CLIProxyAPI's for Antigravity; Factory API keys. The files are only
+// and CLIProxyAPI's for Antigravity (Factory's API keys go to its plugin,
+// with accounts add factory). The files are only
 // read. What importing does to the tool the file came from is said first,
 // and nothing is imported until that is agreed to (--yes agrees).
 func importAccounts(args []string) error {
@@ -556,10 +561,7 @@ func importAccounts(args []string) error {
 	case "antigravity", "ag":
 		id = "antigravity"
 	case "factory", "droid":
-		id = "factory"
-		if provider.Moved(id) {
-			return fmt.Errorf("Factory runs on its plugin now: add the key with magpie accounts add factory")
-		}
+		return fmt.Errorf("Factory runs on its plugin now: add the key with magpie accounts add factory")
 	default:
 		return fmt.Errorf("%q: accounts can be imported for codex, claude, antigravity and factory\n%s", rest[0], importUsage)
 	}
@@ -593,8 +595,6 @@ func importAccounts(args []string) error {
 			"The files are only read, never changed."}
 	case "antigravity":
 		say = []string{provider.AntigravityRisk, "Each account's sign-in is refreshed with Google before it is added."}
-	case "factory":
-		say = []string{"Each key is asked whose Factory account it is before it is added."}
 	}
 	for _, s := range say {
 		fmt.Println(bold.Render("!"), s)
@@ -618,8 +618,6 @@ func importAccounts(args []string) error {
 		res, err = provider.ImportLogins(ctx, id, files)
 	case "antigravity":
 		res, err = provider.ImportGoogleAccounts(ctx, id, files)
-	case "factory":
-		res, err = provider.ImportFactoryKeys(ctx, files)
 	}
 	if err != nil {
 		if len(paths) == 1 {
@@ -724,10 +722,7 @@ func refreshAccounts(asJSON bool) error {
 func checkinWorkBuddy(asJSON bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	rs := append(provider.CheckInWorkBuddy(ctx), provider.CheckInTrae(ctx)...)
-	rs = append(rs, provider.CheckInMiniMax(ctx)...)
-	rs = append(rs, provider.CheckInQoder(ctx)...)
-	rs = append(rs, provider.CheckInPlugins(ctx)...)
+	rs := checkinAll(ctx)
 	if rs == nil {
 		rs = []provider.WorkBuddyCheckin{}
 	}
@@ -755,6 +750,16 @@ func checkinWorkBuddy(asJSON bool) error {
 				r.User = strings.TrimSpace(r.Vendor + " " + r.User)
 			}
 		}
+		// an answer that may be the vendor's day before: asked again
+		// later (#3326)
+		later := ""
+		if r.Again {
+			later = " · magpie asks again later"
+			if r.Outcome == provider.CheckinDone {
+				fmt.Println(muted.Render("·"), r.User, muted.Render("says already checked in · its day may not have turned"+later))
+				continue
+			}
+		}
 		switch r.Outcome {
 		case provider.CheckinClaimed, provider.CheckinDone:
 			line := fmt.Sprint(green.Render("✓"), " ", r.User, " checked in today")
@@ -768,20 +773,23 @@ func checkinWorkBuddy(asJSON bool) error {
 				line += muted.Render(" · already")
 			}
 			fmt.Println(line)
+		// why, in the vendor's or plugin's words, beside the label: a bare
+		// "no check-in event now" left the user guessing (plugins#304)
 		case provider.CheckinIneligible:
-			fmt.Println(muted.Render("·"), r.User, muted.Render("not eligible for the check-in"))
+			fmt.Println(muted.Render("·"), r.User, muted.Render("not eligible for the check-in"+checkinWhy(r.Msg)+later))
 		case provider.CheckinInactive:
-			fmt.Println(muted.Render("·"), r.User, muted.Render("no check-in event now"))
+			fmt.Println(muted.Render("·"), r.User, muted.Render("no check-in event now"+checkinWhy(r.Msg)+later))
 		case provider.CheckinCaptcha:
 			fmt.Println(muted.Render("·"), r.User, muted.Render(strings.TrimSpace("asks for a captcha: check in in its own app "+r.Msg)))
 		case provider.CheckinOwnApp:
-			// Trae CN's 9074 (#808): it pays only its own app; WorkBuddy's
-			// check-in answered 401 while the sign-in works
+			// Trae CN's 9074 (#808): Trae CN refused the claim (#1920);
+			// WorkBuddy's check-in answered 401 while the sign-in works
+			if r.By == "trae" {
+				fmt.Println(muted.Render("·"), r.User, muted.Render(provider.TraeRefusedWords))
+				break
+			}
 			name := r.Vendor
-			switch r.By {
-			case "trae":
-				name = "Trae CN"
-			case "":
+			if r.By == "" {
 				name = "WorkBuddy"
 			}
 			fmt.Println(muted.Render("·"), r.User, muted.Render(name+" only gives check-in credits to its own app; check in in the "+name+" app"))
@@ -796,6 +804,24 @@ func checkinWorkBuddy(asJSON bool) error {
 		return fmt.Errorf("%d of %d accounts couldn't check in", failed, len(rs))
 	}
 	return nil
+}
+
+// checkinAll checks in every account that has a daily check-in: the
+// built-ins' and each plugin's; a test's seam.
+var checkinAll = func(ctx context.Context) []provider.WorkBuddyCheckin {
+	rs := append(provider.CheckInWorkBuddy(ctx), provider.CheckInTrae(ctx)...)
+	rs = append(rs, provider.CheckInMiniMax(ctx)...)
+	rs = append(rs, provider.CheckInQoder(ctx)...)
+	return append(rs, provider.CheckInPlugins(ctx)...)
+}
+
+// checkinWhy is why a check-in had nothing to claim, in the vendor's or
+// plugin's own words, set after its label (plugins#304); empty without.
+func checkinWhy(msg string) string {
+	if msg = strings.TrimSpace(msg); msg != "" {
+		return " · " + msg
+	}
+	return ""
 }
 
 // accountNamed is the saved account of agent that user names: its name as

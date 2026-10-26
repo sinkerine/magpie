@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -31,7 +32,7 @@ func TestCodexRefreshOutlastsAHeldAuthJSON(t *testing.T) {
 		syscall.CloseHandle(h)
 	}()
 	defer func() { <-released }()
-	if _, _, err := codexToken(context.Background(), path); err != nil {
+	if _, _, err := codexToken(context.Background(), filepath.Dir(path)); err != nil {
 		t.Fatal(err)
 	}
 	<-released

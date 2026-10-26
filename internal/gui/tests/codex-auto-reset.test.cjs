@@ -254,6 +254,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const psel = '.pq-autoreset[data-user="Me@example.com"]';
       await panel.locator('#ptabs [data-ptab="usage"]').click();
       await panel.locator(psel).waitFor();
+      // the tab, opened, reads the accounts again (quotasOpened) and draws
+      // its cards anew when they come: a switch found before that is gone
+      // by the time it is scrolled to (#2360), as codex-credits found (#1622)
+      await panel.waitForFunction(() => !quotasLoading);
       assert.equal(await text(panel.locator(psel + " .ar-say")), w.say);
       assert.deepEqual(await panel.locator(psel + " .ar-case-say").allTextContents(), [w.week, w.expiry]);
       assert.equal(await checked(panel, week(psel)), "false");

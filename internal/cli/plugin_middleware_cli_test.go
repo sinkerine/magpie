@@ -25,9 +25,13 @@ func TestPluginListSaysMiddleware(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "alias.middleware.js")
 	bad := filepath.Join(dir, "bad.middleware.js")
+	// a module with only a strategy and onUsage has no hooks, and the
+	// list had nothing after "gateway middleware" for it
+	pick := filepath.Join(dir, "pick.gateway.js")
+	os.WriteFile(pick, []byte("export const strategies = { last: (p, s) => s.map((_, i) => i).reverse() }\nexport function onUsage(row) {}\n"), 0o644)
 	os.WriteFile(good, []byte("export const events = [\"message_start\"]\nexport function onRequest(b, ctx) {}\nexport function onEvent(e, ctx) {}\n"), 0o644)
 	os.WriteFile(bad, []byte("export function onRequest( {\n"), 0o644)
-	for _, spec := range []string{good, bad} {
+	for _, spec := range []string{good, bad, pick} {
 		if _, err := plugin.Add(context.Background(), spec); err != nil {
 			t.Fatal(err)
 		}
@@ -39,6 +43,9 @@ func TestPluginListSaysMiddleware(t *testing.T) {
 	}
 	if !strings.Contains(out, "gateway middleware  onRequest, onEvent") {
 		t.Errorf("the middleware's hooks aren't listed:\n%s", out)
+	}
+	if !strings.Contains(out, "gateway middleware  routings pick/last · onUsage") {
+		t.Errorf("the module's routing and onUsage aren't listed:\n%s", out)
 	}
 	if !strings.Contains(out, "didn't load: ") || !strings.Contains(out, "SyntaxError") {
 		t.Errorf("the broken middleware doesn't say why:\n%s", out)

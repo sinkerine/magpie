@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -31,6 +32,7 @@ func sandbox(t *testing.T) string {
 	t.Setenv("HOME", h)
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_STATE_HOME", "")
 	// Gemini CLI is found by its binary alone
 	bin := filepath.Join(h, "bin")
 	testenv.Program(t, filepath.Join(bin, "gemini"), "#!/bin/sh\n")
@@ -157,19 +159,104 @@ func TestCrushInstructionsWhereCrushReadsThem(t *testing.T) {
 	}
 }
 
-// Alma takes skills, in ~/.config/alma/skills (#824), and MCP servers, in
-// ~/.config/alma/mcp.json (#1292), but has no user-wide place for
-// instructions, and the library says so rather than recording it as given
-// any.
-func TestTakesRefusesAlma(t *testing.T) {
+// Alma takes skills, in ~/.config/alma/skills (#824), MCP servers, in
+// ~/.config/alma/mcp.json (#1292), and instructions, in
+// ~/.config/alma/USER.md, which its main chat reads into its system
+// prompt (#2315).
+func TestTakesAlma(t *testing.T) {
 	sandbox(t)
-	if id, err := Takes("alma", "instructions"); err == nil || !strings.Contains(err.Error(), "Alma has no user-wide place") {
-		t.Errorf("instructions: %q %v", id, err)
-	}
-	for _, kind := range []string{"skills", "mcp"} {
+	for _, kind := range []string{"instructions", "skills", "mcp"} {
 		if id, err := Takes("alma", kind); err != nil || id != "alma" {
 			t.Errorf("%s: %q %v", kind, id, err)
 		}
+	}
+}
+
+// almaHere makes Alma's data folder, which is what has it detected, and
+// returns its USER.md.
+func almaHere(t *testing.T, h string) string {
+	t.Helper()
+	t.Setenv("APPDATA", filepath.Join(h, "AppData", "Roaming"))
+	cfg, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(filepath.Join(cfg, "alma"), 0o755)
+	return filepath.Join(h, ".config", "alma", "USER.md")
+}
+
+// almaFront is how Alma reads its owner from USER.md (getOwnerInfo in
+// 0.4.164's out/main/index.js): the YAML front matter, from the file's
+// first line, unanchored otherwise.
+var almaFront = regexp.MustCompile(`^---\n([\s\S]*?)\n---`)
+
+// Jie211's USER.md, as Alma's own setup writes one, keeps its front matter
+// first and its profile whole when Alma is given the shared instructions:
+// magpie's part goes after it, and turning Alma off leaves the file as it
+// was (#2315).
+func TestAlmaInstructionsKeepTheProfile(t *testing.T) {
+	h := sandbox(t)
+	user := almaHere(t, h)
+	if tg := targetByID("alma"); tg == nil || tg.Instructions != user || !tg.Profile {
+		t.Fatalf("alma: %+v", tg)
+	}
+	mine := "---\nname: \"Jie\"\ntelegram_id: \"123456789\"\ndiscord_id: \"\"\n---\n# About My Human\n- Name: Jie\n- Language: 中文\n"
+	write(t, user, mine)
+	shared := "交流用中文，代码注释和文档默认用英文。"
+	ok(t)(SaveInstructions(InstructionsChange{Shared: &shared, Agents: []string{"alma"}}))
+	got := read(t, user)
+	if want := mine + "\n" + blockBegin + "\n" + shared + "\n" + blockEnd + "\n"; got != want {
+		t.Errorf("USER.md:\n%q\nwant\n%q", got, want)
+	}
+	if m := almaFront.FindStringSubmatch(got); m == nil || !strings.Contains(m[1], `telegram_id: "123456789"`) {
+		t.Errorf("Alma no longer reads its owner from USER.md:\n%s", got)
+	}
+	ok(t)(SaveInstructions(InstructionsChange{Agents: []string{}}))
+	if got := read(t, user); got != mine {
+		t.Errorf("USER.md after Alma is off:\n%q", got)
+	}
+}
+
+// Alma with no USER.md gets one with magpie's part alone, taken away again
+// when Alma is turned off.
+func TestAlmaInstructionsWithoutUserMD(t *testing.T) {
+	h := sandbox(t)
+	user := almaHere(t, h)
+	shared := "Reply in English."
+	ok(t)(SaveInstructions(InstructionsChange{Shared: &shared, Agents: []string{"alma"}}))
+	if got := read(t, user); got != blockBegin+"\n"+shared+"\n"+blockEnd+"\n" {
+		t.Errorf("USER.md:\n%q", got)
+	}
+	ok(t)(SaveInstructions(InstructionsChange{Agents: []string{}}))
+	if _, err := os.Stat(user); !os.IsNotExist(err) {
+		t.Errorf("USER.md left behind: %v", err)
+	}
+}
+
+// Moving Alma's own lines into the shared text would take its owner's
+// profile out of USER.md, and the telegram_id Alma knows its owner by,
+// into every agent's file: it is refused and nothing changes (#2315).
+func TestAlmaProfileIsNotImported(t *testing.T) {
+	h := sandbox(t)
+	user := almaHere(t, h)
+	mine := "---\nname: \"Jie\"\ntelegram_id: \"123456789\"\n---\n# About My Human\n- Name: Jie\n"
+	write(t, user, mine)
+	if _, err := ImportInstructions("alma"); err == nil || !strings.Contains(err.Error(), "profile") {
+		t.Errorf("import: %v", err)
+	}
+	if got := read(t, user); got != mine {
+		t.Errorf("USER.md:\n%q", got)
+	}
+	v, err := ReadInstructions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Shared != "" {
+		t.Errorf("shared text: %q", v.Shared)
+	}
+	i := slices.IndexFunc(v.Agents, func(a AgentInstructions) bool { return a.Agent == "alma" })
+	if i < 0 || !v.Agents[i].Profile || v.Agents[i].On {
+		t.Errorf("alma on the page: %+v", v.Agents)
 	}
 }
 
@@ -627,6 +714,51 @@ func TestInstructions(t *testing.T) {
 	}
 }
 
+// TestInstructionsSetLinkedToAgentsFile is #2349: instructions.md linked to
+// the file Claude Code reads. The set was read with magpie's part in it, so
+// each sync wrote the whole file into its own part again and it doubled.
+func TestInstructionsSetLinkedToAgentsFile(t *testing.T) {
+	h := sandbox(t)
+	cl := filepath.Join(h, ".claude/CLAUDE.md")
+	write(t, cl, "# Mine\n\nBe brief.\n")
+	set := filepath.Join(Dir(), "instructions.md")
+	if err := os.MkdirAll(filepath.Dir(set), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(cl, set); err != nil {
+		t.Skip("no symlinks here:", err)
+	}
+	ok(t)(SaveInstructions(InstructionsChange{Agents: []string{"claude", "codex"}}))
+	for range 3 {
+		ok(t)(Sync())
+	}
+	if s := read(t, cl); s != "# Mine\n\nBe brief.\n" {
+		t.Errorf("claude's file, the set's own, was written into:\n%q", s)
+	}
+	cx := filepath.Join(h, ".codex/AGENTS.md")
+	if s := read(t, cx); s != blockBegin+"\n# Mine\n\nBe brief.\n"+blockEnd+"\n" {
+		t.Errorf("codex:\n%q", s)
+	}
+	iv, _ := ReadInstructions()
+	if iv.Shared != "# Mine\n\nBe brief." {
+		t.Errorf("shared: %q", iv.Shared)
+	}
+
+	// a file grown before: every part magpie wrote into itself comes out
+	grown := "# Mine\n\nBe brief.\n"
+	for range 4 {
+		grown = withBlock(grown, strings.TrimSpace(grown))
+	}
+	write(t, cl, grown)
+	ok(t)(Sync())
+	if s := read(t, cl); s != "# Mine\n\nBe brief.\n" {
+		t.Errorf("grown file after a sync:\n%q", s)
+	}
+	if s := read(t, cx); s != blockBegin+"\n# Mine\n\nBe brief.\n"+blockEnd+"\n" {
+		t.Errorf("codex after:\n%q", s)
+	}
+}
+
 func TestImportInstructions(t *testing.T) {
 	h := sandbox(t)
 	gm := filepath.Join(h, ".gemini/GEMINI.md")
@@ -880,6 +1012,42 @@ func TestGitHubSource(t *testing.T) {
 	}
 }
 
+// A skills CLI command pasted whole installs from its source
+// (RockyShowlle on X: the npx line a skill's page gives), whatever runs
+// it and wherever its flags are; anything else is left as it is.
+func TestSkillsCommand(t *testing.T) {
+	for in, want := range map[string]string{
+		"npx skills add vercel-labs/agent-skills":                     "vercel-labs/agent-skills",
+		"  npx -y skills@latest add owner/repo --skill pdf ":          "owner/repo",
+		"npx skills add --skill pdf -a claude-code owner/repo":        "owner/repo",
+		"bunx skills add https://github.com/o/r/tree/main/skills/pdf": "https://github.com/o/r/tree/main/skills/pdf",
+		"pnpm dlx skills add o/r":                                     "o/r",
+		"bun x skills add o/r -y":                                     "o/r",
+		"owner/repo":                                                  "owner/repo",
+		"npx skills find pdf":                                         "npx skills find pdf",
+		"npx other add o/r":                                           "npx other add o/r",
+		"npx skills add --skill pdf":                                  "npx skills add --skill pdf",
+		"~/skills/pdf":                                                "~/skills/pdf",
+	} {
+		if got := skillsCommand(in); got != want {
+			t.Errorf("%q: %q, want %q", in, got, want)
+		}
+	}
+	sandbox(t)
+	newFakeGitHub(t)
+	p, err := ProbeSkills("npx skills add someone/cli --skill pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Kind != "github" || p.Source != "someone/cli" || len(p.Candidates) != 1 || p.Candidates[0].Name != "pdf" {
+		t.Fatalf("probe: %+v", p)
+	}
+	ok(t)(InstallSkills("npx skills add someone/cli --skill pdf", []string{p.Candidates[0].Path}, nil))
+	if l := mustLoad(t); l.skill("pdf") == nil || l.skill("pdf").Source.Repo != "someone/cli" {
+		t.Fatalf("installed: %+v", l.skill("pdf"))
+	}
+}
+
 // A server or skill on no agent is listed with none, not null: the page
 // looks in the list, and a null blanked the whole Library.
 func TestReadNoAgents(t *testing.T) {
@@ -1038,6 +1206,45 @@ command = "gh-mcp"
 	want := map[string]bool{"node_repl": true, "cua_repl": true, "computer-use": true, "gh": false}
 	if !maps.Equal(own, want) {
 		t.Errorf("own: %v, want %v", own, want)
+	}
+}
+
+// Another app's server in Codex's config, run from inside that app's
+// bundle, is one to bring in, its empty args and inline env table read as
+// they are (iomect's #2635, the TOML as the report gave it). Only the
+// agent's own app's servers are its own.
+func TestFoundServerFromAnotherApp(t *testing.T) {
+	h := sandbox(t)
+	write(t, filepath.Join(h, ".codex/config.toml"), `[mcp_servers.netcatty-external]
+command = "/Applications/Netcatty.app/Contents/Resources/app.asar.unpacked/electron/cli/netcatty-external-mcp"
+args = []
+env = { NETCATTY_EXTERNAL_MCP_DISCOVERY_FILE = "/Users/****/Library/Application Support/netcatty/external-mcp/discovery.json" }
+
+[mcp_servers.computer-use]
+command = "/Applications/Codex.app/Contents/Resources/SkyComputerUseClient"
+`)
+	v, err := Read(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *Found
+	own := map[string]bool{}
+	for i, f := range v.FoundServers {
+		own[f.Server.Name] = f.Own
+		if f.Server.Name == "netcatty-external" {
+			got = &v.FoundServers[i]
+		}
+	}
+	if got == nil || got.Own {
+		t.Fatalf("netcatty-external found as %+v; own %v", got, own)
+	}
+	s := got.Server
+	if s.Command != "/Applications/Netcatty.app/Contents/Resources/app.asar.unpacked/electron/cli/netcatty-external-mcp" || len(s.Args) != 0 ||
+		s.Env["NETCATTY_EXTERNAL_MCP_DISCOVERY_FILE"] != "/Users/****/Library/Application Support/netcatty/external-mcp/discovery.json" || !slices.Contains(s.Agents, "codex") {
+		t.Errorf("netcatty-external read as %+v", s)
+	}
+	if !own["computer-use"] {
+		t.Errorf("the Codex app's own server isn't its own: %v", own)
 	}
 }
 

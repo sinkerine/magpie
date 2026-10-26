@@ -31,6 +31,7 @@ type PresetDef struct {
 	Decide    string   `json:"decide,omitempty"` // a decision API: the provider only routes (see decide.go)
 	Catalog   string   `json:"catalog,omitempty"`
 	Website   string   `json:"website,omitempty"`
+	SiteHost  string   `json:"siteHost,omitempty"` // a partner's: the host its usemagpie.ai/go Website sends the browser to, which the editor's link reads
 	KeysURL   string   `json:"keysUrl,omitempty"`
 	NoKey     bool     `json:"noKey,omitempty"`     // local servers: a key is optional
 	KeyHint   string   `json:"keyHint,omitempty"`   // the key field's placeholder, when it says more than NoKey's
@@ -80,7 +81,8 @@ type Region struct {
 	KeysURL string `json:"keysUrl,omitempty"`
 	// Website, when the region's docs are another page than the preset's,
 	// is where the editor's link goes.
-	Website string `json:"website,omitempty"`
+	Website  string `json:"website,omitempty"`
+	SiteHost string `json:"siteHost,omitempty"` // as PresetDef's
 	// Catalog, for a region whose models another models.dev entry names
 	// than the preset's (Tencent Cloud's pay as you go, beside its plan's
 	// none), is that entry's id.
@@ -388,6 +390,23 @@ var presets = []PresetDef{
 			"global.openai.gpt-6-astra", "global.openai.gpt-6-sol", "global.openai.gpt-6-luna",
 			"openai.gpt-oss-120b-1:0", "openai.gpt-oss-20b-1:0", "qwen.qwen3-coder-480b-a35b-v1:0", "deepseek.v3.2",
 			"moonshotai.kimi-k2.5", "zai.glm-5", "minimax.minimax-m2.5"}},
+	// Amazon Bedrock's Mantle endpoint (@marktoown on X), with the same
+	// Bedrock API key: OpenAI's chat completions and Responses at /v1 (some
+	// models at /openai/v1, which the gateway picks per model: MantleBase)
+	// and Anthropic's Messages at /anthropic/v1/messages, in-region model
+	// ids alone (anthropic.claude-sonnet-5, openai.gpt-oss-120b; no
+	// global. or us. profiles). Unlike the runtime it lists its models at
+	// /v1/models, so the list is the account's own, Mantle-only models
+	// among them (Claude Mythos 5, GPT-5.5, Gemma 4, Grok 4.3). The regions
+	// are the commercial ones whose bedrock-mantle host answered on
+	// 2026-10-16; the runtime's eu-west-3 has none.
+	{ID: "bedrock-mantle", Name: "Amazon Bedrock (Mantle)", Short: "Bedrock Mantle", Icon: "bedrock-color", Kind: KindVendor, Hosts: true,
+		Chat: mantleOpenAIBase("us-east-1"), Responses: mantleOpenAIBase("us-east-1"), Anthropic: mantleAnthropic("us-east-1"),
+		Note:    "Bedrock API key",
+		Website: "https://docs.aws.amazon.com/bedrock/latest/userguide/endpoints.html", KeysURL: "https://console.aws.amazon.com/bedrock/home#/api-keys",
+		Regions: mantleRegions("us-east-1", "us-east-2", "us-west-2", "eu-central-1", "eu-central-2", "eu-north-1", "eu-south-1",
+			"eu-west-1", "eu-west-2", "ap-northeast-1", "ap-northeast-2", "ap-south-1", "ap-southeast-1", "ap-southeast-2",
+			"ap-southeast-3", "ap-southeast-4", "sa-east-1")},
 	// Azure OpenAI, at the user's own resource (azure.go): its v1 API under
 	// /openai/v1 for chat completions and Responses, the key in api-key,
 	// its deployments' names as the model ids. It hosts other makers'
@@ -398,9 +417,12 @@ var presets = []PresetDef{
 		Endpoint:     "https://<resource>.openai.azure.com",
 		EndpointHint: "Your resource's endpoint, from Keys and Endpoint in the Azure portal. Once added, magpie asks the resource for its deployments with this key, over its v1 API; the deployments' names are the model ids.",
 		Website:      "https://ai.azure.com", KeysURL: "https://portal.azure.com/#view/Microsoft_Azure_ProjectOxford/CognitiveServicesHub/~/OpenAI"},
-	// Ollama's own hosted models: the local server's API, at ollama.com with a key
+	// Ollama's own hosted models: the local server's API, at ollama.com with
+	// a key. Its decision models (Clef), served at /v1/systemone, are the
+	// ones its /api/tags gives the "decision" capability (ollama_decide.go)
 	{ID: "ollama-cloud", Name: "Ollama Cloud", Icon: "ollama", Kind: KindVendor, Catalog: "ollama-cloud", Hosts: true,
 		Chat: "https://ollama.com/v1", Anthropic: "https://ollama.com",
+		Decide:  "https://ollama.com/v1",
 		Note:    "cloud models, with an API key",
 		Website: "https://docs.ollama.com/cloud", KeysURL: "https://ollama.com/settings/keys"},
 	// Nous Research's Nous Portal (#392): its own Hermes models and other
@@ -552,9 +574,13 @@ var presets = []PresetDef{
 		Decide:  "https://maas.qianwenaiapi.com/compatible-mode/v1",
 		Note:    "routes groups · picks model and effort",
 		Website: "https://www.qianwenai.com/models/decision-model-preview", KeysURL: "https://platform.qianwenai.com/home/api-keys"},
+	// its decision models (Nimble, Clef, Tev …), served at /v1/systemone
+	// since 0.35.0, are the ones its /api/tags gives the "decision"
+	// capability (ollama_decide.go)
 	{ID: "ollama", Name: "Ollama", Icon: "ollama", Kind: KindLocal, NoKey: true,
 		Chat: "http://localhost:11434/v1", Anthropic: "http://localhost:11434",
-		Note: "your local models", Website: "https://ollama.com"},
+		Decide: "http://localhost:11434/v1",
+		Note:   "your local models", Website: "https://ollama.com"},
 	{ID: "lmstudio", Name: "LM Studio", Icon: "lmstudio", Kind: KindLocal, NoKey: true,
 		Chat: "http://localhost:1234/v1",
 		Note: "local server, port 1234 by default", Website: "https://lmstudio.ai"},
@@ -577,7 +603,7 @@ var presets = []PresetDef{
 	{ID: RemoteMagpiePreset, Name: "Remote magpie", Icon: "magpie", Kind: KindRemote,
 		Note:           "another computer's magpie, shared on its network",
 		Endpoint:       "http://192.168.1.20:3425",
-		EndpointHint:   "The address and API key the other computer's magpie shows in Settings, under Share on local network. Its models and routing groups are listed here; each request goes on in the API the agent spoke.",
+		EndpointHint:   "The address and API key the other computer's magpie shows in Settings → Network and sharing, under Share on local network. Its models and routing groups are listed here; each request goes on in the API the agent spoke.",
 		EndpointNeeded: "The other magpie's address is needed"},
 }
 
@@ -597,6 +623,27 @@ func bedrockRegions(ids ...string) []Region {
 	out := make([]Region, len(ids))
 	for i, id := range ids {
 		out[i] = Region{ID: id, Name: id, Chat: bedrockChat(id), Responses: bedrockChat(id), Anthropic: bedrockAnthropic(id)}
+	}
+	return out
+}
+
+// mantleOpenAIBase is Mantle's base for chat completions and Responses
+// in region: /v1, where most of its models are served.
+func mantleOpenAIBase(region string) string {
+	return "https://bedrock-mantle." + region + ".api.aws/v1"
+}
+
+// mantleAnthropic is Mantle's base the gateway's /v1/messages goes on.
+func mantleAnthropic(region string) string {
+	return "https://bedrock-mantle." + region + ".api.aws/anthropic"
+}
+
+// mantleRegions are Mantle's regions, named by their codes as
+// bedrockRegions' are.
+func mantleRegions(ids ...string) []Region {
+	out := make([]Region, len(ids))
+	for i, id := range ids {
+		out[i] = Region{ID: id, Name: id, Chat: mantleOpenAIBase(id), Responses: mantleOpenAIBase(id), Anthropic: mantleAnthropic(id)}
 	}
 	return out
 }

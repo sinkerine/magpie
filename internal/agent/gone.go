@@ -70,18 +70,23 @@ func (a *Agent) cliHeld() (held, known bool) {
 			return true, true
 		}
 	}
-	if !cliShared[a.ID] {
-		return false, true
-	}
 	// On Windows the programs that read a shared folder can't all be
 	// told: a Store app, an editor run portable or with its extensions
 	// moved off ~\.vscode, a CLI on a PATH only a shell profile sets (fnm).
 	// Taking ~\.claude and ~\.codex for leftovers there hid both agents'
 	// settings, "CLI not found", from a user whose Claude Code and Codex
 	// v0.1.1231 listed (#1482, edussss). There a shared folder whose CLI
-	// isn't found is never taken for gone.
-	if goneOS == "windows" {
+	// isn't found is never taken for gone. A folder an agent's desktop app
+	// reads is one too: DeepSeek Harness Desktop installs to any folder
+	// and puts its dsh.cmd in one the user picks, and taking ~\.dsh for a
+	// leftover hid dsh's settings from v0.1.1239 (#2300, yangkai2; #2304,
+	// wlj521: 未找到 CLI, no model to pick).
+	_, hasApp := desktopApps[a.ID]
+	if goneOS == "windows" && (cliShared[a.ID] || hasApp) {
 		return false, false
+	}
+	if !cliShared[a.ID] {
+		return false, true
 	}
 	// the others that keep a shared folder: editors' extensions, desktop
 	// apps, and the IDEs and editors whose agents bring their own copy of
@@ -147,16 +152,14 @@ func extensionHere(home, id string) bool {
 }
 
 // appHere reports whether one of the bundles names is in a Mac's app
-// folders.
+// folders, or a folder of theirs one level down (inAppFolders).
 func appHere(names ...string) bool {
 	if runtime.GOOS != "darwin" {
 		return false
 	}
-	for _, dir := range appFolders() {
-		for _, n := range names {
-			if isDir(filepath.Join(dir, n)) {
-				return true
-			}
+	for _, p := range inAppFolders(appFolders(), names...) {
+		if isDir(p) {
+			return true
 		}
 	}
 	return false

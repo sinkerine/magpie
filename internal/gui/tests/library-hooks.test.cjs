@@ -144,9 +144,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const row = (name) => v.locator(".lib-hook").filter({ has: page.locator(".name", { hasText: new RegExp("^" + name + "$") }) });
         const agentsOf = (name) => state.hooks.find((s) => s.name === name)?.agents;
 
-        // the tab, with its count, between Skills and RTK
+        // the tab, with its count, between Skills and Subagents
         const tabs = (await v.locator(".lib-tabs button").allTextContents()).map((x) => x.trim());
-        assert.deepEqual(tabs.slice(2, 5), [w("Skills"), w("Hooks") + " · 2", "RTK"]);
+        assert.deepEqual(tabs.slice(2, 6), [w("Skills"), w("Hooks") + " · 2", w("Subagents"), "RTK"]);
         // each hook says when it runs, in words, and what it runs
         assert.equal((await row("fmt").locator(".lib-hookev").textContent()).trim(), w("After a tool runs") + " · " + w("File edits"));
         assert.equal((await row("bark").locator(".lib-hookev").textContent()).trim(), w("When a turn ends"));

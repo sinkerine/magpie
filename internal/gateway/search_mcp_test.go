@@ -66,7 +66,7 @@ func readMCP(t *testing.T, w *httptest.ResponseRecorder) mcpReply {
 const mcpSearchCall = `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"latest go"}}}`
 
 // magpie's web search is an MCP server of its own on the gateway (Kayphoon
-// on Discord): an MCP client initializes, lists one web_search tool and
+// on Discord): an MCP client initializes, lists its web_search tool and
 // calls it, and the search goes where a model's web_search would go — here
 // the search API the user set up — the pages it found in the tool's text.
 func TestSearchMCPServesWebSearch(t *testing.T) {
@@ -90,7 +90,8 @@ func TestSearchMCPServesWebSearch(t *testing.T) {
 		t.Fatalf("a notification: %d %q", w.Code, w.Body.String())
 	}
 	list := readMCP(t, mcpPost(h, here, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`))
-	if len(list.Result.Tools) != 1 || list.Result.Tools[0].Name != "web_search" || !slices.Equal(list.Result.Tools[0].InputSchema.Required, []string{"query"}) {
+	if len(list.Result.Tools) != 2 || list.Result.Tools[0].Name != "web_search" || !slices.Equal(list.Result.Tools[0].InputSchema.Required, []string{"query"}) ||
+		list.Result.Tools[1].Name != "web_fetch" || !slices.Equal(list.Result.Tools[1].InputSchema.Required, []string{"url"}) {
 		t.Fatalf("tools/list: %+v", list)
 	}
 	call := readMCP(t, mcpPost(h, here, mcpSearchCall, "User-Agent", "Cursor/1.7"))

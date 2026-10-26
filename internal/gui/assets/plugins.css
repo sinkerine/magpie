@@ -43,12 +43,22 @@
 .pm-sechead h3 { margin: 0; font-size: 12.5px; font-weight: 650; }
 .pm-sechead span { font-size: 11.5px; color: var(--muted); }
 .pm-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(262px, 1fr)); gap: 10px; }
-/* the GitHub section's kinds and its own field, on one line while they fit;
-   the field goes under the kinds, the whole width, when they don't */
+/* the GitHub section's kinds, what's installed and its own field, on one
+   line while they fit; the field goes under them, the whole width, when
+   they don't */
 .pm-ghbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .pm-ghbar .segs { flex: none; max-width: 100%; }
-.pm-ghfind { width: min(240px, 100%); }
+/* it takes a share of the room the strips leave, up to what its
+   placeholder needs, so "Filter by name, author or description" isn't cut */
+.pm-ghfind { flex: 4 0 auto; width: min(240px, 100%); max-width: min(320px, 100%); }
 .pm-ghnone { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 22px 12px; border-radius: 12px; border: 1px dashed var(--line); font-size: 12px; color: var(--muted); text-align: center; }
+/* what GitHub couldn't give, over the cards it could: a quiet line, its
+   reason wrapping anywhere (a URL in it is one long word) */
+.pm-ghwarn { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 6px; padding: 0 2px; font-size: 11.5px; color: var(--muted); }
+/* its Try again reads as the button it is, beside the quiet line */
+.pm-ghwarn .text { padding: 1px 6px; margin: -1px 0; font-size: 11.5px; color: var(--accent); }
+.pm-ghwarn .text:hover:not(:disabled) { color: var(--accent); background: var(--accent-soft); }
+.pm-ghwarn > span, .pm-ghnone > span { overflow-wrap: anywhere; }
 
 .pm-logo { flex: none; width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; background: var(--pill); color: var(--fg-2); }
 .pm-logo .ic { width: 20px; height: 20px; }
@@ -82,6 +92,10 @@ button.pm-chip { border: 0; font-family: inherit; cursor: pointer; }
 button.pm-chip.up:hover:not(:disabled) { background: var(--accent); color: var(--accent-fg); }
 button.pm-chip:disabled { cursor: default; opacity: .6; }
 .pm-mw-fail { color: var(--red); }
+/* a plugin's tools: the names on one line, the MCP server's address to copy */
+.pm-row .sub.pm-tools { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.pm-tools > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pm-tools > .copy { flex: none; width: 20px; height: 20px; }
 .pm-chip.bad { background: var(--red-soft); color: var(--red); }
 .pm-chip.moved { gap: 4px; background: var(--accent-soft); color: var(--accent); }
 .pm-chip.moved .dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
@@ -123,21 +137,52 @@ button.pm-chip:disabled { cursor: default; opacity: .6; }
 /* an update out: Install's size, green for its own (#1587) */
 .pm-act.pm-up { background: var(--green-soft); color: var(--green); }
 .pm-act.pm-up:hover:not(:disabled) { background: var(--green); color: var(--card); }
-.pm-act.go { background: var(--accent); color: var(--accent-fg); }
-.pm-act.go:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); color: var(--accent-fg); }
+/* Sign in, in a list of cards or rows, is Install's tinted capsule: one
+   style for a row's action, so no card shouts over its neighbours (HIG's
+   one filled button is a sheet's own); a plugin's page fills it */
+.pm-act.go { background: var(--accent-soft); color: var(--accent); }
+.pm-act.go:hover:not(:disabled), .pm-dact .pm-act.go { background: var(--accent); color: var(--accent-fg); }
+.pm-dact .pm-act.go:hover:not(:disabled) { filter: brightness(1.08); }
 .pm-act.done { background: none; color: var(--green); padding: 0 8px; min-width: 0; }
 .pm-act.done:hover:not(:disabled) { background: var(--green-soft); color: var(--green); }
 .pm-act.busy { color: var(--muted); font-weight: 500; }
 .pm-act:disabled:not(.busy):not(.done) { opacity: .55; }
 .pm-act .spin { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid currentColor; border-right-color: transparent; animation: spin .7s linear infinite; }
 
-/* loading: cards drawn as grey bars */
-.pm-card.ghost { gap: 10px; pointer-events: none; }
-.pm-card.ghost > div { border-radius: 6px; background: var(--pill); animation: pm-pulse 1.3s ease-in-out infinite; }
-.pm-card.ghost .g1 { height: 36px; width: 60%; }
-.pm-card.ghost .g2 { height: 11px; }
-.pm-card.ghost .g3 { height: 11px; width: 40%; }
+/* loading: cards laid out as a card is, in soft bars a light passes
+   over, one card a beat after the one before it */
+.pm-card.ghost { gap: 9px; pointer-events: none; border-color: color-mix(in srgb, var(--line) 70%, transparent); }
+.pm-card.ghost .sk {
+  border-radius: 5px;
+  background: linear-gradient(100deg, var(--pill) 30%, color-mix(in srgb, var(--pill-hover) 70%, var(--card)) 50%, var(--pill) 70%);
+  background-size: 300% 100%;
+  animation: pm-sheen 1.8s cubic-bezier(.45, 0, .25, 1) infinite;
+  animation-delay: calc(var(--i, 0) * 120ms);
+}
+.pm-card.ghost .gtop { display: flex; align-items: center; gap: 10px; }
+.pm-card.ghost .gwho { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.pm-card.ghost .glogo { flex: none; width: 36px; height: 36px; border-radius: 10px; }
+.pm-card.ghost .gname { height: 11px; width: 52%; }
+.pm-card.ghost .gby { height: 8px; width: 30%; opacity: .7; }
+.pm-card.ghost .gact { flex: none; width: 56px; height: 26px; border-radius: 13px; opacity: .8; }
+.pm-card.ghost .gline { height: 8px; margin-top: 6px; }
+.pm-card.ghost .gline.short { width: 68%; margin-top: 0; }
+.pm-card.ghost .gmeta { display: flex; gap: 8px; margin-top: 7px; }
+.pm-card.ghost .gchip { height: 8px; width: 46px; opacity: .8; }
+.pm-card.ghost .gchip.short { width: 30px; }
 @keyframes pm-pulse { 50% { opacity: .5; } }
+@keyframes pm-sheen { from { background-position: 100% 0; } to { background-position: 0 0; } }
+/* the GitHub section looking: three dots breathing in turn, and the word */
+.pm-sechead .pm-ghlook { display: inline-flex; align-items: center; gap: 7px; margin-left: auto; font-size: 11px; color: var(--faint); animation: pm-fade .4s var(--ease) both .15s; }
+.pm-ghlook .dots { display: inline-flex; gap: 3px; }
+.pm-ghlook .dots i { width: 4px; height: 4px; border-radius: 50%; background: var(--accent); opacity: .25; animation: pm-breathe 1.2s ease-in-out infinite; }
+.pm-ghlook .dots i:nth-child(2) { animation-delay: .16s; }
+.pm-ghlook .dots i:nth-child(3) { animation-delay: .32s; }
+@keyframes pm-breathe { 0%, 70%, 100% { opacity: .25; transform: none; } 35% { opacity: .9; transform: translateY(-1.5px); } }
+@keyframes pm-fade { from { opacity: 0; } }
+/* its cards when they come: in where the ghosts were, one after another */
+.pm-arrive .pm-card { animation: pm-arrive .42s cubic-bezier(.2, .7, .2, 1) both; animation-delay: calc(var(--i, 0) * 40ms); }
+@keyframes pm-arrive { from { opacity: 0; transform: translateY(4px); } }
 
 .pm-note { margin: 0; padding: 4px 2px; font-size: 12px; color: var(--muted); }
 .pm-note.bad { color: var(--red); }
@@ -157,6 +202,11 @@ button.pm-chip:disabled { cursor: default; opacity: .6; }
 
 /* Installed */
 .pm-listhead { margin: 0 0 -10px; padding: 0 2px; }
+/* the plugins with an update, above the list: the sidebar's dot, named */
+.pm-updates { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; padding: 9px 10px 9px 12px; border-radius: 10px; background: var(--accent-soft); font-size: 12px; line-height: 1.35; }
+.pm-updates .grow { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.pm-updates .pm-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.pm-updates .pm-up { flex: none; }
 .pm-list .row { min-height: 54px; padding: 8px 10px 8px 12px; gap: 11px; cursor: default; transition: background .14s var(--ease); }
 .pm-list .row:hover { background: var(--card-2); }
 .pm-list .row + .row { border-top: 1px solid var(--line-2); }
@@ -203,8 +253,19 @@ button.pm-chip:disabled { cursor: default; opacity: .6; }
 .pm-link { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 9px; border-radius: 7px; background: var(--pill); color: var(--fg-2); font-size: 11.5px; text-decoration: none; }
 .pm-link:hover { background: var(--pill-hover); color: var(--fg); }
 .pm-readme { border-top: 1px solid var(--line-2); padding-top: 12px; min-height: 60px; }
-.pm-rskel { height: 11px; margin: 8px 0; border-radius: 5px; background: var(--pill); animation: pm-pulse 1.3s ease-in-out infinite; }
-.pm-rskel.short { width: 55%; }
+/* the README's skeleton: strings the bird bounces down (bounceLoader) */
+.pm-bounce { position: relative; height: 108px; }
+.pm-bounce[data-gone] { position: absolute; z-index: 2; pointer-events: none; }
+.pm-bounce > svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; transition: opacity .3s ease-out; }
+.pm-bounce[data-gone] > svg { opacity: 0; }
+.pm-bounce path { fill: none; stroke: var(--skel, var(--pill)); stroke-width: 10; stroke-linecap: round; transition: stroke .35s ease-out; }
+.pm-bounce path[data-lit] { stroke: color-mix(in srgb, var(--accent) 18%, var(--skel, var(--pill))); }
+.pm-bird { position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 1; }
+.pm-bird svg { position: absolute; left: -13.2px; top: -19.6px; width: 22px; height: 22px; color: var(--fg); fill: currentColor; overflow: visible; }
+.pm-bird .tail { transform-box: view-box; transform-origin: 14px 22px; }
+.pm-bird .wing { transform-box: view-box; transform-origin: 30px 19.8px; }
+.pm-bird[data-flap] .wing { animation: pm-flap .16s ease-in-out infinite alternate; }
+@keyframes pm-flap { from { transform: rotate(-22deg); } to { transform: rotate(18deg); } }
 
 /* a README */
 .pm-md { font-size: 12.5px; line-height: 1.6; color: var(--fg-2); overflow-wrap: anywhere; }
@@ -237,9 +298,11 @@ button.pm-chip:disabled { cursor: default; opacity: .6; }
 @media (max-width: 560px) {
   .pm-head { flex-wrap: wrap; }
   .pm-find { width: 100%; order: 3; }
+  .pm-ghfind { max-width: 100%; }
   .pm-art { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   .pm-card { transition: none; }
-  .pm-card.ghost > div, .pm-rskel { animation: none; }
+  .pm-card.ghost .sk, .pm-bird .wing, .pm-ghlook, .pm-ghlook .dots i, .pm-arrive .pm-card { animation: none; }
+  .pm-ghlook .dots i { opacity: .5; }
 }

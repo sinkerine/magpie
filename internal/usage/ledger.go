@@ -53,7 +53,10 @@ func (r Record) Failed() bool { return r.Status >= 400 || r.Error != "" }
 // one provider, to the failed calls, and to the rows whose models, provider, host or
 // session hold Query (any case).
 type Filter struct {
-	Day       string // YYYY-MM-DD in the chart's local time zone; "" is the whole period
+	Day string // YYYY-MM-DD in Zone; "" is the whole period
+	// Zone is the reader's time zone (Zone gives it), which the period's
+	// days, the chart's hours and Day are read in; nil is this computer's
+	Zone      *time.Location
 	CallerKey string
 	RouteID   int64
 	Model     string // exact model selected in the ranking
@@ -102,7 +105,7 @@ const (
 // under its totals that local rejections are not counted — so it is "" and
 // picking either cell leaves it out, as the cells' own counts already do.
 func SourceOf(r Row) string {
-	if r.IsRejected() {
+	if r.IsRejected() || r.IsProbe() { // magpie's own test is neither too
 		return ""
 	}
 	switch r.Source {
@@ -116,18 +119,18 @@ func SourceOf(r Row) string {
 
 // keepsRow is keeps with the one dimension a Record does not carry: which of
 // the two sources the row is of (Row.Source, not the record's).
-func (f Filter) keepsRow(r Row) bool {
-	if f.Through != "" && SourceOf(r) != f.Through {
+func (f Filter) keepsRow(r *Row) bool {
+	if f.Through != "" && SourceOf(*r) != f.Through {
 		return false
 	}
-	return f.keepsRecord(r.Record, r.SessionRole != "", r.Subagent, r.ParentAgent)
+	return f.keepsRecord(&r.Record, r.SessionRole != "", r.Subagent, r.ParentAgent)
 }
 
 // OtherComputers is the Filter.Computer of every other computer's calls.
 const OtherComputers = "others"
 
 // computer is whether r is of the computers Computer picks.
-func (f Filter) computer(r Record) bool {
+func (f Filter) computer(r *Record) bool {
 	switch f.Computer {
 	case "":
 		return true
@@ -140,17 +143,17 @@ func (f Filter) computer(r Record) bool {
 }
 
 func (f Filter) keeps(r Record) bool {
-	return f.keepsRecord(r, false, "", "")
+	return f.keepsRecord(&r, false, "", "")
 }
 
-func (f Filter) keepsRecord(r Record, codexIdentity bool, subagent, parentAgent string) bool {
+func (f Filter) keepsRecord(r *Record, codexIdentity bool, subagent, parentAgent string) bool {
 	if f.Day != "" {
 		var day [len(time.DateOnly)]byte
-		if string(r.Time.In(time.Local).AppendFormat(day[:0], time.DateOnly)) != f.Day {
+		if string(r.Time.In(f.loc()).AppendFormat(day[:0], time.DateOnly)) != f.Day {
 			return false
 		}
 	}
-	if f.CallerKey != "" && r.CallerKeyID != f.CallerKey {
+	if f.CallerKey != "" && r.CallerKeyID != f.CallerKey && (f.CallerKey != NoCallerKey || r.CallerKeyID != "") {
 		return false
 	}
 	if f.RouteID != 0 && r.RouteID != f.RouteID {
@@ -238,21 +241,26 @@ type Ledgered struct {
 // comes with the calls the agents' session files record that the gateway did
 // not see.
 func LedgerOf(p Period, f Filter) Ledgered {
-	return LedgerOfAt(p, f, Clock())
+	return LedgerOfAt(p, f, Clock().In(f.loc()))
 }
 
 // LedgerOfAt is LedgerOf with the period read at now, for an answer that
 // names that moment elsewhere too, as an exported CSV's name does.
 func LedgerOfAt(p Period, f Filter, now time.Time) Ledgered {
+	reader := LogCalls
+	if reader == nil {
+		reader = sessions.Calls
+	}
+	return ledgerOfAt(p, f, now, reader)
+}
+
+// ledgerOfAt is LedgerOfAt over the session files' calls reader reads.
+func ledgerOfAt(p Period, f Filter, now time.Time, reader func(time.Time) []sessions.Call) Ledgered {
 	since := p.Since(now)
 	gatewaySince := since
 	if !since.IsZero() {
 		gatewaySince = since.Add(-24 * time.Hour)
 	} // calls ending across the period boundary
-	reader := LogCalls
-	if reader == nil {
-		reader = sessions.Calls
-	}
 	rows, sum, agents, providers := ledgerWithShared(since, p.Until(now), f, gatewayRecords(gatewaySince), reader(since), sharedRecords(since))
 	return Ledgered{rows, sum, agents, providers}
 }
@@ -270,12 +278,14 @@ func gatewayRecords(since time.Time) []Record {
 
 // Filtered narrows one snapshot without reloading either log or repricing rows.
 func (l Ledgered) Filtered(f Filter) Ledgered {
-	if f == (Filter{}) {
+	g := f
+	g.Zone = nil // the zone narrows nothing but through Day
+	if g == (Filter{}) {
 		return l
 	}
 	out := Ledgered{Rows: []Row{}, Agents: l.Agents, Providers: l.Providers}
 	for _, r := range l.Rows {
-		if f.keepsRow(r) {
+		if f.keepsRow(&r) {
 			out.Rows = append(out.Rows, r)
 			if !r.IsRejected() {
 				out.Sum.addRow(r)
@@ -410,7 +420,7 @@ func ledgerWithShared(since, until time.Time, f Filter, recs []Record, logs []se
 // ledgerMatched is ledgerWithShared with the session files' calls the
 // gateway saw already told (matched, by their index in logs).
 func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall, matched map[int]bool, pairs map[int]int, actors map[int]string, compactions map[int]*bool) (rows []Row, sum Totals, agents, providers []string) {
-	renamed := provider.Renamed()
+	renamed := provider.UsageRenames()
 	// the upstream names in force now, read once for the lot: a row is
 	// judged by the names standing today, which is what Ledger says, and
 	// the rows here are what a reader compares a bill against
@@ -432,7 +442,7 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 			sent = provider.SentNameIn(wires, r.Provider, r.Model, r.Effort)
 		}
 		row := codexIdentityRow(Row{Record: r, Swapped: r.Served != "" && Swapped(sent, r.Served), Routed: GroupRouted(sent, r.Served), Source: source}, actor, codexIdentities)
-		if !f.keepsRow(row) {
+		if !f.keepsRow(&row) {
 			return
 		}
 		if pr != nil && r.Input+r.Output > 0 {
@@ -449,9 +459,7 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		if !since.IsZero() && r.Time.Before(since) || after(until, r.Time) {
 			continue
 		}
-		if id, ok := renamed[r.Provider]; ok {
-			r.Provider = id
-		}
+		r.Provider = renamed.Of(r.Provider, r.Time)
 		actor := ""
 		if call, ok := pairs[i]; ok && call >= 0 && call < len(logs) {
 			actor = logs[call].ThreadID
@@ -486,9 +494,7 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		if !since.IsZero() && r.Time.Before(since) || after(until, r.Time) {
 			continue
 		}
-		if id, ok := renamed[r.Provider]; ok {
-			r.Provider = id
-		}
+		r.Provider = renamed.Of(r.Provider, r.Time)
 		add(r, priceOf(r), c.Source, "")
 	}
 	// the two logs, by when each call began
@@ -547,13 +553,11 @@ func Pricer() func(Record) *catalog.Price {
 // effective prices used by the ledger. Reuse it for one page of routes;
 // make it again on the next read so a changed tariff re-prices history.
 func NewPricer() func([]Record) Totals {
-	priceOf, renamed := Pricer(), provider.Renamed()
+	priceOf, renamed := Pricer(), provider.UsageRenames()
 	return func(recs []Record) Totals {
 		var sum Totals
 		for _, r := range recs {
-			if id, ok := renamed[r.Provider]; ok {
-				r.Provider = id
-			}
+			r.Provider = renamed.Of(r.Provider, r.Time)
 			sum.add(r, priceOf(r))
 		}
 		return sum
@@ -565,7 +569,7 @@ var CSVHeader = []string{"time", "agent", "requested_model", "provider", "host",
 	"effort", "input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens", "reasoning_tokens",
 	"cost_usd", "duration_ms", "ttft_ms", "status", "error", "session", "kind", "provider_key_id", "provider_key_name", "provider_account", "route_id",
 	"request_id", "endpoint", "error_message", "error_type", "source", "rejected", "session_provider", "session_account", "session_official_login", "caller_key_id", "caller_key_name", "response_id", "upstream",
-	"cache_write_5m_tokens", "cache_write_1h_tokens", "tries", "handed_on", "tier_asked", "tier_sent", "tier_served", "upstream_stop"}
+	"cache_write_5m_tokens", "cache_write_1h_tokens", "tries", "handed_on", "tier_asked", "tier_sent", "tier_served", "upstream_stop", "credits"}
 
 // WriteCSV writes rows as CSV, a header first (cache_write_tokens is every
 // cache write, as it always was, and the last two columns split it into
@@ -578,7 +582,9 @@ var CSVHeader = []string{"time", "agent", "requested_model", "provider", "host",
 // on: the request's outcome is the row with the same route_id after it.
 // tier_asked, tier_sent and tier_served are the service tier the client
 // asked for, the one sent on the row's try and the one the reply said it
-// ran at, each empty when there was none (Record.TierAsked).
+// ran at, each empty when there was none (Record.TierAsked). credits is
+// what the reply said the call cost in its plan's credits, empty when it
+// said none (Record.Credits).
 func WriteCSV(w io.Writer, rows []Row) error {
 	cw := csv.NewWriter(w)
 	cw.Write(CSVHeader)
@@ -596,6 +602,10 @@ func WriteCSV(w io.Writer, rows []Row) error {
 		if r.Tries > 0 {
 			tries = n(r.Tries)
 		}
+		credits := ""
+		if r.Credits != nil {
+			credits = strconv.FormatFloat(*r.Credits, 'f', -1, 64)
+		}
 		routeID := ""
 		if r.RouteID != 0 {
 			routeID = strconv.FormatInt(r.RouteID, 10)
@@ -605,7 +615,7 @@ func WriteCSV(w io.Writer, rows []Row) error {
 			cost, strconv.FormatInt(r.Millis, 10), ttft, n(r.Status), strconv.FormatBool(r.Failed()), r.Session, r.Kind, r.ProviderKeyID, r.ProviderKeyName, r.Account(), routeID,
 			r.RequestID, r.Endpoint, r.Error, r.ErrType, r.Source, strconv.FormatBool(r.IsRejected()), r.SessionProvider, r.SessionAccount, strconv.FormatBool(r.SessionOfficialLogin), r.CallerKeyID, r.CallerKeyName, r.ResponseID, r.Upstream,
 			n(r.CacheWrite - min(r.CacheWrite1h, r.CacheWrite)), n(min(r.CacheWrite1h, r.CacheWrite)), tries, strconv.FormatBool(r.HandedOn),
-			r.TierAsked, r.TierSent, r.TierServed, r.Stop})
+			r.TierAsked, r.TierSent, r.TierServed, r.Stop, credits})
 	}
 	cw.Flush()
 	return cw.Error()
@@ -732,6 +742,7 @@ func (t *Totals) addRow(r Row) {
 	t.CacheRead += r.CacheRead
 	t.CacheWrite += r.CacheWrite
 	t.CacheWrite1h += r.CacheWrite1h
+	t.countCache(r.Record)
 	t.Reasoning += r.Reasoning
 	switch {
 	case r.Priced:
@@ -739,6 +750,36 @@ func (t *Totals) addRow(r Row) {
 	case r.Input+r.Output > 0:
 		t.Unpriced++
 	}
+}
+
+// plus adds what another sum counted: a row's own, made once by addRow,
+// added to each of the many groups it is in instead of each reading the
+// row again (#3493).
+func (t *Totals) plus(d *Totals) {
+	t.Calls += d.Calls
+	t.Errors += d.Errors
+	t.Retried += d.Retried
+	t.Loops += d.Loops
+	t.Input += d.Input
+	t.Output += d.Output
+	t.CacheRead += d.CacheRead
+	t.CacheWrite += d.CacheWrite
+	t.CacheWrite1h += d.CacheWrite1h
+	t.CacheUnknown += d.CacheUnknown
+	t.CacheUnknownCalls += d.CacheUnknownCalls
+	t.Reasoning += d.Reasoning
+	t.Cost += d.Cost
+	t.Unpriced += d.Unpriced
+	t.Credits += d.Credits
+	t.Credited += d.Credited
+	t.Timed += d.Timed
+	t.TTFT += d.TTFT
+	t.DecodeMs += d.DecodeMs
+	t.DecodeOut += d.DecodeOut
+	t.DecodeN += d.DecodeN
+	t.FloorOut += d.FloorOut
+	t.FloorMs += d.FloorMs
+	t.FloorN += d.FloorN
 }
 
 // FloorAgents are the agents whose session files time a call from what
@@ -833,17 +874,41 @@ func (r Row) Floor() (tokens int, ms int64) {
 }
 
 // Dimensions are what calls are told apart by: the provider they went to,
-// the agent that made them, the model, and the model at the provider it
+// the agent that made them, the model, the model at the provider it
 // went to ("modelAt"), so one model's speed at each provider can be compared
-// (inaction on Discord).
-var Dimensions = []string{"provider", "agent", "model", "modelAt"}
+// (inaction on Discord), and the gateway key that made them ("callerKey"),
+// so the clients a shared gateway serves can be compared (#2521).
+var Dimensions = []string{"provider", "agent", "model", "modelAt", "callerKey"}
+
+// NoCallerKey is the "callerKey" of a call that carried no gateway key: one
+// that wasn't counted against any, as this computer's own agents' are, or
+// that came before keys were recorded. As a filter it keeps only those.
+const NoCallerKey = "none"
+
+// Without is f with the pick of dimension d cleared: what d's shares are
+// counted over, so that the others are still there to switch to.
+func (f Filter) Without(d string) Filter {
+	switch d {
+	case "provider":
+		f.Provider = ""
+	case "agent":
+		f.Agent = ""
+	case "model":
+		f.Model = ""
+	case "modelAt":
+		f.Model, f.Provider = "", ""
+	case "callerKey":
+		f.CallerKey = ""
+	}
+	return f
+}
 
 // ModelAtKey is a call's "modelAt": its provider's id and its model, as
 // "provider/model" (a provider's id has no "/").
 func ModelAtKey(provider, model string) string { return provider + "/" + model }
 
 // key is the row's part of a dimension: its provider's id, its agent, its model.
-func (r Row) key(by string) string {
+func (r *Row) key(by string) string {
 	switch by {
 	case "provider":
 		return r.Provider
@@ -851,6 +916,11 @@ func (r Row) key(by string) string {
 		return r.Agent
 	case "modelAt":
 		return ModelAtKey(r.Provider, r.Model)
+	case "callerKey":
+		if r.CallerKeyID == "" {
+			return NoCallerKey
+		}
+		return r.CallerKeyID
 	case "computer":
 		if r.Computer == "" {
 			return ThisComputer
@@ -865,7 +935,7 @@ func (r Row) key(by string) string {
 // would otherwise build again for each.
 type keyer map[[2]string]string
 
-func (m keyer) key(r Row, by string) string {
+func (m keyer) key(r *Row, by string) string {
 	if by != "modelAt" {
 		return r.key(by)
 	}
@@ -896,7 +966,7 @@ func Breakdown(rows []Row, by string) []Share {
 		if r.IsRejected() {
 			continue
 		}
-		k := keys.key(r, by)
+		k := keys.key(&r, by)
 		s := at[k]
 		if s == nil {
 			s = &Share{ID: k}
@@ -950,6 +1020,18 @@ func (p *Part) add(r Row) {
 			p.DecodeOut += n
 		}
 	}
+}
+
+// plus counts in the part a row whose own sums are d (Totals.addRow): what
+// add counts, read from them.
+func (p *Part) plus(d *Totals) {
+	p.Calls += d.Calls
+	p.Tokens += d.AllTokens()
+	p.Cost += d.Cost
+	p.Timed += d.Timed
+	p.TTFT += d.TTFT
+	p.DecodeMs += d.DecodeMs
+	p.DecodeOut += d.DecodeOut
 }
 
 // SeriesPoint is a point of the timeline with its calls told apart, by each
@@ -1015,7 +1097,7 @@ func ledgerSeriesAt(p Period, rows []Row, now time.Time) (bucket string, pts []S
 		}
 		pts[i].addRow(r)
 		for _, d := range Dimensions {
-			if k := keys.key(r, d); kept[d][k] {
+			if k := keys.key(&r, d); kept[d][k] {
 				part := pts[i].By[d][k]
 				part.add(r)
 				pts[i].By[d][k] = part
@@ -1027,17 +1109,18 @@ func ledgerSeriesAt(p Period, rows []Row, now time.Time) (bucket string, pts []S
 
 // Visit calls fn with each record from since on, as the ledger's index
 // reads usage.jsonl: only its blocks that reach since are decoded.
+// Each record is as it was recorded: a provider renamed since is named
+// by the id it had then, which provider.UsageRenames tells (NewCoster
+// does so itself).
 func Visit(since time.Time, fn func(Record)) { readLogSnapshot().visit(since, fn) }
 
 // NewCoster prices one record at a time at the effective prices the
 // ledger uses, read once: its cost in USD, and false for a call with
 // tokens but no known price.
 func NewCoster() func(Record) (float64, bool) {
-	priceOf, renamed := Pricer(), provider.Renamed()
+	priceOf, renamed := Pricer(), provider.UsageRenames()
 	return func(r Record) (float64, bool) {
-		if id, ok := renamed[r.Provider]; ok {
-			r.Provider = id
-		}
+		r.Provider = renamed.Of(r.Provider, r.Time)
 		var t Totals
 		t.add(r, priceOf(r))
 		return t.Cost, t.Unpriced == 0

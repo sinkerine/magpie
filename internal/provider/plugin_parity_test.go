@@ -48,10 +48,7 @@ func TestMovedProviderModelsArePlugins(t *testing.T) {
 // 0 would make them the cheapest to pick. Whether it takes images is said
 // when the plugin said it.
 func TestPluginCatalogPriceAndImages(t *testing.T) {
-	type cost = struct {
-		Input  float64 `json:"input"`
-		Output float64 `json:"output"`
-	}
+	type cost = plugin.Cost
 	pp := plugin.Provider{ID: "fakeco", Models: []plugin.Model{
 		{ID: "plan", Cost: &cost{}, Image: true, ImageSaid: true},
 		{ID: "priced", Cost: &cost{Input: 1, Output: 2}, ImageSaid: true},

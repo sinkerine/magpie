@@ -66,7 +66,7 @@ func TestCodexRefreshFlushesAuthJSONBeforeReplacingIt(t *testing.T) {
 	// a flush that fails leaves auth.json whole, and the request served
 	path, was := dueCodexAuth(t)
 	steady.Sync = func(*os.File) error { return errors.New("the disk went away") }
-	if tok, _, err := codexToken(context.Background(), path); err != nil || tok == "" {
+	if tok, _, err := codexToken(context.Background(), filepath.Dir(path)); err != nil || tok == "" {
 		t.Fatalf("codexToken: %q, %v", tok, err)
 	}
 	if b, err := os.ReadFile(path); err != nil || string(b) != string(was) {
@@ -91,7 +91,7 @@ func TestCodexRefreshFlushesAuthJSONBeforeReplacingIt(t *testing.T) {
 		flushed = true
 		return f.Sync()
 	}
-	if _, _, err := codexToken(context.Background(), path); err != nil {
+	if _, _, err := codexToken(context.Background(), filepath.Dir(path)); err != nil {
 		t.Fatal(err)
 	}
 	if !flushed {

@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/middleware"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/pluginrt"
@@ -18,7 +20,7 @@ import (
 )
 
 const pluginUsage = `usage: magpie plugin [list] [--json]
-       magpie plugin add <npm | git | path>        install an OpenCode provider plugin, a pi package or a gateway middleware (opencode-gemini-auth, pi-antigravity, github:owner/repo, ./my-plugin.js, ./alias.middleware.js)
+       magpie plugin add <name | npm | git | path> install a community plugin by its name (workbuddy, think-tags, Qoder), an OpenCode provider plugin, a pi package or a gateway hook/middleware (opencode-gemini-auth, pi-antigravity, github:owner/repo, ./my-plugin.js, ./alias.middleware.js, ./recall.hooks.ts); npm:<name> is npm's package of a name a community plugin goes by
        magpie plugin rm <name>                     remove one
        magpie plugin update                        install the newest version of each
        magpie plugin on|off <name>                 turn one on or off
@@ -27,7 +29,6 @@ const pluginUsage = `usage: magpie plugin [list] [--json]
        magpie plugin login <provider> [<method>]   sign in to a provider a plugin adds
        magpie plugin logout <provider>             forget the sign-in
        magpie plugin move|migrate <subscription>   run a built-in subscription's accounts on its community plugin
-       magpie plugin move-back|unmigrate <subscription>   go back to the built-in, with its accounts
        magpie plugin builtin [on|off <id>]         list magpie's built-in plugins (Sessions, Library, routing groups…), or turn one on or off
        magpie plugin preset essentials|all         start the built-in plugins from the Essentials preset, or from all of them
        magpie plugin dump [--json]                 what plugins.yml comes to: each built-in plugin, its config, and the layer each value is from`
@@ -58,6 +59,10 @@ func pluginCmd(args []string) error {
 			return err
 		}
 		fmt.Println(green.Render("✓"), "added", e.Spec)
+		// a community plugin's name (workbuddy, WorkBuddy) stood for it
+		if typed := strings.TrimSpace(rest[0]); !plugin.IsPath(typed) && !plugin.IsGit(typed) && !strings.HasPrefix(typed, "npm:") && plugin.Name(typed) != plugin.Name(e.Spec) {
+			fmt.Println(faint.Render("  " + strconv.Quote(plugin.Name(typed)) + " is magpie's community plugin " + plugin.Name(e.Spec)))
+		}
 		// a deprecated built-in it serves, not signed in to, is its now
 		provider.HandOver(ctx, false)
 		return listPlugins(ctx, false)
@@ -66,14 +71,14 @@ func pluginCmd(args []string) error {
 			return errors.New(pluginUsage)
 		}
 		rest[0] = installedName(rest[0])
-		back := provider.MovedOnto(rest[0])
+		moved := provider.MovedOnto(rest[0])
 		if err := provider.RemovePlugin(ctx, rest[0]); err != nil {
 			return err
 		}
-		for _, id := range back {
-			fmt.Println(green.Render("✓"), id, "is back on its built-in")
-		}
 		fmt.Println(green.Render("✓"), "removed", rest[0])
+		for _, id := range moved {
+			fmt.Println(faint.Render("  " + id + " is off until the plugin is added again; its accounts are kept"))
+		}
 		return nil
 	case "update", "upgrade":
 		if err := plugin.Update(ctx); err != nil {
@@ -87,17 +92,15 @@ func pluginCmd(args []string) error {
 			return errors.New(pluginUsage)
 		}
 		rest[0] = installedName(rest[0])
-		var back []string
-		if sub == "off" {
-			back = provider.MovedOnto(rest[0])
-		}
 		if err := provider.SetPluginOff(ctx, rest[0], sub == "off"); err != nil {
 			return err
 		}
-		for _, id := range back {
-			fmt.Println(green.Render("✓"), id, "is back on its built-in")
-		}
 		fmt.Println(green.Render("✓"), rest[0], "is", sub)
+		if sub == "off" {
+			for _, id := range provider.MovedOnto(rest[0]) {
+				fmt.Println(faint.Render("  " + id + " is off with it; its accounts are kept"))
+			}
+		}
 		return nil
 	case "options", "config":
 		if len(rest) < 1 || len(rest) > 2 {
@@ -149,20 +152,11 @@ func pluginCmd(args []string) error {
 		if err := provider.Move(ctx, rest[0]); err != nil {
 			return fmt.Errorf("%s stays built-in: %w", rest[0], err)
 		}
-		fmt.Println(green.Render("✓"), rest[0], "runs on", provider.MovePackage(rest[0]), muted.Render("(magpie plugin move-back "+rest[0]+" to undo)"))
+		fmt.Println(green.Render("✓"), rest[0], "runs on", provider.MovePackage(rest[0]))
 		return nil
 	case "move-back", "moveback", "unmigrate":
-		if len(rest) != 1 {
-			return errors.New(pluginUsage)
-		}
-		if !provider.Moved(rest[0]) {
-			return fmt.Errorf("%s isn't on its plugin", rest[0])
-		}
-		if err := provider.MoveBack(ctx, rest[0]); err != nil {
-			return err
-		}
-		fmt.Println(green.Render("✓"), rest[0], "is built-in again")
-		return nil
+		// the built-ins are retired: there is no going back to one
+		return errors.New("magpie's built-in subscriptions are retired: their community plugins run them")
 	case "builtin", "builtins", "built-in":
 		return builtinCmd(rest)
 	case "preset":
@@ -201,6 +195,13 @@ func listPlugins(ctx context.Context, asJSON bool) error {
 	clashes := plugin.Clashes(loaded)
 	ps, perr := plugin.Providers(ctx)
 	mws := middleware.States()
+	var pts []plugin.PluginTools
+	for _, p := range loaded {
+		if len(p.Tools) > 0 {
+			pts = append(pts, plugin.PluginTools{Spec: p.Spec, Tools: p.Tools})
+		}
+	}
+	toolNames := gateway.ToolNames(pts)
 	if asJSON {
 		b, _ := json.MarshalIndent(map[string]any{"plugins": l.Plugins, "loaded": loaded, "providers": ps, "middleware": mws}, "", "  ")
 		fmt.Println(string(b))
@@ -226,12 +227,29 @@ func listPlugins(ctx context.Context, asJSON bool) error {
 			what += " " + muted.Render("("+strings.TrimSpace(n+" "+plugin.Installed(e.Spec))+")")
 		}
 		fmt.Printf("%s  %s\n", what, state)
+		if plugin.Gateway(plugin.Target(e.Spec)) != "" {
+			fmt.Println("  " + muted.Render("async gateway hook") + "  onRequest")
+		}
 		// its calls are counted in the gateway's process, not this one
 		if m, ok := mws[e.Spec]; ok && !e.Off {
 			if m.Error != "" {
 				fmt.Printf("  %s  %s\n", muted.Render("gateway middleware"), amber.Render("didn't load: "+m.Error))
 			} else {
-				fmt.Printf("  %s  %s\n", muted.Render("gateway middleware"), strings.Join(m.Hooks, ", "))
+				fmt.Printf("  %s  %s\n", muted.Render("gateway middleware"), mwPoints(m))
+			}
+		}
+		// the tools it gives agents, by their names on the plugin tools
+		// MCP server (the host loads no plugin that is off, so one has
+		// none), and the page it adds to the window
+		if ts := toolsLine(toolNames[e.Spec]); ts != "" {
+			fmt.Printf("  %s  %s\n", muted.Render("tools"), ts)
+		}
+		if w, _ := plugin.Window(plugin.Target(e.Spec)); w != nil {
+			if w.Page != nil {
+				fmt.Printf("  %s  %s\n", muted.Render("page"), pageLine(w, w.Page))
+			}
+			if len(w.Panels) > 0 {
+				fmt.Printf("  %s  %s\n", muted.Render("panels"), panelsLine(w))
 			}
 		}
 		for _, p := range ps {
@@ -284,7 +302,7 @@ func installedName(name string) string {
 		}
 	}
 	for _, x := range ps {
-		if plugin.ShortName(plugin.Name(x.Spec)) == name {
+		if plugin.Called(plugin.Name(x.Spec), name) {
 			return plugin.Name(x.Spec)
 		}
 	}
@@ -307,7 +325,7 @@ func pluginOptions(name string, set []string) error {
 	}
 	// a short name, as the community's READMEs write it
 	for i, x := range ps {
-		if e == nil && plugin.ShortName(plugin.Name(x.Spec)) == name {
+		if e == nil && plugin.Called(plugin.Name(x.Spec), name) {
 			e = &ps[i]
 		}
 	}
@@ -451,9 +469,13 @@ func pluginLogin(ctx context.Context, name, method string) error {
 	ctx = provider.Via(ctx, provider.PluginID(pp.ID))
 	var saved plugin.Saved
 	if pp.Methods[m].Type == "api" {
-		key, err := secret("key", keyPrompt(pp.Name, pp.Methods[m]), false)
-		if err != nil {
-			return err
+		key := ""
+		if !pp.Methods[m].Keyless {
+			var err error
+			key, err = secret("key", keyPrompt(pp.Name, pp.Methods[m]), false)
+			if err != nil {
+				return err
+			}
 		}
 		if saved, err = plugin.APIKey(ctx, pp.ID, m, inputs, key, plugin.NewAccount); err != nil {
 			return err
@@ -466,7 +488,9 @@ func pluginLogin(ctx context.Context, name, method string) error {
 		if a.URL != "" {
 			fmt.Println("Sign in in your browser. If it didn't open, go to:")
 			fmt.Println(faint.Render(a.URL))
-			openInBrowser(a.URL)
+			if !a.Opened {
+				openInBrowser(a.URL)
+			}
 		}
 		if a.Instructions != "" {
 			fmt.Println(a.Instructions)
@@ -511,7 +535,19 @@ func pluginLogin(ctx context.Context, name, method string) error {
 	// magpie, it comes back
 	id := provider.PluginSignedIn(saved)
 	fmt.Println(green.Render("✓"), "signed in to", pp.Name, muted.Render("· its models are "+id+"/<model>"))
+	sayStillOff(id)
 	return nil
+}
+
+// sayStillOff tells, after a sign-in, that the provider it went to is
+// switched off. A sign-in keeps the user's own switch as it was, but
+// "signed in" and then "○ switched off" in magpie providers read as a bug
+// with nothing saying how to turn it on (Atlas, WorkBuddy AI). A provider
+// that can't be found says nothing: not known to be off.
+func sayStillOff(id string) {
+	if p, err := provider.Find(id); err == nil && p.Off {
+		fmt.Println(amber.Render("!"), p.Name, "is switched off in magpie, so agents aren't given its models · turn it on: magpie provider on "+p.ID)
+	}
 }
 
 // keyPrompt asks an "api" method's key: its title, then the hint the
@@ -578,4 +614,62 @@ func askPrompt(q *plugin.Prompt) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(line), nil
+}
+
+// mwPoints is what a gateway module serves, as the Plugins page's mwLine
+// tells it: its hooks, the routings its strategies serve, and whether it
+// has onUsage.
+func mwPoints(m middleware.State) string {
+	var parts []string
+	if len(m.Hooks) > 0 {
+		parts = append(parts, strings.Join(m.Hooks, ", "))
+	}
+	if len(m.Strategies) > 0 {
+		parts = append(parts, "routings "+strings.Join(m.Strategies, ", "))
+	}
+	if m.Usage {
+		parts = append(parts, "onUsage")
+	}
+	return strings.Join(parts, " · ")
+}
+
+// toolsLine is a plugin's tools by their MCP names, sorted.
+func toolsLine(names map[string]string) string {
+	var out []string
+	for _, n := range names {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
+}
+
+// pageLine is a plugin's page: its title, the built-in page it takes the
+// place of, and what it may read of magpie's.
+func pageLine(w *plugin.WindowSpec, pg *plugin.PageSpec) string {
+	s := pg.Title
+	if pg.Replaces != "" {
+		s += " " + muted.Render("in place of "+pg.Replaces)
+	}
+	return s + " " + muted.Render("("+readsText(w.Reads)+")")
+}
+
+// panelsLine is the panels a plugin adds to magpie's own pages: the page
+// each is in, and what they may read of magpie's.
+func panelsLine(w *plugin.WindowSpec) string {
+	var at []string
+	for _, p := range w.Panels {
+		s := p.Slot
+		if p.Title != "" {
+			s = p.Title + " on " + p.Slot
+		}
+		at = append(at, s)
+	}
+	return strings.Join(at, ", ") + " " + muted.Render("("+readsText(w.Reads)+")")
+}
+
+func readsText(reads []string) string {
+	if len(reads) == 0 {
+		return "reads nothing"
+	}
+	return "reads " + strings.Join(reads, ", ")
 }

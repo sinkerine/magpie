@@ -12,7 +12,7 @@ import (
 
 // These connections belong to the trace reader, not the Sessions listing cache.
 // Updates are read in timestamp/ID order in bounded batches; large histories
-// neither hold dbReadMu nor force the entire conversation to be re-exported.
+// neither hold storeMu nor force the entire conversation to be re-exported.
 type ocTraceState struct {
 	messages      map[string]ocTraceMessage
 	order         []string
@@ -47,12 +47,7 @@ func (r *TraceReader) pollOpenCodeDB(path string, bodies bool, budget *int64) ([
 		}
 		files = append(files, ocDBRows(db, fmt.Sprintf(q, "session", where), "opencode", path, ocDB{db}, parent)...)
 	}
-	files = ocRoots(files, parent)
-	// Retain only the latest stores, as for JSONL discovery.
-	sortTraceOCFiles(files)
-	if len(files) > Limit {
-		files = files[:Limit]
-	}
+	files = traceOpenCodeWindow(ocRoots(files, parent))
 	var out []TraceSpan
 	pending := false
 	seen := map[string]bool{}

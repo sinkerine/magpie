@@ -47,14 +47,15 @@ Send `magpie-<your-app-id>` (`Authorization: Bearer magpie-acme`, or
 log and the routing rules that match on agents. Without it, magpie counts
 the call by the first word of your `User-Agent` (`Acme/1.4 (darwin)` is
 `Acme`); an SDK's own User-Agent (`OpenAI/JS …`, `ai-sdk/…`) would count it
-as that SDK. From another computer (Settings → Share on local network) the
+as that SDK. From another computer (Settings → Network and sharing → Share on local network) the
 key must be one of the user's gateway keys, and the User-Agent names your
 app.
 
 **Models.** `GET /v1/models` lists what the user has turned on: `id`
 (`provider/model`, or a routing group's name, which you send as it is),
 `display_name`, `owned_by` (the provider), `reasoning` and
-`supported_reasoning_levels` (`[{"effort":"low"},…]`), `context_window`
+`supported_reasoning_levels` (`[{"effort":"low"},…]`, and the same as
+plain names in `reasoning_levels`), `context_window`
 and `max_output_tokens` when known, `modalities` when magpie knows whether
 it takes images. List them from there rather than shipping a list: the
 user adds and removes providers in magpie. Reasoning is asked in your
@@ -114,9 +115,11 @@ app offers decides its shape:
   `Import` returns the link (`yourapp://provider/import?…` carrying the
   gateway's URL, the key `magpie-<id>` and the endpoints), the row's button
   opens it, and the user says yes once, in your app. `Added` reads,
-  read-only, whether your app has magpie already. magpie writes nothing of
-  yours. This suits an app that keeps its providers in a database or
-  encrypted.
+  read-only, whether your app has magpie already. Leave `Added` nil if your
+  app has no public status reader (as [Lody](../internal/agent/lody.go) does);
+  the row then asks the user to confirm in your app without claiming an
+  import status. magpie writes nothing of yours. This suits an app that keeps
+  its providers in a database or encrypted.
 - **Your app has a local API while it runs** (Alma, at `localhost:23001`):
   magpie adds itself as a provider and sets the default model through it.
 
@@ -138,7 +141,7 @@ kinds ([plugin guide](https://usemagpie.ai/docs/plugins)):
   source of models, such as a subscription magpie doesn't sign in to
   itself. They sign in, list models and make requests.
 - **Gateway middleware**: rewrites requests and replies as they pass
-  (`onRequest`, `onEvent`, `onResponse`).
+  (`onRequest`, `onProvider`, `onEvent`, `onResponse`).
 
 A plugin can't add a row to the Agents page or write another app's
 config, so it is not how an app registers itself.

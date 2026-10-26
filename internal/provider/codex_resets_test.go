@@ -48,7 +48,7 @@ func fakeCodexResets(t *testing.T, count int, details any) *atomic.Int32 {
 
 func TestCodexResetsCounted(t *testing.T) {
 	home := signIn(t)
-	auth := home + "/.codex/auth.json"
+	dir := home + "/.codex"
 	soon := "2026-10-03T14:30:00Z"
 	later := "2026-11-01T00:00:00Z"
 	for _, c := range []struct {
@@ -82,7 +82,7 @@ func TestCodexResetsCounted(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			asked := fakeCodexResets(t, c.count, c.details)
-			q := codexSubscriptionUsage(context.Background(), auth)
+			q := codexSubscriptionUsage(context.Background(), dir)
 			if q.Error != "" || len(q.Windows) != 1 {
 				t.Fatalf("quota %+v", q)
 			}
@@ -216,9 +216,17 @@ func TestUseCodexReset(t *testing.T) {
 	if _, err := UseCodexReset(context.Background(), "nobody@example.com"); err == nil || consumed.Load() != 0 {
 		t.Fatalf("spent on an unknown account: %v", err)
 	}
+	// the menu bar hears the windows started again, and reads them at
+	// once rather than at its next tick (#2357)
+	var told atomic.Int32
+	OnSubscriptionUsage(func() { told.Add(1) })
+	t.Cleanup(func() { OnSubscriptionUsage(nil) })
 	out, err := UseCodexReset(context.Background(), "me@example.com")
 	if err != nil || out.Code != "reset" || out.Windows != 2 || consumed.Load() != 1 {
 		t.Fatalf("%+v %v", out, err)
+	}
+	if told.Load() == 0 {
+		t.Fatal("a reset spent didn't tell the menu bar")
 	}
 	if got := spent.Load(); got != "soon" {
 		t.Fatalf("spent %v, not the one that runs out first", got)

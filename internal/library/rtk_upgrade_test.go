@@ -306,3 +306,34 @@ func TestRTKChannelVersion(t *testing.T) {
 		}
 	}
 }
+
+// An rtk cargo put in ~/.cargo/bin is upgraded with cargo, naming the
+// package: rtk-ai/rtk has rtk-proxy beside rtk, and cargo install --git
+// refuses to choose between them (#2328, #2092). The fake cargo answers as
+// cargo does.
+func TestRTKUpgradeCargoNamesThePackage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fakes are shell scripts")
+	}
+	h := sandbox(t)
+	latestServer(t, "v0.50.0")
+	dir := filepath.Join(h, ".cargo", "bin")
+	testenv.Program(t, filepath.Join(dir, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION")))
+	write(t, filepath.Join(dir, "VERSION"), "0.40.1")
+	testenv.Program(t, filepath.Join(dir, "cargo"), `#!/bin/sh
+[ "$1 $2 $3" = "install --git https://github.com/rtk-ai/rtk" ] || exit 2
+case " $* " in
+*" rtk "*) echo 0.50.0 > "`+filepath.Join(dir, "VERSION")+`" ;;
+*) echo "error: multiple packages with binaries found: rtk, rtk-proxy." >&2; exit 101 ;;
+esac
+`)
+	t.Setenv("PATH", dir)
+
+	v := ReadRTK()
+	if v.Path != filepath.Join(dir, "rtk") || !strings.HasPrefix(v.Upgrade, "cargo install") {
+		t.Fatalf("view: %+v", v)
+	}
+	if v, err := UpgradeRTK(); err != nil || v.Version != "0.50.0" {
+		t.Fatalf("after: %+v, %v", v, err)
+	}
+}

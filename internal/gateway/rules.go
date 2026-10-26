@@ -25,8 +25,11 @@ var ruleClock = time.Now
 
 // RuleHit is what the trace tells of a group's rules for a request.
 type RuleHit struct {
-	N    int      `json:"n"`             // the rule, from 1; 0 when none matched
-	Use  string   `json:"use,omitempty"` // the member it puts first
+	N   int    `json:"n"`             // the rule, from 1; 0 when none matched
+	Use string `json:"use,omitempty"` // the member it puts first
+	// More: the members the rule names after Use (provider.Rule.More), in
+	// order: they go next, before Then
+	More []string `json:"more,omitempty"`
 	When []string `json:"when,omitempty"`
 	Held bool     `json:"held,omitempty"` // decided when the turn began
 	// Waits: the turn began before magpie saw it (or its rule was changed
@@ -69,6 +72,12 @@ type RuleHit struct {
 	Small   []string `json:"small,omitempty"`
 	// Bare: the group has no rules, only its effort picked
 	Bare bool `json:"bare,omitempty"`
+	// UseEffort: the reasoning the rule asks the member it names for
+	// (provider.Rule.UseEffort, #2633), in place of the agent's
+	UseEffort string `json:"useEffort,omitempty"`
+	// members are the models of the member the rule names, as the group
+	// whose rule it is has them (ruleOver): who UseEffort is for
+	members []provider.Member
 }
 
 // Classified is what the classifier was asked as a turn began, and said.
@@ -105,6 +114,9 @@ type turnRule struct {
 	// cache of it is read from then (ruleAnswered)
 	answered time.Time
 	size     int // how long magpie took the conversation's last request to be (estimate)
+	// hour is what the vendor said it keeps of the conversation for an
+	// hour (Anthropic's 1-hour cache writes), warm past cacheCold (#2302)
+	hour hourCache
 }
 
 var turnRules = struct {
@@ -191,7 +203,10 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		// whatever put a member first, the rules after it that match too
 		// say who comes next
 		if hit != nil && hit.Use != "" && hit.N >= 1 {
-			hit.Then = provider.ThenUses(g.Rules, q, hit.N, hit.Use)
+			hit.Then = provider.ThenUses(g.Rules, q, hit.N, hit.uses())
+			if hit.N <= len(g.Rules) {
+				hit.UseEffort = g.Rules[hit.N-1].UseEffort // and how hard it asks it to think
+			}
 		}
 	}()
 	if hit.Effort == "" && q.Thinking {
@@ -208,11 +223,22 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 			if !r.Matches(q) {
 				continue
 			}
-			if c := ctx[r.Use]; c > 0 && c < q.Tokens {
-				hit.Small = append(hit.Small, r.Use)
+			// of the models the rule names, those that take it, in order
+			var fit []string
+			for _, u := range r.Uses() {
+				if c := ctx[u]; c > 0 && c < q.Tokens {
+					hit.Small = append(hit.Small, u)
+					continue
+				}
+				fit = append(fit, u)
+			}
+			if len(fit) == 0 {
 				continue
 			}
-			hit.N, hit.Use, hit.When = i+1, r.Use, r.Conditions()
+			hit.N, hit.Use, hit.When = i+1, fit[0], r.Conditions()
+			if len(fit) > 1 {
+				hit.More = fit[1:]
+			}
 			break
 		}
 		return hit
@@ -232,7 +258,7 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		case tr.use == "":
 			hit.Held = true
 		case tr.n >= 1 && tr.n <= len(g.Rules) && g.Rules[tr.n-1].Use == tr.use:
-			hit.Held, hit.N, hit.Use, hit.When = true, tr.n, tr.use, g.Rules[tr.n-1].Conditions()
+			hit.Held, hit.N, hit.Use, hit.More, hit.When = true, tr.n, tr.use, g.Rules[tr.n-1].More, g.Rules[tr.n-1].Conditions()
 		default:
 			hit.Waits = true
 		}
@@ -241,7 +267,7 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		}
 		if grown, ok := outgrown(g, ctx, hit, q); ok {
 			hit = grown
-			turnRules.m[key] = turnRule{turn: turn, use: hit.Use, n: hit.N, at: now, input: tr.input, intent: q.Intent, effort: tr.effort, wanted: tr.wanted, answered: tr.answered, size: size}
+			turnRules.m[key] = turnRule{turn: turn, use: hit.Use, n: hit.N, at: now, input: tr.input, intent: q.Intent, effort: tr.effort, wanted: tr.wanted, answered: tr.answered, size: size, hour: tr.hour}
 			return hit
 		}
 		if had {
@@ -270,6 +296,9 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 			c.AfterEffort = tr.effort
 		}
 		text := userText(req)
+		// what was said before it, for a follow-up that says little of
+		// its own (@HirotaNagai on X): from the same parsed, masked request
+		prev.User, prev.Reply = turnBefore(req)
 		switch {
 		case g.Classifier == "":
 			c.Error = "the group has no classifier"
@@ -305,15 +334,15 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		}
 	}
 	if i := provider.MatchRule(g.Rules, q); i >= 0 {
-		hit.N, hit.Use, hit.When = i+1, g.Rules[i].Use, g.Rules[i].Conditions()
+		hit.N, hit.Use, hit.More, hit.When = i+1, g.Rules[i].Use, g.Rules[i].More, g.Rules[i].Conditions()
 	}
 	turnRules.Lock()
 	defer turnRules.Unlock()
-	input, answered := tr.input, tr.answered
+	input, answered, hour := tr.input, tr.answered, tr.hour
 	if cur, ok := turnRules.m[key]; ok {
-		input, answered = cur.input, cur.answered // answered while the classifier was asked
+		input, answered, hour = cur.input, cur.answered, cur.hour // answered while the classifier was asked
 	}
-	turnRules.m[key] = turnRule{turn: turn, use: hit.Use, n: hit.N, at: now, input: input, intent: q.Intent, effort: hit.Pick, wanted: hit.Wanted, answered: answered, size: size}
+	turnRules.m[key] = turnRule{turn: turn, use: hit.Use, n: hit.N, at: now, input: input, intent: q.Intent, effort: hit.Pick, wanted: hit.Wanted, answered: answered, size: size, hour: hour}
 	if len(turnRules.m) > 4096 {
 		for k, tr := range turnRules.m {
 			if now.Sub(tr.at) > stickKeep {
@@ -348,7 +377,7 @@ func outgrown(g provider.Group, ctx map[string]int, held *RuleHit, q provider.Ru
 	}
 	out := *held
 	out.Held, out.Waits, out.Grown = false, false, true
-	out.N, out.Use, out.When = i+1, g.Rules[i].Use, g.Rules[i].Conditions()
+	out.N, out.Use, out.More, out.When = i+1, g.Rules[i].Use, g.Rules[i].More, g.Rules[i].Conditions()
 	return &out, true
 }
 
@@ -360,8 +389,11 @@ func memberContexts(ms []provider.Member) map[string]int {
 	for _, m := range ms {
 		for _, e := range cat {
 			if e.Group == "" && e.Provider.ID == m.Provider.ID && e.Model == m.Model {
-				if c, ok := out[m.ID]; !ok || e.Context > 0 && (c == 0 || e.Context < c) {
-					out[m.ID] = e.Context
+				// a later group in the group that has it too (#2361)
+				for _, id := range append([]string{m.ID}, alsoIDs(m)...) {
+					if c, ok := out[id]; !ok || e.Context > 0 && (c == 0 || e.Context < c) {
+						out[id] = e.Context
+					}
 				}
 				// a model the group names that a group in it has too (named)
 				if n := len(m.Path); n > 1 {
@@ -376,6 +408,15 @@ func memberContexts(ms []provider.Member) map[string]int {
 	return out
 }
 
+// alsoIDs are the group's member ids of m's other places (Also).
+func alsoIDs(m provider.Member) []string {
+	var out []string
+	for _, o := range m.Also {
+		out = append(out, o.ID)
+	}
+	return out
+}
+
 // ruleAnswered keeps what the vendor counted a conversation's request as,
 // for its next turn's rules to go by.
 func ruleAnswered(key string, u Usage) {
@@ -386,7 +427,8 @@ func ruleAnswered(key string, u Usage) {
 	turnRules.Lock()
 	defer turnRules.Unlock()
 	if tr, ok := turnRules.m[key]; ok {
-		tr.input, tr.answered = n, ruleClock()
+		now := ruleClock()
+		tr.input, tr.answered, tr.hour = n, now, tr.hour.after(u, now)
 		turnRules.m[key] = tr
 	}
 }
@@ -400,8 +442,10 @@ func ruleAnswered(key string, u Usage) {
 // while the cache is warm the effort only goes up — a hard turn still gets
 // the reasoning it needs, and a conversation pays for at most one miss per
 // level — and a lower pick waits for a turn the cache is lost to anyway:
-// one after cacheCold without an answer, or after the agent compacted the
-// conversation (it is now under half as long as its last request).
+// one after cacheCold without an answer (an hour, where the vendor said it
+// keeps the conversation that long: tr.hour, #2302), or after the agent
+// compacted the conversation (it is now under half as long as its last
+// request).
 func keepsEffort(tr turnRule, pick string, tokens int, now time.Time) bool {
 	if tr.effort == "" || pick == "" || pick == tr.effort {
 		return false
@@ -413,7 +457,7 @@ func keepsEffort(tr turnRule, pick string, tokens int, now time.Time) bool {
 	if tr.answered.After(last) {
 		last = tr.answered
 	}
-	if now.Sub(last) > cacheCold {
+	if now.Sub(last) > cacheCold && !tr.hour.warm(now) {
 		return false
 	}
 	if tr.size > 0 && tokens < tr.size/2 {
@@ -455,6 +499,10 @@ func (s *Server) nestedRules(at string, req *Request, agent string, ask classifi
 			continue
 		}
 		cands, pl = ruleOver(h, subMs, cands, pl, aff)
+		if led := ruleLed(h, subMs, cands); strings.HasPrefix(led, provider.GroupPrefix) {
+			// further down, the way the group it chose has its models
+			ms = homed(ms, append(slices.Clone(lead.Path[:depth+1]), led))
+		}
 	}
 	return out, keys, cands, pl
 }
@@ -463,46 +511,44 @@ func (s *Server) nestedRules(at string, req *Request, agent string, ask classifi
 // the models of the group in the group it is. A model the group names
 // itself that a group in it, ahead of it, names too is kept where it was
 // met first (provider's membersIn), in that group, and a rule naming it
-// is still its (#625).
+// is still its (#625); so is a model two groups in the group share, for a
+// rule naming the later one (#2361).
 func named(m provider.Member, id string) bool {
-	return m.ID == id || !strings.HasPrefix(id, provider.GroupPrefix) && len(m.Path) > 1 && m.Path[len(m.Path)-1] == id
+	_, ok := m.In(id)
+	return ok
 }
 
-// ruleMembers are the models of the member a rule names, among those
-// ready now: the model, or a group in the group's.
-func ruleMembers(hit *RuleHit, ms []provider.Member) []provider.Member {
-	if hit == nil || hit.Use == "" {
-		return nil
-	}
+// membersNamed are the models of the group's member id among ms, each as
+// that member has it and in its own order: a group in the group that
+// shares models with one ahead of it has them in its order, not the
+// other's (#2361).
+func membersNamed(id string, ms []provider.Member) []provider.Member {
 	var out []provider.Member
 	for _, m := range ms {
-		if named(m, hit.Use) {
-			out = append(out, m)
+		if o, ok := m.In(id); ok {
+			out = append(out, o)
 		}
 	}
+	slices.SortStableFunc(out, func(a, b provider.Member) int { return a.At - b.At })
 	return out
 }
 
-// modelRuled reports whether the one going first is a model the group's
-// rule names itself: one a group in the group has too goes there, and that
-// group's rules don't pick another over it (#625).
-func modelRuled(hit *RuleHit, ms []provider.Member, cs []candidate) bool {
-	if hit == nil || strings.HasPrefix(hit.Use, provider.GroupPrefix) || len(cs) == 0 {
-		return false
+// uses are the members the rule names, in order: Use, then More.
+func (h *RuleHit) uses() []string {
+	if h == nil || h.Use == "" {
+		return nil
 	}
-	return slices.ContainsFunc(ruleMembers(hit, ms), func(m provider.Member) bool { return ofMember(cs[0], m) })
+	return append([]string{h.Use}, h.More...)
 }
 
-// ruleOrder is who a rule's request goes to before the group's others:
-// the member it names, then those the rules after it that match too name.
-func ruleOrder(hit *RuleHit, ms []provider.Member) []provider.Member {
-	out := ruleMembers(hit, ms)
-	if hit == nil || hit.Use == "" {
-		return out
-	}
-	for _, id := range hit.Then {
-		for _, m := range ms {
-			if named(m, id) {
+// ruleMembers are the models of the members a rule names, among those
+// ready now, in the rule's order: each a model, or a group in the group's.
+// A model two of them have is the first's.
+func ruleMembers(hit *RuleHit, ms []provider.Member) []provider.Member {
+	var out []provider.Member
+	for _, id := range hit.uses() {
+		for _, m := range membersNamed(id, ms) {
+			if !slices.ContainsFunc(out, func(o provider.Member) bool { return o.At == m.At }) {
 				out = append(out, m)
 			}
 		}
@@ -510,16 +556,105 @@ func ruleOrder(hit *RuleHit, ms []provider.Member) []provider.Member {
 	return out
 }
 
+// ruleLed is the member of the rule's (Use or one of More) the one going
+// first is of: Use when it is none of them.
+func ruleLed(hit *RuleHit, ms []provider.Member, cs []candidate) string {
+	if hit == nil || len(cs) == 0 {
+		return ""
+	}
+	for _, id := range hit.uses() {
+		if slices.ContainsFunc(membersNamed(id, ms), func(m provider.Member) bool { return ofMember(cs[0], m) }) {
+			return id
+		}
+	}
+	return hit.Use
+}
+
+// homeAt are the places (At) of the rule's models met first in the
+// members it names, not shared with a group ahead of them: only those
+// were planned in that member's own routing (#2407, #2361).
+func homeAt(hit *RuleHit, ms []provider.Member) map[int]bool {
+	out := map[int]bool{}
+	uses := hit.uses()
+	for _, m := range ms {
+		if slices.Contains(uses, m.ID) {
+			out[m.At] = true
+		}
+	}
+	return out
+}
+
+// homed is ms with each model that has a place under path (the group's
+// member ids from the top) as that place has it, in the walk's order:
+// the groups in a group a rule chose decide among its models with their
+// own rules, its own order and the way down it has them (#2361).
+func homed(ms []provider.Member, path []string) []provider.Member {
+	out := make([]provider.Member, len(ms))
+	for i, m := range ms {
+		out[i] = m
+		if o, ok := m.Homed(path); ok {
+			out[i] = o
+		}
+	}
+	slices.SortStableFunc(out, func(a, b provider.Member) int { return a.At - b.At })
+	return out
+}
+
+// modelRuled reports whether the one going first is a model the group's
+// rule names itself: one a group in the group has too goes there, and that
+// group's rules don't pick another over it (#625).
+func modelRuled(hit *RuleHit, ms []provider.Member, cs []candidate) bool {
+	if hit == nil || len(cs) == 0 {
+		return false
+	}
+	led := ruleLed(hit, ms, cs)
+	if led == "" || strings.HasPrefix(led, provider.GroupPrefix) {
+		return false
+	}
+	return slices.ContainsFunc(membersNamed(led, ms), func(m provider.Member) bool { return ofMember(cs[0], m) })
+}
+
+// ruleOrder is who a rule's request goes to before the group's others:
+// the members it names, in order, then those the rules after it that
+// match too name.
+func ruleOrder(hit *RuleHit, ms []provider.Member) []provider.Member {
+	out := ruleMembers(hit, ms)
+	if hit == nil || hit.Use == "" {
+		return out
+	}
+	for _, id := range hit.Then {
+		out = append(out, membersNamed(id, ms)...)
+	}
+	return out
+}
+
 // ruleFirst puts first the keys or accounts of the members in ms that
 // aren't resting, a member's before the next's and each's in the order
-// they had; everyone else follows as they were, to fail over to. lead is
-// the one in ms whose goes first, -1 when none is ready.
-func ruleFirst(ms []provider.Member, cs []candidate, pl planned) (out []candidate, _ planned, lead int) {
+// they had; everyone else follows as they were, to fail over to. own is
+// how many of ms are the rule's own members, ahead of the rules after
+// it's. lead is the one in ms whose goes first, -1 when none is ready.
+func ruleFirst(ms []provider.Member, cs []candidate, pl planned, own int, home map[int]bool) (out []candidate, _ planned, lead int) {
 	rank := func(i int) int {
 		if pl.order[i].Rest != nil {
 			return -1
 		}
-		return slices.IndexFunc(ms, func(m provider.Member) bool { return ofMember(cs[i], m) })
+		at := slices.IndexFunc(ms, func(m provider.Member) bool { return ofMember(cs[i], m) })
+		if at < 0 || at >= own {
+			return at
+		}
+		// the group in the group the rule names is one member here: its
+		// models rank as the group's block, in the order the group's own
+		// routing planned them, not the group's listed order — ranked
+		// apart, a rotate group in the group was pinned to its first
+		// member on every request the rule put it first (#2407). A model
+		// it shares with a group ahead of it was planned in that group's
+		// order, so it keeps its rank in the named group's (#2361).
+		if len(ms[at].Path) > 1 && home[ms[at].At] {
+			if first := slices.IndexFunc(ms[:own], func(m provider.Member) bool { return m.ID == ms[at].ID && home[m.At] }); first >= 0 {
+				return first
+			}
+		}
+		return at
 	}
 	idx := make([]int, len(cs))
 	for i := range idx {
@@ -559,21 +694,23 @@ func ruleFirst(ms []provider.Member, cs []candidate, pl planned) (out []candidat
 // going outside it. One kept outside it, which took over when it failed,
 // isn't held there: the turn goes back to the rule's member once one of it
 // is ready again, its rest over.
-func ruleOver(hit *RuleHit, ms []provider.Member, cs []candidate, pl planned, aff *Affinity) ([]candidate, planned) {
+func ruleOver(hit *RuleHit, ms []provider.Member, cs []candidate, pl planned, aff *Affinity) (out []candidate, _ planned) {
+	defer func() { homeCands(out, ruleMembers(hit, ms)) }()
+	if hit.UseEffort != "" {
+		hit.members = ruleMembers(hit, ms)
+	}
 	kept := aff != nil && aff.Kept
 	if hit.Held && kept && len(cs) > 1 {
 		ordered := ruleOrder(hit, ms)
-		place := func(i int) int { // which of the rule's members cs[i] is of: 0 its own, then the Then's
+		ids := append(hit.uses(), hit.Then...)
+		place := func(i int) int { // which of the rule's members cs[i] is of: Use 0, then More's, then the Then's
 			for _, m := range ordered {
 				if !ofMember(cs[i], m) {
 					continue
 				}
-				if named(m, hit.Use) {
-					return 0
-				}
-				for j, id := range hit.Then {
+				for j, id := range ids {
 					if named(m, id) {
-						return j + 1
+						return j
 					}
 				}
 			}
@@ -589,13 +726,14 @@ func ruleOver(hit *RuleHit, ms []provider.Member, cs []candidate, pl planned, af
 			// it stays: the rule's members after it, then the group's
 			sub := pl
 			sub.order = pl.order[1:]
-			rest, sub, _ := ruleFirst(ordered, cs[1:], sub)
+			rest, sub, _ := ruleFirst(ordered, cs[1:], sub, len(ruleMembers(hit, ms)), homeAt(hit, ms))
 			cs = append([]candidate{cs[0]}, rest...)
 			pl.order = append([]Weighed{pl.order[0]}, sub.order...)
 			if p >= 0 {
-				hit.Unready = p > 0
+				// one of More is the rule's own: ready, though not Use
+				hit.Unready = p > len(hit.More)
 				if p > 0 {
-					hit.Instead = hit.Then[p-1]
+					hit.Instead = ids[p]
 				}
 			}
 			return cs, pl
@@ -609,20 +747,59 @@ func ruleOver(hit *RuleHit, ms []provider.Member, cs []candidate, pl planned, af
 	return cs, pl
 }
 
+// ruleEffort is the reasoning a rule asks its member for (#2633), when c
+// is one of that member's keys or accounts — the outermost group's rule
+// that names one, as the turn's pick is the outermost group's — fitted to
+// the levels c's model has. A model whose levels aren't known is asked as
+// it would be without the rule: magpie can't tell it thinks. "" for none.
+// A rule after it that only fails over (Then) asks nothing of its member.
+func ruleEffort(c candidate, hit *RuleHit, nested []NestedRule) string {
+	hits := []*RuleHit{hit}
+	for _, n := range nested {
+		hits = append(hits, n.Rule)
+	}
+	for _, h := range hits {
+		if h == nil || h.UseEffort == "" || !slices.ContainsFunc(h.members, func(m provider.Member) bool { return ofMember(c, m) }) {
+			continue
+		}
+		levels := c.p.Efforts(c.model)
+		if len(levels) == 0 {
+			return ""
+		}
+		return fitLevel(h.UseEffort, levels)
+	}
+	return ""
+}
+
+// homeCands sends the keys or accounts of the rule's members as the
+// member the rule names has them: fast, and its first token's wait, where
+// a group ahead of it has the same model too (#2361).
+func homeCands(cs []candidate, ms []provider.Member) {
+	for i := range cs {
+		if j := slices.IndexFunc(ms, func(m provider.Member) bool { return ofMember(cs[i], m) }); j >= 0 {
+			cs[i].fast, cs[i].firstToken = ms[j].Fast, innerFirstToken(ms[j])
+		}
+	}
+}
+
 // applyRule puts a rule's members first (ruleOrder) and says in the hit
-// whether the one it names leads; it reports whether any of them was ready.
+// whether the one it names first leads, and who does when it doesn't; it
+// reports whether any of them was ready.
 func applyRule(hit *RuleHit, ms []provider.Member, cs []candidate, pl planned) ([]candidate, planned, bool) {
 	ordered := ruleOrder(hit, ms)
+	own := len(ruleMembers(hit, ms))
 	lead := -1
 	if len(ordered) > 0 && len(cs) > 0 {
-		cs, pl, lead = ruleFirst(ordered, cs, pl)
+		cs, pl, lead = ruleFirst(ordered, cs, pl, own, homeAt(hit, ms))
 	}
-	// ordered has the rule's own first, then those of the rules after it
-	hit.Unready = lead < 0 || lead >= len(ruleMembers(hit, ms))
-	if lead >= 0 && hit.Unready {
+	// ordered has the rule's own first (Use's, then More's), then those
+	// of the rules after it
+	hit.Unready = lead < 0 || lead >= own
+	if lead >= 0 && !named(ordered[lead], hit.Use) {
+		next := append(slices.Clone(hit.More), hit.Then...)
 		hit.Instead = ordered[lead].ID
-		if i := slices.IndexFunc(hit.Then, func(id string) bool { return named(ordered[lead], id) }); i >= 0 {
-			hit.Instead = hit.Then[i]
+		if i := slices.IndexFunc(next, func(id string) bool { return named(ordered[lead], id) }); i >= 0 {
+			hit.Instead = next[i]
 		}
 	}
 	return cs, pl, lead >= 0

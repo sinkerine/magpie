@@ -93,3 +93,54 @@ func TestGroupFailsOverASchemaTooDeep(t *testing.T) {
 		t.Fatalf("tries %+v", r.Tries)
 	}
 }
+
+// commandCodeBare400 is Command Code's Provider API turning a request away
+// with nothing but its trace id, as lqisgod's usage.jsonl has it (#2313).
+const commandCodeBare400 = `{"message":"invalid request error trace_id: 251c3c29761c17fdc459480ed9c68932","type":"invalid_request_error"}`
+
+// Command Code's bare 400 is its backend's, not the request's: the same
+// bytes sent again answer 200 (CommandCodeAI/command-code#960). The
+// group's next member is asked and Command Code doesn't rest; before, the
+// route ended on it with the later members never asked (#2313).
+func TestGroupFailsOverCommandCodesBare400(t *testing.T) {
+	fresh(t)
+	a := &scripted{replies: []reply{{400, "", commandCodeBare400}}}
+	b := &scripted{replies: []reply{{200, "text/event-stream", chatStreamOK}}}
+	scriptedOn(t, "commandcode", provider.Chat, a)
+	scriptedOn(t, "b", provider.Chat, b)
+	if err := provider.SaveGroup(provider.Group{Name: "G", Members: []string{"commandcode/m", "b/m"}, Routing: provider.Ordered}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	code, body := postAs(t, s, "", `{"model":"group/g","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if code != 200 || !strings.Contains(body, "from b") || a.n != 1 || b.n != 1 {
+		t.Fatalf("%d %s (a %d, b %d)", code, body, a.n, b.n)
+	}
+	r := s.trace.routes[len(s.trace.routes)-1]
+	if len(r.Tries) != 2 || r.Tries[0].Status != 400 || r.Tries[0].Fail != failShape || r.Tries[0].Rest != nil {
+		t.Fatalf("tries %+v", r.Tries)
+	}
+
+	for _, x := range []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{400, commandCodeBare400, true},
+		{400, `Command Code: ` + commandCodeBare400, true},
+		// as a client behind Command Code saw it, wrapped, and its 422
+		// of the week before (CommandCodeAI/command-code#952)
+		{400, `{"message":"{\"message\":\"invalid request error trace_id: a050673b3298a747a15895803095bcf0\",\"type\":\"invalid_request_error\"}\n","type":"invalid_request_error"}`, true},
+		{422, `{"message":"{\"message\":\"invalid request error trace_id: f9965636e3da815215348ef4ddf2ae63\",\"type\":\"invalid_request_error\"}\n","type":"server_error"}`, true},
+		// its overflow, and a parameter it names, are the request's
+		{400, `{"message":"The input is longer than the model's context length trace_id: e811a6f10da868000cc12a043c07a73b","type":"invalid_request_error"}`, false},
+		{400, `{"error":{"message":"Invalid option: expected one of \"low\"|\"medium\"|\"high\"|\"xhigh\"|\"max\"","type":"invalid_request_error","param":"reasoning_effort"}}`, false},
+		// a message that says more after its trace id
+		{400, `{"message":"invalid request error trace_id: 251c3c29761c17fdc459480ed9c68932: messages.3.content too long","type":"invalid_request_error"}`, false},
+		{200, commandCodeBare400, false},
+	} {
+		if got := shapeRefused(x.status, []byte(x.body)); got != x.want {
+			t.Errorf("shapeRefused(%d, %s) = %v", x.status, x.body, got)
+		}
+	}
+}

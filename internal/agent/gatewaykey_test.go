@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -217,17 +218,19 @@ func TestPinnedGatewayKeyForEveryWriter(t *testing.T) {
 			agy = m[1]
 		}
 		return map[string]string{
-			"agy":       agy,
-			"alma":      almaKey(),
-			"cindy":     cindy.Auth.APIKey,
-			"copilotjb": jbKey,
-			"cursor":    cursorLocalEnv(gw)[cursorLocalVars[1]],
-			"hanako":    hanakoProvider().APIKey,
-			"pencil":    pencilProviderJSON(gw)["apiKey"].(string),
-			"vscode":    vscodeStable.token(),
-			"vscodium":  vscodiumKind.token(),
-			"workbuddy": buddyModel("codebuddy", "m", "m", 0, 0, false, nil)["apiKey"].(string),
-			"zcode":     zc,
+			"agy":        agy,
+			"aionui":     aionuiKey(AionUiLink(gw)),
+			"alma":       almaKey(),
+			"cindy":      cindy.Auth.APIKey,
+			"copilotjb":  jbKey,
+			"cursor":     cursorLocalEnv(gw)[cursorLocalVars[1]],
+			"hanako":     hanakoProvider().APIKey,
+			"openpencil": openPencilEntry(gw).APIKey,
+			"pencil":     pencilProviderJSON(gw)["apiKey"].(string),
+			"vscode":     vscodeStable.token(),
+			"vscodium":   vscodiumKind.token(),
+			"workbuddy":  buddyModel("codebuddy", "m", "m", 0, 0, false, nil)["apiKey"].(string),
+			"zcode":      zc,
 		}
 	}
 	plain := keys()
@@ -247,4 +250,10 @@ func TestPinnedGatewayKeyForEveryWriter(t *testing.T) {
 			t.Errorf("%s with nothing shared: key %q, want magpie's own", agent, plain[agent])
 		}
 	}
+}
+
+// aionuiKey is the api_key AionUi's link hands it.
+func aionuiKey(link string) string {
+	v, _ := url.ParseQuery(strings.TrimPrefix(link, AionUiScheme))
+	return v.Get("api_key")
 }

@@ -58,6 +58,10 @@ type QuotaPoint struct {
 	ResetsAt *time.Time `json:"resetsAt,omitempty"`
 }
 
+// StartsCycleAfter uses the same observed reset boundaries that history
+// sampling preserves, including refills with an unchanged deadline.
+func (p QuotaPoint) StartsCycleAfter(previous QuotaPoint) bool { return newCycle(previous, p) }
+
 // QuotaLine is one window's points, oldest first.
 type QuotaLine struct {
 	Name   string       `json:"name"`

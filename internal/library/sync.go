@@ -21,6 +21,9 @@ type Result struct {
 	// fetched again and the ones that couldn't be (What is skill:<name>)
 	Updated   []string  `json:"updated,omitempty"`
 	Unupdated []Problem `json:"unupdated,omitempty"`
+	// Gone are, for an update of skills, the ones their sources no longer
+	// have: removed there, not failed (skill_gone.go)
+	Gone []string `json:"gone,omitempty"`
 	// Unimported are, for skills brought in together, the ones that
 	// couldn't be (What is skill:<name>)
 	Unimported []Problem `json:"unimported,omitempty"`
@@ -63,7 +66,8 @@ func (l *Library) sync() *Result {
 	if b == nil {
 		b = newBackups()
 	}
-	for _, step := range syncSteps(Targets(), b, res) {
+	all := Targets()
+	for _, step := range syncSteps(all, l.held(all), b, res) {
 		step(l)
 	}
 	res.Backup = b.dir
@@ -73,19 +77,30 @@ func (l *Library) sync() *Result {
 	return res
 }
 
-// syncSteps are what a sync does, one agent's part at a time, in order.
-func syncSteps(all []*Target, b *backups, res *Result) []func(*Library) {
+// syncSteps are what a sync does, one agent's part at a time, in order. The
+// agents gone from here that still have what magpie gave them (held) only
+// have what was unticked taken out, after the rest.
+func syncSteps(all, gone []*Target, b *backups, res *Result) []func(*Library) {
 	var steps []func(*Library)
 	for _, t := range all {
 		steps = append(steps, func(l *Library) {
 			l.syncInstructions(t, b, res)
 			l.syncMCP(t, b, res)
 			l.syncHooks(t, b, res)
+			l.syncSubagents(t, b, res)
 		})
 	}
 	// an edit made in an agent's copy of a skill goes to the library first,
-	// for the others to get rather than be undone (takeEdits)
-	steps = append(steps, func(l *Library) { l.takeEdits(all, res) })
+	// for the others to get rather than be undone (takeEdits); one in a
+	// gone agent's copy too, before that copy is taken out
+	steps = append(steps, func(l *Library) { l.takeEdits(append(slices.Clone(all), gone...), res) })
+	for _, t := range gone {
+		steps = append(steps, func(l *Library) {
+			l.syncMCP(t, b, res)
+			l.syncHooks(t, b, res)
+			l.syncSkills(t, res, all)
+		})
+	}
 	// ~/.agents/skills first: an agent that reads it too gets no second
 	// link to what is there already
 	shared := realDir(sharedSkillsDir())
@@ -113,7 +128,7 @@ func syncSteps(all []*Target, b *backups, res *Result) []func(*Library) {
 func Sync() (*Result, error) {
 	res := &Result{Changed: []string{}, Problems: []Problem{}}
 	b := newBackups()
-	var all []*Target
+	var all, gone []*Target
 	// what the step before learnt of the skills (hashes, copies found
 	// untouched), kept while nothing else held the lock between
 	var memo *Library
@@ -136,10 +151,10 @@ func Sync() (*Result, error) {
 		return nil
 	}
 	// the agents are found under the lock, as a change finds them
-	if err := step(func(*Library) { all = Targets() }); err != nil {
+	if err := step(func(l *Library) { all = Targets(); gone = l.held(all) }); err != nil {
 		return nil, err
 	}
-	for _, f := range syncSteps(all, b, res) {
+	for _, f := range syncSteps(all, gone, b, res) {
 		if err := step(f); err != nil {
 			return nil, err
 		}
@@ -161,11 +176,12 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 	a := l.applied(id)
 	// an agent given no server, with none of magpie's in it, isn't read:
 	// a file of its that can't be read is nothing the library did
-	if len(a.MCP) == 0 && len(a.ToolRules) == 0 && !slices.ContainsFunc(l.MCP, func(s *Server) bool { return slices.Contains(s.Agents, id) }) {
+	if len(a.MCP) == 0 && len(a.ToolRules) == 0 && (t.Gone || !slices.ContainsFunc(l.MCP, func(s *Server) bool { return slices.Contains(s.Agents, id) })) {
 		return
 	}
 	how := toolsOffOf(t)
 	toolsOff := map[string][]string{} // what magpie's in each entry's list now
+	startup := map[string]float64{}   // the startup timeout magpie's in each entry now
 	entries, err := t.MCP.entries()
 	if err != nil {
 		res.fail(id, "mcp", err)
@@ -193,11 +209,22 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 		if _, ok := entries[name]; (ok || t.MCP.holds(name)) && !write("mcp:"+name, func() error { return t.MCP.del(name) }) {
 			mine = append(mine, name)
 			toolsOff[name] = a.ToolsOff[name]
+			startup[name] = a.Startup[name]
 		}
 	}
 	base := gatewayOf(t)
 	for _, s := range l.MCP {
 		if !slices.Contains(s.Agents, id) {
+			continue
+		}
+		// an agent gone from here is given nothing: what it has still
+		// stays its, until unticked
+		if t.Gone {
+			if slices.Contains(a.MCP, s.Name) {
+				mine = append(mine, s.Name)
+				toolsOff[s.Name] = a.ToolsOff[s.Name]
+				startup[s.Name] = a.Startup[s.Name]
+			}
 			continue
 		}
 		s := through(s, base)
@@ -206,6 +233,7 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 			continue
 		}
 		s, _ = t.MCP.side(s)
+		s = wroteStartup(s, a.Startup[s.Name])
 		old := entries[s.Name]
 		if err := t.MCP.foreign(old); err != nil {
 			res.fail(id, "mcp:"+s.Name, err)
@@ -226,17 +254,29 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 			if cur, ok := t.MCP.current(s.Name, old, s); ok && cur.same(s) && t.MCP.has(s) && !t.MCP.behind(s, old) {
 				mine = append(mine, s.Name)
 				toolsOff[s.Name] = offMine
+				startup[s.Name] = t.MCP.startupWritten(s, old)
 				continue
 			}
 		}
 		if write("mcp:"+s.Name, func() error { return t.MCP.putEntry(s, off.apply(t.MCP.merged(s, old))) }) {
 			mine = append(mine, s.Name)
 			toolsOff[s.Name] = offMine
+			startup[s.Name] = t.MCP.startupWritten(s, old)
 		} else if old != nil {
 			toolsOff[s.Name] = prev // the entry is as it was
+			startup[s.Name] = a.Startup[s.Name]
 		}
 	}
 	a.MCP = mine
+	for k, v := range startup {
+		if v == 0 || !slices.Contains(mine, k) {
+			delete(startup, k)
+		}
+	}
+	a.Startup = startup
+	if len(a.Startup) == 0 {
+		a.Startup = nil
+	}
 	for k, v := range toolsOff {
 		if len(v) == 0 {
 			delete(toolsOff, k)
@@ -276,14 +316,20 @@ type AgentView struct {
 	NoEnvRefs bool `json:"noEnvRefs,omitempty"`
 	// ToolsOff: it can be told to leave out single tools of a server
 	// (mcp_tools_off.go); the page names those that can't
-	ToolsOff bool   `json:"toolsOff,omitempty"`
-	MCPVia   string `json:"mcpVia,omitempty"`
+	ToolsOff bool `json:"toolsOff,omitempty"`
+	// Startup: it is given a server's startup timeout (Codex's
+	// startup_timeout_sec)
+	Startup bool   `json:"startup,omitempty"`
+	MCPVia  string `json:"mcpVia,omitempty"`
 	// How is the way it is given its skills, link or copy, and HowOwn its
 	// own over the library's; MustCopy is one that can only take copies
 	// (in WSL)
 	How      string `json:"how,omitempty"`
 	HowOwn   bool   `json:"howOwn,omitempty"`
 	MustCopy bool   `json:"mustCopy,omitempty"`
+	// Gone: not installed here any more, and listed only for what magpie
+	// gave it to be taken out (held); it is given nothing new
+	Gone bool `json:"gone,omitempty"`
 }
 
 // ServerView is a library server, and what each agent it's on made of it.
@@ -302,7 +348,7 @@ type SkillView struct {
 	Name        string            `json:"name"`
 	Description string            `json:"description"`
 	Source      string            `json:"source,omitempty"`
-	Kind        string            `json:"kind"`             // github, folder, or "" for one kept in the library
+	Kind        string            `json:"kind"`             // github, git, folder, or "" for one kept in the library
 	Origin      string            `json:"origin,omitempty"` // on GitHub, as CC Switch installed it: it can be updated from there
 	Repo        string            `json:"repo,omitempty"`   // the repository it came from, however it came in, for the page to group by
 	Icon        string            `json:"icon,omitempty"`
@@ -320,6 +366,9 @@ type SkillView struct {
 	// in the library or in an agent's copy: an update replaces that, so
 	// the page asks first (#1449)
 	Edited bool `json:"edited,omitempty"`
+	// Gone is when its source was found without it: removed there, the
+	// page offers to take it out (skill_gone.go)
+	Gone string `json:"gone,omitempty"`
 }
 
 // View is the Library page.
@@ -328,11 +377,15 @@ type View struct {
 	Servers []ServerView `json:"servers"`
 	// Hooks are the library's hooks, and HookAgents what each agent on
 	// this computer can take of them (hooks.go)
-	Hooks        []HookView      `json:"hooks"`
-	HookAgents   []HookAgentView `json:"hookAgents"`
-	FoundServers []Found         `json:"foundServers"`
-	Skills       []SkillView     `json:"skills"`
-	FoundSkills  []FoundSkill    `json:"foundSkills"`
+	Hooks      []HookView      `json:"hooks"`
+	HookAgents []HookAgentView `json:"hookAgents"`
+	// Subagents are the library's subagents, and SubagentAgents what
+	// each agent on this computer makes of them (subagents.go)
+	Subagents      []SubagentView      `json:"subagents"`
+	SubagentAgents []SubagentAgentView `json:"subagentAgents"`
+	FoundServers   []Found             `json:"foundServers"`
+	Skills         []SkillView         `json:"skills"`
+	FoundSkills    []FoundSkill        `json:"foundSkills"`
 	// NewSkills are skills a check found its skills' repositories to have
 	// added beside them, to add or set aside
 	NewSkills    []NewSkill        `json:"newSkills"`
@@ -399,6 +452,17 @@ func readView(problems []Problem, glance bool) (*View, error) {
 			av.NoRemote = t.MCP.supports(&Server{Transport: "http"}) != nil
 			av.NoEnvRefs = t.MCP.refsOf() == envSyntax{}
 			av.ToolsOff = toolsOffOf(t) != toolsNone
+			av.Startup = t.MCP.Format == fmtCodex
+		}
+		v.Agents = append(v.Agents, av)
+	}
+	// an agent gone from here that still has what magpie gave it: listed on
+	// the rows of what it has, for that to be taken out (held)
+	gone := l.held(targets)
+	for _, t := range gone {
+		av := AgentView{ID: t.Agent.ID, Name: t.Agent.Name, Icon: t.Agent.Icon, Skills: t.Skills, Gone: true}
+		if t.MCP != nil {
+			av.MCP = t.MCP.Path
 		}
 		v.Agents = append(v.Agents, av)
 	}
@@ -438,7 +502,8 @@ func readView(problems []Problem, glance bool) (*View, error) {
 		}
 		v.Servers = append(v.Servers, sv)
 	}
-	v.Hooks, v.HookAgents = l.hooksView(targets, of)
+	v.Hooks, v.HookAgents = l.hooksView(append(slices.Clone(targets), gone...), of)
+	v.Subagents, v.SubagentAgents = l.subagentsView(targets, of)
 	tr := &tracer{}
 	for _, s := range l.Skills {
 		sv := SkillView{Name: s.Name, Agents: append([]string{}, s.Agents...), Icon: skillIcon(s), Problems: of("skill:" + s.Name), Repo: tr.repoOf(s)}
@@ -474,6 +539,7 @@ func readView(problems []Problem, glance bool) (*View, error) {
 		}
 		sv.Check = lastCheck(s.Name)
 		sv.Edited, _ = l.editState(s, targets)
+		sv.Gone = s.Gone
 		v.Skills = append(v.Skills, sv)
 	}
 	v.FoundServers = foundServersOf(l, targets)

@@ -154,3 +154,45 @@ func TestWriterStreamToolArgsRewritten(t *testing.T) {
 		t.Fatalf("args %q: %v", js.String(), err)
 	}
 }
+
+// A keepalive comment goes to the agent as it is written, not with the
+// event after it, even while an event is held for the rest of a
+// placeholder: held, a proxy in front of magpie heard nothing while the
+// vendor reasoned silently and hung up (#2402). The placeholder split
+// around it still comes back whole.
+func TestWriterStreamKeepaliveNotHeld(t *testing.T) {
+	const phone = "13987654321"
+	p := phonePlaceholder(t, phone)
+	chat := func(s string) string {
+		b, _ := json.Marshal(s)
+		return `data: {"choices":[{"index":0,"delta":{"content":` + string(b) + `}}]}` + "\n\n"
+	}
+	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "text/event-stream")
+	w := NewWriter(rec)
+	w.WriteHeader(200)
+	for i, s := range []string{": keepalive\n", chat("call " + p[:5]), ": keepalive\r\n", ": keep"} {
+		w.Write([]byte(s))
+		if want := []int{1, 1, 2, 2}[i]; strings.Count(rec.Body.String(), ": keepalive") != want {
+			t.Fatalf("after %q: %q", s, rec.Body.String())
+		}
+	}
+	w.Write([]byte("alive\n"))
+	w.Write([]byte(chat(p[5:] + " now")))
+	w.Finish()
+	var text strings.Builder
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if d, ok := strings.CutPrefix(line, "data: "); ok {
+			var e struct {
+				Choices []struct{ Delta struct{ Content string } }
+			}
+			if err := json.Unmarshal([]byte(d), &e); err != nil {
+				t.Fatalf("event %q: %v", d, err)
+			}
+			text.WriteString(e.Choices[0].Delta.Content)
+		}
+	}
+	if text.String() != "call "+phone+" now" || strings.Count(rec.Body.String(), ": keepalive") != 3 {
+		t.Fatalf("text %q in %q", text.String(), rec.Body.String())
+	}
+}

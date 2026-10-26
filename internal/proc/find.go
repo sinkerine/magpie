@@ -34,6 +34,10 @@ func FindTool(name string) string {
 // binary's testenv.Isolate made.
 const sandboxVar = "MAGPIE_TEST_SANDBOX"
 
+// Isolated reports whether this is a test binary testenv isolated, where
+// nothing of the machine's own (its folders, its registry) is read.
+func Isolated() bool { return os.Getenv(sandboxVar) != "" }
+
 // SystemDirs are paths of the machine's own, outside any home (Homebrew's
 // /opt/homebrew/bin, /usr/local/bin, an app in /Applications, the
 // registry's PATH), as discovery looks in them: as they are, except in a

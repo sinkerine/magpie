@@ -284,6 +284,43 @@ func TestCLIMissingSharedFoldersWindows(t *testing.T) {
 	}
 }
 
+// #2300 (yangkai2, Windows) and #2304 (wlj521): from v0.1.1239 DeepSeek
+// Harness showed 未找到 CLI with no model to pick. ~\.dsh is read by
+// DeepSeek Harness Desktop too, which installs to any folder and puts
+// its dsh.cmd in one the user picks, so on Windows a ~\.dsh whose dsh
+// isn't found where magpie looks is never taken for a leftover. Judged
+// for a Mac, the same folder is still gone (#843).
+func TestCLIMissingDshWindows(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	t.Setenv("PATH", t.TempDir())
+	noApps(t)
+	dir := filepath.Join(home, ".dsh")
+	// the desktop app's profile, as it leaves it after its first start
+	writeT(t, filepath.Join(dir, "profiles", "desktop", "cordis.patch.yml"), dshDesktopPatch)
+	writeT(t, filepath.Join(dir, "profiles", "desktop", "package.json"), "{}\n")
+	dsh := &Agent{ID: "dsh", Name: "DeepSeek Harness", Bin: "magpie-test-gone-dsh", Dir: dir, Path: filepath.Join(dir, "profiles", "desktop", "cordis.patch.yml")}
+	if !dsh.Detected() {
+		t.Fatal("~\\.dsh not detected")
+	}
+	judgeFor(t, "windows")
+	if dsh.CLIMissing() {
+		t.Fatal("dsh taken for uninstalled on Windows, its settings hidden")
+	}
+	for _, x := range installsOf([]*Agent{dsh}, "windows", true) {
+		if x.Missing {
+			t.Fatalf("dsh offered again as gone on Windows: %+v", x)
+		}
+	}
+	judgeFor(t, "darwin")
+	if !dsh.CLIMissing() {
+		t.Fatal("~/.dsh with no dsh and no app not gone when judged for a Mac")
+	}
+}
+
 // jetBrainsDirFor and zedAgentsDirFor are where jetBrainsHere and
 // zedAgentsHere look on this system.
 func jetBrainsDirFor(home string) string {

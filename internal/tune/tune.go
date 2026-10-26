@@ -151,7 +151,10 @@ type CompactOpts struct {
 	// Current is the window it runs with now; 0 when nothing sets one,
 	// and tune takes it from where its compactions were made
 	Current int
-	// Window is the model's whole window, the most a setting can give
+	// Window is the model's whole window, the most a setting can give; 0
+	// when it isn't known, and then nothing short of Max caps a setting
+	// (zhemu on Discord: a 1M model magpie had no window for was offered
+	// no more than the largest prompt it had been sent, 412K)
 	Window int
 }
 
@@ -346,18 +349,23 @@ func Compact(cs []Call, o CompactOpts) *Compaction {
 	}
 	cur := o.Current
 	if cur == 0 {
-		if f.Compacts >= 3 {
+		switch {
+		case f.Compacts >= 3:
 			cur = roundTo(f.Peak+o.Reserve, o.Step)
-		} else {
+		case o.Window > 0:
 			cur = o.Window
+		default:
+			cur = o.Max
 		}
 	}
 	// the agent compacts at the smaller of the setting and the model's
-	// window: a 500K setting on a 200K model runs at 200K
+	// window: a 500K setting on a 200K model runs at 200K. A window
+	// nobody knows caps nothing short of Max
+	top := o.Max
 	if o.Window > 0 {
 		cur = min(cur, o.Window)
+		top = min(o.Max, o.Window)
 	}
-	top := min(o.Max, max(o.Window, cur))
 	// a window that leaves little room over the summary compacts over and
 	// over: it keeps at least half the summary's size, or twenty calls'
 	// growth, free over it

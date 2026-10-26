@@ -83,7 +83,8 @@ function server(lang, state, posts) {
 // scrolls the button into view), and what was clicked stays where it was on
 // the screen while the click redraws around it: a click never scrolls the
 // page (app.js's guard holds it). The window is tall enough for the whole
-// list, as the pick bar stays over the last rows of a longer one.
+// list, as the pick bar stays over the last rows of a longer one: with the
+// Library's tabs on two lines at 440px (Subagents, #2283) that takes 1100px.
 const press = async (page, loc) => {
   // where it is once the page has faded in (content-in slides it 2px), not
   // on the way: a reader clicks what they see standing still
@@ -123,7 +124,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const w = (key, vars) => tr(lang, key, vars);
         const state = { servers: [sv("fs", "stdio", ["claude", "copilot"]), sv("web", "sse", ["claude"]), sv("docs", "http", [], { signIn: { signedIn: true } })] };
         const posts = [], errors = [];
-        const ctx = await browser.newContext({ viewport: { width: 440, height: 1000 }, reducedMotion: "reduce" });
+        const ctx = await browser.newContext({ viewport: { width: 440, height: 1100 }, reducedMotion: "reduce" });
         await ctx.addInitScript(() => { try { localStorage.setItem("magpie.libTab", "mcp"); } catch {} });
         const page = await ctx.newPage();
         page.setDefaultTimeout(5000);

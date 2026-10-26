@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // Stats is what every session spent, day by day: all of them, not only the
@@ -40,6 +42,11 @@ type Summary struct {
 	ParentSession string        `json:"parent_session,omitempty"`
 	RootSession   string        `json:"root_session,omitempty"`
 	ModelEffort   []ModelEffort `json:"model_effort,omitempty"`
+	// Gateway: magpie knows the session only from the gateway's records
+	// (MergeExternalStats). The agent left no file magpie reads, so it has
+	// no folder, and no prompt unless gateway conversations were recorded
+	// (#2285: a Pi subagent's DeepSeek turns read as "(no prompt)").
+	Gateway bool `json:"gateway,omitempty"`
 	Tokens
 	Cost   float64  `json:"cost"`
 	Priced bool     `json:"priced"` // every model it used has a price
@@ -103,7 +110,29 @@ func StatsFor(days int) Stats {
 // StatsAt is StatsFor as if it were now.
 func StatsAt(days int, now time.Time) Stats { return statsAt(days, now) }
 
-func statsAt(days int, now time.Time) Stats {
+// StatsAndNative is StatsFor, and the agent|id of every session List would
+// list, with no limit: what tells a gateway session the agent keeps too
+// from one only magpie saw. Both come of one pass over the files, as the
+// overview asks for both on every poll (#2776).
+func StatsAndNative(days int) (Stats, map[string]bool) {
+	native := map[string]bool{}
+	return statsIn(days, time.Now(), native), native
+}
+
+func statsAt(days int, now time.Time) Stats { return statsIn(days, now, nil) }
+
+// statsIn is statsAt, filling native as StatsAndNative says when not nil.
+func statsIn(days int, now time.Time, native map[string]bool) Stats {
+	// read before the locks: it reads settings.json
+	alias := provider.UsageAlias()
+	st := statsRead(days, now, native)
+	if alias != nil {
+		st = aliasStats(st, alias)
+	}
+	return st
+}
+
+func statsRead(days int, now time.Time, native map[string]bool) Stats {
 	now = now.In(time.Local)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
 	var since time.Time
@@ -114,18 +143,31 @@ func statsAt(days int, now time.Time) Stats {
 	}
 	out := Stats{From: from, To: today.Format(time.DateOnly), Days: []Day{}, Sessions: []Summary{}, Keys: []string{}}
 
-	dbReadMu.Lock()
-	defer dbReadMu.Unlock()
+	storeMu.RLock()
+	defer storeMu.RUnlock()
 	mu.Lock()
 	defer mu.Unlock()
 	loadCache()
-	defer closeDBs()
+	defer useDBs()()
 	files := allFiles()
 	// every changed file, whatever the range, so a wider range picked later
 	// finds them read rather than starting another run
 	refresh(files, files)
 	identities := codexIdentitySnapshot(files)
 	taskTitles := codexSubagentTaskTitles(files)
+	if native != nil {
+		groups := map[string][]file{}
+		for _, f := range files {
+			groups[f.key] = append(groups[f.key], f)
+		}
+		price, titles := pricer(), codexTitleOf()
+		for _, fs := range groups {
+			// as List: a session nothing was said in is not listed
+			if s, ok := assembleListed(fs, price, titles); ok {
+				native[s.Agent+"|"+s.ID] = true
+			}
+		}
+	}
 	var want []file
 	for _, f := range files {
 		if !f.mod.Before(since) {
@@ -249,7 +291,7 @@ func statsAt(days int, now time.Time) Stats {
 	for date := range dates {
 		byDate[date] = &Day{Date: date, Usage: []Usage{}, Active: []Active{}}
 	}
-	price := pricer()
+	price, titles := pricer(), codexTitleOf()
 	for k, t := range use {
 		u := Usage{Agent: k.agent, Cwd: k.cwd, Model: k.model, Tokens: t}
 		if p := price(k.model); p != nil {
@@ -306,7 +348,7 @@ func statsAt(days int, now time.Time) Stats {
 		if len(sh.dates) == 0 {
 			continue
 		}
-		s, ok := assemble(groups[key], price)
+		s, ok := assembleListed(groups[key], price, titles)
 		if !ok {
 			continue
 		}

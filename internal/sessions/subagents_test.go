@@ -161,3 +161,83 @@ func TestKimiSubagents(t *testing.T) {
 		t.Fatalf("1.5 subagents %+v", s.Subagents)
 	}
 }
+
+// #2290 (infinitr0us): OpenCode 2.0.29 names a child session's agent in
+// session_v2.agent and titles it with the task alone ("Port Phase2
+// physics", no "(@general subagent)"), so the type comes from the column.
+// A child whose row names no agent still takes it from an older title.
+func TestOpenCodeV2SubagentKind(t *testing.T) {
+	inZone(t, 0)
+	data, _ := setupMore(t)
+	db := ocMakeV2(t, filepath.Join(data, "opencode", "opencode.db"))
+	const older = "ses_1a2b3c4d5e6fEEEEEEEEEEEEEE"
+	for _, q := range []string{
+		`UPDATE session_v2 SET agent = 'build' WHERE id = '` + ocMain + `'`,
+		`UPDATE session_v2 SET agent = 'explore', title = 'Port Phase2 physics', version = '2.0.29' WHERE id = '` + ocChild + `'`,
+		`INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated) VALUES
+			('` + older + `', 'global', '` + ocMain + `', 'old-heron', '/work/oc', 'Find the flaky test (@general subagent)', '2.0.18', 1790416870000, 1790416870000)`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := find(t, List(0), "opencode", ocMain)
+	var got []string
+	for _, sa := range s.Subagents {
+		got = append(got, sa.ID+"|"+sa.Title+"|"+sa.Kind)
+	}
+	if want := ocChild + "|Port Phase2 physics|explore," + older + "|Find the flaky test|general"; strings.Join(got, ",") != want {
+		t.Fatalf("subagents %q, want %q", got, want)
+	}
+}
+
+// #2290 (infinitr0us): a Kimi Code 2.1.1 subagent's own wire file starts
+// with the task its parent gave it, a turn.prompt from a system_trigger
+// named subagent. It opens as the subagent's first message, as a Claude
+// Code or OpenCode subagent's task does, not as folded context; another
+// system_trigger in that file, and one in the session's own file, stay
+// folded. The records are in the shape of Kimi Code's 1.5 wire files.
+func TestKimiSubagentTask(t *testing.T) {
+	inZone(t, 0)
+	claude, _ := setup(t)
+	dir := filepath.Join(filepath.Dir(claude), "home", ".kimi-code")
+	kimiSessionsIn(t, dir)
+	s := find(t, List(0), "kimi", kimiJune)
+	agents := filepath.Dir(filepath.Dir(s.Subagents[0].Path))
+	writeFile(t, filepath.Join(agents, "agent-1", "wire.jsonl"), strings.Join([]string{
+		`{"type":"metadata","protocol_version":"1.5","created_at":1781503100000}`,
+		`{"type":"turn.prompt","agentId":"agent-1","input":[{"type":"text","text":"Map every caller of the physics step"}],"origin":{"kind":"system_trigger","name":"subagent"},"promptId":"p1","turnId":0,"time":1781503100010}`,
+		`{"type":"context.append_message","agentId":"agent-1","message":{"role":"user","content":[{"type":"text","text":"Map every caller of the physics step"}],"toolCalls":[],"origin":{"kind":"system_trigger","name":"subagent"}},"time":1781503100010}`,
+		`{"type":"context.append_loop_event","agentId":"agent-1","event":{"type":"content.part","uuid":"u1","turnId":"0","step":1,"stepUuid":"s1","part":{"type":"text","text":"Three callers."}},"time":1781503100500}`,
+		`{"type":"turn.prompt","agentId":"agent-1","input":[{"type":"text","text":"a background task finished"}],"origin":{"kind":"system_trigger","name":"background_task"},"promptId":"p2","turnId":1,"time":1781503100600}`,
+	}, "\n")+"\n")
+	f, err := os.OpenFile(filepath.Join(agents, "main", "wire.jsonl"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString(`{"type":"subagent.spawned","subagentId":"agent-1","subagentName":"explore","parentToolCallId":"call_2","parentAgentId":"main","description":"Map the callers","runInBackground":true,"time":1781503100000}` + "\n")
+	f.WriteString(`{"type":"turn.prompt","agentId":"main","input":[{"type":"text","text":"subagent agent-1 finished"}],"origin":{"kind":"system_trigger","name":"subagent"},"promptId":"p3","turnId":9,"time":1781503200000}` + "\n")
+	f.Close()
+	Reset()
+	s = find(t, List(0), "kimi", kimiJune)
+	tr, err := SubagentTranscript(s, "agent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, p := range tr.Parts {
+		got = append(got, p.Role+"/"+p.Kind+"|"+p.Text)
+	}
+	want := "user/text|Map every caller of the physics step,assistant/text|Three callers.,user/context|a background task finished"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("subagent transcript %q, want %q", got, want)
+	}
+	main, err := TranscriptOf(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := main.Parts[len(main.Parts)-1]
+	if last.Kind != "context" || last.Text != "subagent agent-1 finished" {
+		t.Fatalf("the session's own system_trigger: %+v", last)
+	}
+}

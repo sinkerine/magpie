@@ -20,6 +20,7 @@ import (
 	"github.com/tidwall/jsonc"
 	"gopkg.in/yaml.v3"
 
+	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/imagemcp"
@@ -46,6 +47,15 @@ type Server struct {
 	// (GitHub's, 新v学员 on Discord). It is magpie's alone: the agents are
 	// given the server as before.
 	OAuth *OAuthApp `json:"oauth,omitempty"`
+	// StartupTimeout is the seconds an agent waits for the server to start
+	// and list its tools: Codex's startup_timeout_sec (#3168), the only
+	// agent given it. 0 leaves it to the agent (Codex's own is 30s).
+	StartupTimeout int `json:"startupTimeout,omitempty"`
+
+	// startupWrote is the startup_timeout_sec magpie last wrote in the
+	// entry being written, 0 for none: one the entry has otherwise is the
+	// user's, and stays (startupTheirs)
+	startupWrote float64
 }
 
 // OAuthApp is an OAuth app made with a server's vendor, by the names
@@ -115,6 +125,9 @@ func (s *Server) check() error {
 			}
 			s.OAuth = nil
 		}
+	}
+	if s.StartupTimeout < 0 || s.StartupTimeout > maxStartupTimeout {
+		return fmt.Errorf("%s: the startup timeout is between 0 (the agent's own) and %d seconds", s.Name, maxStartupTimeout)
 	}
 	for k := range s.Env {
 		if strings.TrimSpace(k) == "" {
@@ -344,15 +357,69 @@ func selfTimeout(s *Server, def int) int {
 	return def
 }
 
+// maxStartupTimeout is the longest startup timeout a server is given: a
+// day, as a hook's timeout.
+const maxStartupTimeout = 86400
+
+// startupTheirs says whether old, a Codex entry, has a startup timeout
+// magpie didn't write: a startup_timeout_ms (magpie writes only _sec, and
+// Codex reads _ms only without it), or a startup_timeout_sec other than
+// the one magpie wrote last. That one is the user's, and magpie's value
+// never goes over it.
+func startupTheirs(s *Server, old map[string]any) bool {
+	if _, ok := old["startup_timeout_ms"]; ok {
+		return true
+	}
+	v, ok := old["startup_timeout_sec"]
+	return ok && (s.startupWrote == 0 || !isNumber(v, s.startupWrote))
+}
+
+// startupWritten is the startup_timeout_sec of magpie's in the entry it
+// writes for s over old, for the next write to know it by: 0 for none.
+func (f *mcpFile) startupWritten(s *Server, old map[string]any) float64 {
+	if f.Format != fmtCodex || startupTheirs(s, old) {
+		return 0
+	}
+	return float64(s.StartupTimeout)
+}
+
+// startupBehind says whether a Codex entry lacks the startup timeout
+// magpie gives s, or has one magpie wrote that s no longer has.
+func startupBehind(s *Server, old map[string]any) bool {
+	if startupTheirs(s, old) {
+		return false
+	}
+	v, ok := old["startup_timeout_sec"]
+	if s.StartupTimeout == 0 {
+		return ok
+	}
+	return !isNumber(v, float64(s.StartupTimeout))
+}
+
+// wroteStartup is s with the startup timeout magpie last wrote in its
+// entry.
+func wroteStartup(s *Server, v float64) *Server {
+	if s.startupWrote == v {
+		return s
+	}
+	c := *s
+	c.startupWrote = v
+	return &c
+}
+
 // gooseOldTimeout is the timeout magpie wrote for every Goose server before
 // magpie-image was given a longer one.
 const gooseOldTimeout = 300
 
 // behind says whether an entry magpie wrote before lacks the timeout it
 // gives s now: Codex's tool_timeout_sec is missing, or Goose's timeout is
-// still the gooseOldTimeout every server had. A value the user chose is
-// neither, so it is left as it is.
+// still the gooseOldTimeout every server had, or Codex's startup timeout
+// isn't the one s has (startupBehind). A value the user chose is none of
+// these, so it is left as it is.
 func (f *mcpFile) behind(s *Server, old map[string]any) bool {
+	if f.Format == fmtCodex && old != nil && startupBehind(s, old) {
+		return true
+	}
 	if selfTimeout(s, 0) == 0 {
 		return false
 	}
@@ -629,6 +696,10 @@ func (f *mcpFile) encode(s *Server) ordered {
 		// Codex gives a tool a minute unless its entry says more
 		if t := selfTimeout(s, 0); t > 0 {
 			add("tool_timeout_sec", t)
+		}
+		// and 30s to start and list its tools unless its entry says more
+		if s.StartupTimeout > 0 {
+			add("startup_timeout_sec", s.StartupTimeout)
 		}
 	case fmtDsh:
 		// a reference is a !!js expression dsh evaluates (dshRef)
@@ -1093,6 +1164,16 @@ func (f *mcpFile) merged(s *Server, old map[string]any) ordered {
 	o := f.encode(s)
 	mine := f.mine(s)
 	behind := f.behind(s, old)
+	// Codex's startup timeout is magpie's unless the user wrote one
+	// (startupTheirs): theirs is kept as it is, below, with no _sec of
+	// magpie's beside a _ms of theirs
+	if f.Format == fmtCodex {
+		if startupTheirs(s, old) {
+			o = slices.DeleteFunc(o, func(e kv) bool { return e.k == "startup_timeout_sec" })
+		} else {
+			mine = append(slices.Clone(mine), "startup_timeout_sec")
+		}
+	}
 	for i, e := range o {
 		if v, ok := old[e.k]; ok && !slices.Contains(mine, e.k) && !(behind && f.Format == fmtGoose && e.k == "timeout") {
 			o[i].v = v
@@ -1333,17 +1414,39 @@ type Found struct {
 	Own bool `json:"own,omitempty"`
 }
 
-// appOwned is whether a server runs from inside an app's own install — a
-// Mac app bundle, a Microsoft Store app, the Codex app's runtimes — as the
-// servers an agent's app writes into its config itself do.
-func appOwned(s *Server) bool {
-	if s.Remote() {
+// appOwned is whether a server runs from inside the agent's own app
+// install — its Mac app bundle, its Microsoft Store app, the Codex app's
+// runtimes — as the servers an agent's app writes into its config itself
+// do. Another app's server in the agent's config (Netcatty's, #2635) is
+// one the user added there: it is brought in like any other.
+func appOwned(s *Server, a *agent.Agent) bool {
+	if s.Remote() || a == nil {
 		return false
 	}
 	cmd := strings.ToLower(strings.ReplaceAll(s.Command, `\`, "/"))
-	for _, in := range []string{".app/contents/", "/windowsapps/", "/cua_node/", "/openai/codex/runtimes/"} {
-		if strings.Contains(cmd, in) {
-			return true
+	if a.ID == "codex" && (strings.Contains(cmd, "/cua_node/") || strings.Contains(cmd, "/openai/codex/runtimes/")) {
+		return true
+	}
+	names := []string{strings.ToLower(a.ID), strings.ToLower(a.Name)}
+	if id, _, ok := strings.Cut(names[0], "-"); ok {
+		names = append(names, id)
+	}
+	if n, _, ok := strings.Cut(names[1], " "); ok {
+		names = append(names, n)
+	}
+	segs := strings.Split(cmd, "/")
+	for i, seg := range segs {
+		// an app is a bundle (Codex.app) or a Store package
+		// (WindowsApps/OpenAI.Codex_1.0_x64) the command is inside
+		app := strings.HasSuffix(seg, ".app") && i+1 < len(segs) && segs[i+1] == "contents"
+		app = app || (i > 0 && segs[i-1] == "windowsapps" && i+1 < len(segs))
+		if !app {
+			continue
+		}
+		for _, n := range names {
+			if n != "" && strings.Contains(seg, n) {
+				return true
+			}
 		}
 	}
 	return false
@@ -1372,7 +1475,7 @@ func foundServersOf(l *Library, targets []*Target) []Found {
 			switch {
 			case f == nil:
 				s.Agents = []string{t.Agent.ID}
-				byName[name] = &Found{Server: s, Own: appOwned(s)}
+				byName[name] = &Found{Server: s, Own: appOwned(s, t.Agent)}
 				names = append(names, name)
 			case f.Server.same(s):
 				f.Server.Agents = append(f.Server.Agents, t.Agent.ID)

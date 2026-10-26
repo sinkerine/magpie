@@ -190,10 +190,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.deepEqual(errors, []);
     });
 
-    // #808: Trae CN answers a claim from magpie 9074 for good, since it
-    // pays only its own app; the card says to check in there, offers no
+    // #808: Trae CN answers a claim from magpie 9074 for the day; the card
+    // says Trae CN refused it, in Trae's words, and to check in in the
+    // Trae CN app, not that Trae pays only its app (#1920). It offers no
     // Check in now, and the Settings tab's line says the same.
-    test(`${engine} ${lang}: a Trae CN check-in only its own app gets says to check in in Trae CN`, async (t) => {
+    test(`${engine} ${lang}: a Trae CN check-in refused 9074 says Trae refused it and to check in in Trae CN`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 440, height: 900 }, reducedMotion: "reduce" })).newPage();
@@ -202,8 +203,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       page.on("pageerror", (e) => errors.push(e.message));
       const own = { user: "hu", by: "trae", day: today, outcome: "own-app", msg: "当前参与用户太多，请稍后再试" };
       const says = lang === "en"
-        ? "Trae CN only gives check-in credits to its own app; check in in the Trae CN app"
-        : "Trae CN 只给自己的客户端发签到积分，请在 Trae CN App 里签到";
+        ? "Trae CN refused this check-in (9074: too many taking part); check in in the Trae CN app"
+        : "Trae CN 拒绝了这次签到（9074 当前参与用户太多），请在 Trae CN App 里签到";
       await page.route("**/*", async (route) => {
         const url = new URL(route.request().url());
         if (url.pathname === "/api/usage/quotas") {

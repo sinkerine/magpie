@@ -21,6 +21,7 @@ type Writer struct {
 	buf     bytes.Buffer
 	pending *held
 	done    bool
+	put     map[string]int // placeholders put back, each place counted
 }
 
 const (
@@ -41,6 +42,17 @@ type held struct {
 func NewWriter(w http.ResponseWriter) *Writer { return &Writer{w: w} }
 
 func (rw *Writer) Header() http.Header { return rw.w.Header() }
+
+// Put is how many places of each placeholder the answer had put back,
+// so far: for the record of what masking did.
+func (rw *Writer) Put() map[string]int { return rw.put }
+
+func (rw *Writer) count() map[string]int {
+	if rw.put == nil {
+		rw.put = map[string]int{}
+	}
+	return rw.put
+}
 
 // Unwrap is for http.ResponseController.
 func (rw *Writer) Unwrap() http.ResponseWriter { return rw.w }
@@ -90,6 +102,18 @@ func (rw *Writer) Write(p []byte) (int, error) {
 	rw.buf.Write(p)
 	for {
 		b := rw.buf.Bytes()
+		// a comment between two events (": keepalive") goes on as it
+		// comes: held for the event after it, an agent behind a proxy
+		// heard nothing while its vendor reasoned silently, and the
+		// proxy hung up (#2402). It carries nothing to put back, and an
+		// event held for its placeholder's tail goes on after it as well.
+		if c := commentLines(b); c > 0 {
+			if _, err := rw.w.Write(b[:c]); err != nil {
+				return len(p), err
+			}
+			rw.buf.Next(c)
+			continue
+		}
 		i, n := eventEnd(b)
 		if i < 0 {
 			break
@@ -101,6 +125,21 @@ func (rw *Writer) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+// commentLines is how long the whole comment lines (": keepalive") and
+// blank lines at the start of b are: b starts where an event does, so none
+// of them is part of one.
+func commentLines(b []byte) int {
+	n := 0
+	for n < len(b) && (b[n] == ':' || b[n] == '\n' || b[n] == '\r') {
+		i := bytes.IndexByte(b[n:], '\n')
+		if i < 0 || b[n] == '\r' && i != 1 {
+			break
+		}
+		n += i + 1
+	}
+	return n
 }
 
 // eventEnd is where the first complete event in b ends, and the length of
@@ -132,14 +171,14 @@ func (rw *Writer) Finish() {
 	rw.done = true
 	switch rw.mode {
 	case whole:
-		rw.w.Write(RestoreJSON(rw.buf.Bytes()))
+		rw.w.Write(restoreJSON(rw.buf.Bytes(), rw.count()))
 	case stream:
 		if rw.pending != nil {
 			rw.w.Write(rw.pending.full)
 			rw.pending = nil
 		}
 		if rw.buf.Len() > 0 {
-			rw.w.Write([]byte(Restore(rw.buf.String(), false)))
+			rw.w.Write([]byte(restore(rw.buf.String(), false, rw.count())))
 		}
 	}
 	rw.Flush()
@@ -152,7 +191,7 @@ func (rw *Writer) event(ev []byte) error {
 		if err := rw.release(); err != nil {
 			return err
 		}
-		_, err := rw.w.Write([]byte(Restore(string(ev), false)))
+		_, err := rw.w.Write([]byte(restore(string(ev), false, rw.count())))
 		return err
 	}
 	ctx := name + "|" + eventCtx(data)
@@ -188,7 +227,9 @@ func (rw *Writer) event(ev []byte) error {
 			tailPath, tail = path, s[len(s)-n:]
 			cut = Restore(s[:len(s)-n], asJSON(key, typ))
 		}
-		return Restore(s, asJSON(key, typ))
+		// counted here only: cut is s again without its tail, and
+		// whichever of the two goes out, the places are these
+		return restore(s, asJSON(key, typ), rw.count())
 	})
 	full := rebuild(pre, restored, post)
 	if tail == "" {

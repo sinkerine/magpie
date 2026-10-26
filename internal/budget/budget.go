@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/access"
+	"github.com/yetone/magpie/internal/gwbudget"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
@@ -101,23 +102,26 @@ func counts(r usage.Record) bool { return !r.IsRejected() && !r.IsReported() && 
 
 // sumsFor is keyID's sums for each window starting at starts, read from
 // usage.jsonl the first time; those of windows no limit counts in now
-// are let go. Called with state held.
+// are let go. A window two limits share (a day and a week on a Monday,
+// a day and a month on the 1st) is kept once, as Append adds a call to
+// each one kept (#2942). Called with state held.
 func sumsFor(keyID string, starts []time.Time) []*sums {
 	k := slot(keyID)
 	kept := state.sums[k]
 	out := make([]*sums, len(starts))
 	var next []*sums
+	at := func(ss []*sums, start time.Time) int {
+		return slices.IndexFunc(ss, func(s *sums) bool { return s.start.Equal(start) })
+	}
 	for i, start := range starts {
-		j := slices.IndexFunc(kept, func(s *sums) bool { return s.start.Equal(start) })
-		if j < 0 {
-			j = slices.IndexFunc(next, func(s *sums) bool { return s.start.Equal(start) })
-			if j >= 0 {
-				out[i] = next[j]
-				continue
-			}
-			out[i] = read(keyID, start)
-		} else {
+		if j := at(next, start); j >= 0 {
+			out[i] = next[j]
+			continue
+		}
+		if j := at(kept, start); j >= 0 {
 			out[i] = kept[j]
+		} else {
+			out[i] = read(keyID, start)
 		}
 		next = append(next, out[i])
 	}
@@ -313,6 +317,21 @@ func (r *Refusal) Error() string {
 // RetryAfter is how long until the window resets, in whole seconds.
 func (r *Refusal) RetryAfter(now time.Time) int {
 	return max(int(r.Reset.Sub(now).Seconds()+0.999), 1)
+}
+
+// ResetAt is when the window resets.
+func (r *Refusal) ResetAt() time.Time { return r.Reset }
+
+// Limiter is Reserve as the gateway's budget point asks it
+// (gwbudget.Limiter); plugins/budget serves it.
+type Limiter struct{}
+
+func (Limiter) Reserve(who access.Identity, body int64, model string, now time.Time) (func(), gwbudget.Refusal) {
+	release, refused := Reserve(who, body, model, now)
+	if refused != nil {
+		return nil, refused
+	}
+	return release, nil
 }
 
 // Reserve lets a request of who's in, holding a reservation for it until

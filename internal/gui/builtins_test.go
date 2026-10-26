@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/pluginrt"
 	"github.com/yetone/magpie/internal/settings"
 	_ "github.com/yetone/magpie/plugins/all"
@@ -34,7 +35,16 @@ func postBuiltin(h http.Handler, body string) *httptest.ResponseRecorder {
 // one is refused.
 func TestBuiltinSwitch(t *testing.T) {
 	h := builtinHome(t)
-	if _, err := pluginrt.Settle(true); err != nil {
+	if _, err := pluginrt.Settle(); err != nil {
+		t.Fatal(err)
+	}
+	// a new install has every one on, so a new user sees all magpie does
+	for _, b := range builtinsState() {
+		if !b.On || b.State != pluginrt.Active {
+			t.Fatalf("a new install: %+v", b)
+		}
+	}
+	if err := pluginrt.SetPreset(pluginrt.PresetEssentials); err != nil {
 		t.Fatal(err)
 	}
 	if rec := postBuiltin(h, `{"id":"library","on":true}`); rec.Code != http.StatusOK {
@@ -44,14 +54,14 @@ func TestBuiltinSwitch(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 			t.Fatal(err)
 		}
-		if len(out) != 11 {
+		if len(out) != 14 {
 			t.Fatalf("the built-ins: %+v", out)
 		}
 		for _, b := range out {
 			// the Gateway, Routing and Usage pages, the routing strategies,
-			// the gateway middleware and privacy masking are essential: on in
-			// every preset
-			if b.On != (b.ID == "library" || b.ID == "gateway" || b.ID == "middleware" || b.ID == "redact" || b.ID == "rotation" || b.ID == "routing" || b.ID == "usage") || b.On != (b.State == pluginrt.Active) {
+			// the gateway middleware, privacy masking, web search, key
+			// limits and plugin tools are essential: on in every preset
+			if b.On != (b.ID == "budget" || b.ID == "library" || b.ID == "gateway" || b.ID == "middleware" || b.ID == "redact" || b.ID == "rotation" || b.ID == "routing" || b.ID == "search" || b.ID == "tools" || b.ID == "usage") || b.On != (b.State == pluginrt.Active) {
 				t.Fatalf("after library on: %+v", out)
 			}
 		}
@@ -102,8 +112,8 @@ func TestBuiltinBrokenFile(t *testing.T) {
 	}
 }
 
-// boot.js says what is off before the page paints: everything for a new
-// install, nothing for one that ran before.
+// boot.js says what is off before the page paints: nothing for an
+// install as it starts, what Essentials leaves off once the user picks it.
 func TestBootSaysBuiltinsOff(t *testing.T) {
 	h := builtinHome(t)
 	boot := func() string {
@@ -111,11 +121,11 @@ func TestBootSaysBuiltinsOff(t *testing.T) {
 		h.ServeHTTP(rec, httptest.NewRequest("GET", "/boot.js", nil))
 		return rec.Body.String()
 	}
-	if _, err := pluginrt.Settle(false); err != nil {
+	if _, err := pluginrt.Settle(); err != nil {
 		t.Fatal(err)
 	}
 	if b := boot(); !strings.Contains(b, `"featuresOff":[]`) {
-		t.Fatalf("an existing user: %s", b)
+		t.Fatalf("an install as it starts: %s", b)
 	}
 	if err := pluginrt.SetPreset(pluginrt.PresetEssentials); err != nil {
 		t.Fatal(err)
@@ -124,7 +134,38 @@ func TestBootSaysBuiltinsOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	if b := boot(); !strings.Contains(b, `"featuresOff":["groups","otel","sessions","warmups"]`) {
-		t.Fatalf("a new install: %s", b)
+		t.Fatalf("Essentials picked: %s", b)
+	}
+}
+
+// boot.js says where the gateway listens when this process serves it, so
+// the sidebar's line is drawn before the first paint (#3429), and nothing
+// when it doesn't: one served by another magpie is the providers' read to
+// find, never this process's guess.
+func TestBootSaysWhereItsGatewayListens(t *testing.T) {
+	h := builtinHome(t)
+	t.Setenv("MAGPIE_ADDR", "127.0.0.1:3481")
+	boot := func() string {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/boot.js", nil))
+		return rec.Body.String()
+	}
+	prev := served.Swap(nil)
+	t.Cleanup(func() { served.Store(prev) })
+	if b := boot(); strings.Contains(b, "sideGateway") {
+		t.Fatalf("no gateway served here: %s", b)
+	}
+	served.Store(gateway.New())
+	if b := boot(); !strings.Contains(b, `"sideGateway":{"boot":true,"running":true,"url":"http://127.0.0.1:3481"}`) {
+		t.Fatalf("served here: %s", b)
+	}
+	t.Setenv("MAGPIE_ADDR", "0.0.0.0:3483")
+	if b := boot(); !strings.Contains(b, `"sideGateway":{"boot":true,"running":true,"url":"http://127.0.0.1:3483"}`) {
+		t.Fatalf("every interface, reached on loopback: %s", b)
+	}
+	served.Store(nil)
+	if b := boot(); strings.Contains(b, "sideGateway") {
+		t.Fatalf("stopped: %s", b)
 	}
 }
 
@@ -133,7 +174,7 @@ func TestBootSaysBuiltinsOff(t *testing.T) {
 // config, not both.
 func TestBuiltinConfig(t *testing.T) {
 	h := builtinHome(t)
-	if _, err := pluginrt.Settle(false); err != nil {
+	if _, err := pluginrt.Settle(); err != nil {
 		t.Fatal(err)
 	}
 	gw := func() builtinJSON {

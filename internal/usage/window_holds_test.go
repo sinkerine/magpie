@@ -9,6 +9,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // holdsHome is a home whose models.dev copy prices a Claude and an OpenAI
@@ -157,19 +158,19 @@ func TestWindowHoldsNeedsTheWholeWindowLogged(t *testing.T) {
 		}
 	}
 	priceOf := func(Record) *catalog.Price { return nil }
-	if got := windowHolds(qs, now, now.Add(-2*24*time.Hour), priceOf, nil, nil, read); got[0].Windows[0].Holds != nil || got[0].Windows[0].HoldsWhy != provider.HoldsBeforeLog {
+	if got := windowHolds(qs, now, now.Add(-2*24*time.Hour), priceOf, provider.Renames{}, nil, read); got[0].Windows[0].Holds != nil || got[0].Windows[0].HoldsWhy != provider.HoldsBeforeLog {
 		t.Fatalf("the log began 2 days into the week, and the week was reckoned: %+v, why %q", got[0].Windows[0].Holds, got[0].Windows[0].HoldsWhy)
 	}
-	got := windowHolds(qs, now, now.Add(-30*24*time.Hour), priceOf, nil, nil, read)
+	got := windowHolds(qs, now, now.Add(-30*24*time.Hour), priceOf, provider.Renames{}, nil, read)
 	if h := got[0].Windows[0].Holds; h == nil || h.Tokens != 500 || h.Priced {
 		t.Fatalf("logged since before the week: %+v, want 500 tokens, unpriced", h)
 	}
-	if got := windowHolds(qs, now, now.Add(-30*24*time.Hour), priceOf, nil, nil, func(func(Record)) {}); got[0].Windows[0].Holds != nil || got[0].Windows[0].HoldsWhy != provider.HoldsNoneRouted {
+	if got := windowHolds(qs, now, now.Add(-30*24*time.Hour), priceOf, provider.Renames{}, nil, func(func(Record)) {}); got[0].Windows[0].Holds != nil || got[0].Windows[0].HoldsWhy != provider.HoldsNoneRouted {
 		t.Fatalf("nothing routed, and the week was reckoned: %+v, why %q", got[0].Windows[0].Holds, got[0].Windows[0].HoldsWhy)
 	}
 	// a provider since renamed: its calls under the old id are the account's
 	recs[0].Provider = "claude-old"
-	if got := windowHolds(qs, now, now.Add(-30*24*time.Hour), priceOf, map[string]string{"claude-old": "claude"}, nil, read); got[0].Windows[0].Holds == nil {
+	if got := windowHolds(qs, now, now.Add(-30*24*time.Hour), priceOf, provider.RenamesOf(map[string]string{"claude-old": "claude"}), nil, read); got[0].Windows[0].Holds == nil {
 		t.Fatal("a call under the provider's old id wasn't counted")
 	}
 }
@@ -222,7 +223,7 @@ func TestWindowHoldsLeavesOutCallsPaidOtherwise(t *testing.T) {
 	}
 	var whys [2]string
 	holds := func(qs []provider.SubscriptionQuota, h []provider.QuotaHistory, recs ...Record) (five, week *provider.WindowHolds) {
-		got := windowHolds(qs, now, first, priceOf, nil, dryRuns(qs, h, now), reads(recs...))
+		got := windowHolds(qs, now, first, priceOf, provider.Renames{}, dryRuns(qs, h, now), reads(recs...))
 		whys = [2]string{got[0].Windows[0].HoldsWhy, got[0].Windows[1].HoldsWhy}
 		return got[0].Windows[0].Holds, got[0].Windows[1].Holds
 	}
@@ -256,5 +257,134 @@ func TestWindowHoldsLeavesOutCallsPaidOtherwise(t *testing.T) {
 	before := hist(pt(9*24*time.Hour, 40), pt(8*24*time.Hour, 0), pt(8*24*time.Hour-time.Hour, 100))
 	if _, week = holds(card(20, 3*time.Hour), before, subscription, call(8*24*time.Hour-30*time.Minute, 900000)); week == nil || week.Routed.Tokens != 100000 {
 		t.Fatalf("a dry run before the week: week %+v, want 100000 routed", week)
+	}
+}
+
+// A successful call after the vendor's reset is in the new allowance,
+// even when the first reading of the refill arrives a few seconds later.
+func TestWindowHoldsResetBeforeRefillReading(t *testing.T) {
+	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(-time.Hour)
+	refill := reset.Add(3 * time.Second)
+	lastLeft, firstDry := reset.Add(-90*time.Minute), reset.Add(-87*time.Minute)
+	weekReset, fiveReset := now.Add(3*24*time.Hour), reset.Add(5*time.Hour)
+	for _, providerID := range []string{"codex", "claude"} {
+		t.Run(providerID, func(t *testing.T) {
+			qs := []provider.SubscriptionQuota{{Provider: providerID, User: "sample@example.com", ReadAt: &now, Windows: []provider.QuotaWindow{
+				{Name: "5 hours", Used: 20, ResetsAt: &fiveReset, Span: 5 * time.Hour},
+				{Name: "7 days", Used: 50, ResetsAt: &weekReset, Span: 7 * 24 * time.Hour},
+			}}}
+			hist := []provider.QuotaHistory{{Provider: providerID, User: "sample@example.com", Lines: []provider.QuotaLine{{Name: "5 hours", Points: []provider.QuotaPoint{
+				{At: lastLeft, Left: 3, ResetsAt: &reset}, {At: firstDry, Left: 0, ResetsAt: &reset}, {At: refill, Left: 100, ResetsAt: &fiveReset},
+			}}}}}
+			for _, tc := range []struct {
+				name string
+				at   time.Time
+				want bool
+			}{
+				{"just after reset", reset.Add(585 * time.Millisecond), true},
+				{"at reset", reset, true},
+				{"before reset", reset.Add(-time.Second), false},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					call := Record{Time: tc.at, Provider: providerID, ProviderAccount: "sample@example.com", Model: "m", Input: 1000, Status: 200}
+					got := windowHolds(qs, now, now.Add(-30*24*time.Hour), func(Record) *catalog.Price { return nil }, provider.Renames{}, dryRuns(qs, hist, now), func(fn func(Record)) { fn(call) })
+					h := got[0].Windows[1].Holds
+					if (h != nil) != tc.want {
+						t.Fatalf("week holds = %+v, want present %v", h, tc.want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestDryRunsKeepsTheCurrentReadingReset(t *testing.T) {
+	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	qs := []provider.SubscriptionQuota{{Provider: "plugin", User: "sample", Windows: []provider.QuotaWindow{{Name: "5 hours", Used: 100, ResetSecs: 3600}}}}
+	runs := dryRuns(qs, nil, now)["plugin\x00sample"]
+	if len(runs) != 1 || runs[0].holds(now.Add(time.Hour)) || !runs[0].holds(now.Add(time.Hour-time.Second)) {
+		t.Fatalf("current relative reset: %+v", runs)
+	}
+}
+
+// A window that ran dry, reset, and ran dry again before its next reset
+// hides only the calls inside each dry stretch: the 7-day estimate still
+// shows when its calls fall outside them (#2010).
+func TestWindowHoldsDryAgainAfterReset(t *testing.T) {
+	at := func(t time.Time) *time.Time { return &t }
+	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	r1 := now.Add(-6 * time.Hour)
+	r2 := r1.Add(5 * time.Hour)
+	weekReset := now.Add(3 * 24 * time.Hour)
+	qs := []provider.SubscriptionQuota{{Provider: "codex", User: "u", ReadAt: &now, Windows: []provider.QuotaWindow{
+		{Name: "5 hours", Used: 20, ResetsAt: at(now.Add(4 * time.Hour)), Span: 5 * time.Hour},
+		{Name: "7 days", Used: 50, ResetsAt: &weekReset, Span: 7 * 24 * time.Hour},
+	}}}
+	hist := []provider.QuotaHistory{{Provider: "codex", User: "u", Lines: []provider.QuotaLine{{Name: "5 hours", Points: []provider.QuotaPoint{
+		{At: r1.Add(-2 * time.Hour), Left: 10, ResetsAt: &r1}, {At: r1.Add(-time.Hour), Left: 0, ResetsAt: &r1},
+		{At: r1.Add(2 * time.Hour), Left: 0, ResetsAt: &r2}, {At: r2.Add(time.Minute), Left: 100, ResetsAt: at(r2.Add(5 * time.Hour))},
+	}}}}}
+	calls := []Record{
+		{Time: now.Add(-3 * 24 * time.Hour), Input: 1000, Status: 200},
+		{Time: r1.Add(time.Hour), Input: 1000, Status: 200}, // after the reset, before the next dry reading
+	}
+	got := windowHolds(qs, now, now.Add(-30*24*time.Hour), func(Record) *catalog.Price { return nil }, provider.Renames{}, dryRuns(qs, hist, now), func(fn func(Record)) {
+		for _, c := range calls {
+			c.Provider, c.ProviderAccount, c.Model = "codex", "u", "m"
+			fn(c)
+		}
+	})
+	if w := got[0].Windows[1]; w.Holds == nil || w.Holds.Tokens != 4000 {
+		t.Fatalf("7 days: %+v (%q), want 4000 tokens", w.Holds, w.HoldsWhy)
+	}
+}
+
+// #2333: magpie quota --json and GET /v1/magpie/quotas reckon a window's
+// whole by the same WithWindowHolds the Usage page does, which usage hands
+// provider (ReckonHolds) since provider can't read the log itself.
+func TestQuotaReportsReckonByTheLog(t *testing.T) {
+	holdsHome(t)
+	now := holdClock(t, time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC))
+	reset := now.Add(2 * time.Hour)
+	for _, ago := range []time.Duration{8 * 24 * time.Hour, time.Hour} {
+		Append(Record{Time: now.Add(-ago), Agent: "codex", Provider: "codex", ProviderAccount: "sam@example.com", Model: "gpt-5.5", Input: 4000, Output: 1000, Status: 200})
+	}
+	if provider.ReckonHolds == nil {
+		t.Fatal("provider.ReckonHolds isn't set: the quota reports tell no whole")
+	}
+	qs := provider.ReckonHolds([]provider.SubscriptionQuota{{Provider: "codex", User: "sam@example.com", Windows: []provider.QuotaWindow{
+		{Name: "5 hours", Used: 10, ResetsAt: &reset, Span: 5 * time.Hour},
+		{Name: "7 days", Used: 2, ResetsAt: &reset, Span: 7 * 24 * time.Hour},
+	}}}, now)
+	if h := qs[0].Windows[0].Holds; h == nil || h.Tokens != 50000 || !h.Priced {
+		t.Fatalf("5 hours: %+v, want 50000 tokens, priced", h)
+	}
+	if qs[0].Windows[1].HoldsWhy != provider.HoldsLow {
+		t.Fatalf("7 days: why %q, want %q", qs[0].Windows[1].HoldsWhy, provider.HoldsLow)
+	}
+}
+
+// #2344: a window's whole is priced like the Usage page's cost, so a call
+// to a provider's own id no list prices is priced at the maker's list
+// price of the model the user said it is the same as (ModelSameAs), never
+// at a rate; without one it stays unpriced.
+func TestHoldsPriceTheModelItIsTheSameAs(t *testing.T) {
+	holdsHome(t)
+	if err := provider.Save(provider.Provider{ID: "wb", Name: "WB", Key: "k", Chat: "https://wb.example/v1",
+		Models: []string{"gpt-5-5-wb", "other"}, PriceRate: 0.5}); err != nil {
+		t.Fatal(err)
+	}
+	s := settings.Load()
+	s.ModelSameAs = map[string]string{"wb/gpt-5-5-wb": "gpt-5.5"}
+	if err := settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	priceOf := apiPricer()
+	if pr := priceOf(Record{Provider: "wb", Model: "gpt-5-5-wb"}); pr == nil || pr.Input != 1.25 {
+		t.Errorf("the model it is the same as wasn't its API price: %+v", pr)
+	}
+	if pr := priceOf(Record{Provider: "wb", Model: "other"}); pr != nil {
+		t.Errorf("a model with no Same as was priced: %+v", pr)
 	}
 }

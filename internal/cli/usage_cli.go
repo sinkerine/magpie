@@ -13,6 +13,7 @@ import (
 
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/fx"
+	pr "github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 	stats "github.com/yetone/magpie/internal/usage"
 )
@@ -193,7 +194,7 @@ func boolToInt(b bool) int {
 // printUsage is a summary's totals and its tables: agents, models,
 // upstream keys, accounts, gateway keys and the top sessions.
 func printUsage(out io.Writer, s stats.Summary, title string, names map[string]string) {
-	fmt.Fprintln(out, bold.Render(fmtTokens(s.Tokens())+" tokens"), muted.Render(title+" ·"), plural(s.Calls, "call"), muted.Render("·"), cost(s.Totals)+unpricedNote(s.Unpriced))
+	fmt.Fprintln(out, bold.Render(fmtTokens(s.Tokens())+" tokens"), muted.Render(title+" ·"), plural(s.Calls, "call"), muted.Render("·"), cost(s.Totals)+unpricedNote(s.Unpriced)+credits(s.Totals))
 	fmt.Fprintln(out, muted.Render("  in "+fmtTokens(s.Input)+"  out "+fmtTokens(s.Output)+"  cache read "+fmtTokens(s.CacheRead)+"  cache write "+fmtTokens(s.CacheWrite)+"  reasoning "+fmtTokens(s.Reasoning)),
 		func() string {
 			// requests, each counted once by how it ended: one a later try
@@ -219,7 +220,7 @@ func printUsage(out io.Writer, s stats.Summary, title string, names map[string]s
 			if s.Tokens() > 0 {
 				share = fmt.Sprintf("%3.0f%%", 100*float64(g.Tokens())/float64(s.Tokens()))
 			}
-			fmt.Fprintln(out, "  "+pad(name(g), w), muted.Render(share), pad(fmtTokens(g.Tokens()), 7), faint.Render(pad(plural(g.Calls, "call"), 10)), cost(g.Totals), faint.Render(speed(g.Totals)))
+			fmt.Fprintln(out, "  "+pad(name(g), w), muted.Render(share), pad(fmtTokens(g.Tokens()), 7), faint.Render(pad(plural(g.Calls, "call"), 10)), cost(g.Totals), faint.Render(speed(g.Totals)), muted.Render(stats.FormatCredits(g.Totals)))
 		}
 	}
 	provider := func(id string) string {
@@ -254,7 +255,8 @@ func printUsage(out io.Writer, s stats.Summary, title string, names map[string]s
 	}
 	if len(s.Accounts) > 0 {
 		table("accounts", s.Accounts, func(g stats.Group) string {
-			who := g.Account
+			// by the name the user gave it now (plugins#310)
+			who := pr.AccountShownOf(g.Provider, g.Account)
 			if who == "" {
 				who = "account not recorded"
 			}
@@ -336,6 +338,15 @@ func fmtTokens(n int) string {
 		return fmt.Sprintf("%.1fK", float64(n)/1e3)
 	}
 	return fmt.Sprint(n)
+}
+
+// credits is " · " and what the credited calls cost in their plans'
+// credits, as the replies said (#2512); "" when none said.
+func credits(t stats.Totals) string {
+	if c := stats.FormatCredits(t); c != "" {
+		return muted.Render(" · " + c)
+	}
+	return ""
 }
 
 // cost renders list-price cost, saying when some calls could not be

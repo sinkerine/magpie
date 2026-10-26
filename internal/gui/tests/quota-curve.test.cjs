@@ -82,6 +82,16 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       ];
       const shortReset = now - 12 * D + H;
       data.history[0].lines[0].points.unshift({ at: iso(now - 12 * D), left: 12, start: iso(shortReset - 5 * H), resetsAt: iso(shortReset) });
+      const historicalHolds = (tokens, used) => ({ tokens, priced: false, used, since: iso(now - 13 * D), routed: { calls: 2, tokens: tokens * used / 100 } });
+      data.historyHolds = (url) => {
+        const end = Date.parse(url.searchParams.get("to"));
+        const short = Math.abs(end - (now - 11 * D)) < 1000;
+        const used = short ? 30 : Math.abs(end - (now - 6 * D)) < 1000 ? 70 : 80;
+        return [{ provider: "codex", user: "a@x.com", windows: [
+          ...(short ? [{ name: "5 hours", holds: historicalHolds(12000, 88) }] : []),
+          { name: "Weekly", holds: historicalHolds(700000 + used, used) },
+        ] }];
+      };
       const reads = [];
       const handler = serve(lang, "light", false, data);
       await page.route("**/*", (r) => { if (r.request().url().includes("/quotas/history")) reads.push(r.request().url()); return handler(r); });
@@ -114,8 +124,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await items.nth(index).click();
         assert.equal(await pick.textContent(), w.past);
         assert.equal(await curve.locator(".qc-pace").textContent(), "", "a past cycle has no pace to tell");
-        assert.equal(await meters.locator(".quota-holds").count(), 0, "today's whole-window estimate is not presented as a historical estimate");
         const hasShort = index === 2;
+        await page.waitForFunction((n) => document.querySelector('.subscription-card[data-key="codex"] .quota-windows').querySelectorAll(".quota-holds").length === n, hasShort ? 2 : 1);
+        const estimates = await meters.locator(".quota-holds").allTextContents();
+        assert.ok(estimates.every((text) => !text.includes("100K") && !text.includes("$12")), "today's estimate is never used for history");
+        assert.equal(await meters.locator(".quota-holds").count(), hasShort ? 2 : 1, "historical estimates follow the sampled windows");
         assert.deepEqual(await curve.locator(".qc-key b").allTextContents(), hasShort ? ["12%", left + "%"] : [left + "%"], "the historical legend uses that cycle's final reading");
         assert.match(await meters.locator(".quota-n").nth(1).textContent(), new RegExp((100 - left) + "%"), "the weekly meter follows the historical selection");
         if (hasShort) assert.match(await meters.locator(".quota-n").first().textContent(), /88%/, "the 5-hour meter uses its last reading inside that cycle");
@@ -222,6 +235,7 @@ function serve(lang, theme, panel, data) {
     if (url.pathname === "/api/settings/quota-left") { settings.quotaLeft = route.request().postDataJSON().on; return json(settings); }
     if (url.pathname === "/api/providers") return json({ providers: [], presets: [], excluded: [], gateway: { running: true, window: true } });
     if (url.pathname === "/api/usage/quotas") return json(data.quotas);
+    if (url.pathname === "/api/usage/quotas/history/holds") return json(data.historyHolds ? await data.historyHolds(url) : []);
     if (url.pathname === "/api/usage/quotas/history") return json(data.history);
     if (url.pathname === "/api/usage") return json({ calls: 0, input: 0, output: 0, cost: 0, agents: [], accounts: [], models: [], series: [], days: [] });
     if (url.pathname === "/api/groups") return json({ groups: [], models: [] });
@@ -378,7 +392,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await spark.locator("path.qc-line").count(), 1);
       assert.equal((((await spark.locator("path.qc-line").getAttribute("d")).match(/M/g)) || []).length, 1, "the current cycle only");
       assert.equal(await spark.locator("line.qc-even").count(), 1);
-      // Both windows begun: the line reads "↻ 14:26 · Weekly …", and a pace
+      // Both windows begun: the line names both reset times, and a pace
       // after it would read as the week's, so none is said there (#2079)
       assert.equal(await pcard.locator(".pq-pace").count(), 0, "no pace beside another window's deadline");
       // the 5-hour window the only one begun: its pace, by its deadline
@@ -398,7 +412,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const scard = silent.locator(".pq-card", { hasText: "a@x.com" });
       await scard.waitFor();
       assert.equal(await scard.locator(".pq-pace").count(), 0, "nothing to say, nothing said");
-      assert.ok((await scard.locator(".pq-sub").textContent()).includes("↻"), "the deadline is still said");
+      assert.ok((await scard.locator(".pq-sub").textContent()).includes(lang === "zh" ? "重置于" : "Resets"), "the deadline is still named");
       // the line ends at now already; in 16px a dotted now line read as a
       // stray mark under the curve (#1601)
       assert.equal(await spark.locator("line.qc-now").count(), 0, "no now line in the thin spark");
@@ -662,5 +676,62 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     assert.equal(new Set(got.evens.map((e) => e.dash)).size, 1, "the paces share one dotted pattern");
     assert.ok(got.lines.every((l) => l.dash !== got.evens[0].dash), say);
     assert.deepEqual(errors, []);
+  });
+}
+
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  test(`${engine}: historical estimates ignore late answers and say why one is unknown`, async (t) => {
+    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+    t.after(() => browser.close());
+    const page = await (await browser.newContext({ viewport: { width: 440, height: 760 }, reducedMotion: "reduce" })).newPage();
+    page.setDefaultTimeout(5000);
+    const now = Date.now(), D = 24 * H;
+    const data = fixtures(now);
+    data.quotas = [data.quotas[0]];
+    data.quotas[0].windows = [data.quotas[0].windows[1]];
+    data.quotas[0].windows[0].holds = { tokens: 100000, priced: false, used: 30, routed: { calls: 1, tokens: 30000 } };
+    const point = (day, left, end) => ({ at: iso(now + day * D), left, start: iso(now + (end - 7) * D), resetsAt: iso(now + end * D) });
+    data.history = [{ provider: "codex", user: "a@x.com", lines: [{ name: "Weekly", points: [point(-17,90,-11),point(-12,40,-11),point(-10,90,-4),point(-5,30,-4),point(-3,90,3),point(-1,70,3)] }] }];
+    const answer = (tokens) => [{ provider: "codex", user: "a@x.com", windows: [{ name: "Weekly", holds: { tokens, priced: false, used: 60, since: iso(now - 18 * D), routed: { calls: 2, tokens: tokens * .6 } } }] }];
+    let release, requests = 0;
+    data.historyHolds = (url) => {
+      requests++;
+      if (Math.abs(Date.parse(url.searchParams.get("to")) - (now - 4 * D)) < 1000) return new Promise((resolve) => { release = () => resolve(answer(111000)); });
+      return answer(777000);
+    };
+    await page.route("**/*", serve("en", "light", false, data));
+    await page.goto("http://magpie.test/?view=usage");
+    const card = page.locator('.subscription-card[data-key="codex"]');
+    const pick = card.getByRole("button", { name: "Choose a recorded cycle" });
+    await pick.click();
+    await page.locator(".sess-menu .pm-item").nth(1).click();
+    await page.waitForFunction(() => document.querySelector(".quota-holds-why")?.textContent === "Loading…");
+    await pick.click();
+    await page.locator(".sess-menu .pm-item").nth(2).click();
+    await page.waitForFunction(() => document.querySelector(".quota-holds")?.textContent.includes("777K"));
+    assert.equal(typeof release, "function");
+    const delayed = page.waitForResponse((r) => r.url().includes("/history/holds") && new URL(r.url()).searchParams.get("to") === iso(now - 4 * D));
+    release();
+    await delayed;
+    assert.match(await card.locator(".quota-holds").textContent(), /777K/);
+    await pick.click();
+    await page.locator(".sess-menu .pm-item").first().click();
+    assert.match(await card.locator(".quota-holds").textContent(), /100K/, "current estimate is restored");
+    await pick.click();
+    await page.locator(".sess-menu .pm-item").nth(1).click();
+    await page.waitForFunction(() => document.querySelector(".quota-holds")?.textContent.includes("111K"));
+    assert.equal(requests, 2, "completed selections reuse their own estimate");
+    // a past cycle the server can't reckon says why, as a live one does
+    data.historyHolds = () => [{ provider: "codex", user: "a@x.com", windows: [{ name: "Weekly", holdsWhy: "log" }] }];
+    await card.locator(".quota-refresh").click();
+    await page.waitForFunction(() => document.querySelector(".quota-holds-why")?.textContent === "Whole: not enough data");
+    assert.match(await card.locator(".quota-holds-why").getAttribute("title"), /before magpie's request log/);
+    assert.equal(await card.locator(".quota-holds").count(), 0);
+    // and one with no estimate and no reason shows nothing, like a live card
+    data.historyHolds = () => [];
+    await card.locator(".quota-refresh").click();
+    await page.waitForFunction(() => !document.querySelector(".subscription-card[data-key=codex] .quota-holds-why"));
+    assert.equal(await card.locator(".quota-holds").count(), 0);
+    assert.deepEqual(await page.evaluate(() => ({ page: document.documentElement.scrollWidth > innerWidth, cards: [...document.querySelectorAll(".subscription-card")].some((c) => c.scrollWidth > c.clientWidth + 1) })), { page: false, cards: false });
   });
 }

@@ -126,11 +126,21 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           await lastAsked(asked, (q) => q.get("via") === "reported");
           await p.locator("#ledVia .blk:nth-child(4).on[aria-pressed=true]").waitFor();
           assert.equal(await p.locator("#ledVia .blk.on").count(), 1);
+          // the bar under the picked cell is straight and stops short of its
+          // rounded corners (the owner: "在拐角处没有紫色 border")
+          const barClear = (n) => p.locator("#ledVia .blk").nth(n).evaluate((b) => {
+            const c = getComputedStyle(b), bar = getComputedStyle(b, "::after");
+            return c.boxShadow === "none" && bar.content !== "none" && parseFloat(bar.height) === 2 &&
+              parseFloat(bar.left) >= parseFloat(c.borderBottomLeftRadius) && parseFloat(bar.right) >= parseFloat(c.borderBottomRightRadius);
+          });
+          assert(await barClear(3), "the last cell's bar clears its corner");
           assert.deepEqual(await labels(p), w.cells, "the cells stay while one is picked");
           await reach(p, p.locator("#ledVia .blk").nth(0));
           await p.locator("#ledVia .blk").nth(0).click();
           await lastAsked(asked, (q) => !q.has("via"));
           await p.locator("#ledVia .blk:nth-child(1).on").waitFor();
+          assert(await barClear(0), "and the first's");
+          if (shots) await p.screenshot({ clip: await p.locator("#ledVia").boundingBox(), path: path.join(shots, `via-picked-${engine}-${lang}-${width}.png`) });
           assert.deepEqual(errors, []);
         });
       }

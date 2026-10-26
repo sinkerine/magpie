@@ -66,19 +66,28 @@ func signIn(t *testing.T) string {
 	return home
 }
 
-// isolate keeps tests off the machine's own Claude Code and Cursor Keychain
+// isolate keeps tests off the machine's own Claude Code Keychain
 // logins and forgets anything a previous test cached.
-func isolate(t *testing.T) {
+func isolate(t testing.TB) {
 	t.Helper()
 	oldKeychain, oldBase, oldExe := claudeKeychain, claudeBase, claudeExecutable
-	oldCursor, oldDevin := cursorKeychain, DevinExecutable
-	claudeKeychain, cursorKeychain = false, false
+	oldDevin := DevinExecutable
+	claudeKeychain = false
 	claudeExecutable = func() string { return "" }
 	// the machine's own devin, if it has one, is no test's
 	DevinExecutable = func() string { return "" }
 	forgetClaudeCredential()
 	forgetClaudeStatus()
-	forgetDevinStatus()
+	devinStatus.forget()
+	// nor Codex's keychain item (#2367): a test's has nothing in it,
+	// whatever the system
+	oldCodexKeychain, oldCodexHere := codexKeychain, codexKeychainHere
+	codexKeychain = &fakeKeychain{}
+	resetCodexKeychain()
+	// a test's keychain answers at once: however loaded the machine, a
+	// read isn't taken for one waiting on a prompt
+	oldHold := keychainHold
+	keychainHold = time.Minute
 	// nor an account's allowance another test read, which LoginUsage and
 	// the Usage page share
 	loginUsageCache.Lock()
@@ -94,10 +103,13 @@ func isolate(t *testing.T) {
 	ForgetBalances()
 	t.Cleanup(func() {
 		claudeKeychain, claudeBase, claudeExecutable = oldKeychain, oldBase, oldExe
-		cursorKeychain, DevinExecutable = oldCursor, oldDevin
+		DevinExecutable = oldDevin
+		codexKeychain, codexKeychainHere = oldCodexKeychain, oldCodexHere
+		keychainHold = oldHold
+		resetCodexKeychain()
 		forgetClaudeCredential()
 		forgetClaudeStatus()
-		forgetDevinStatus()
+		devinStatus.forget()
 	})
 }
 
@@ -289,7 +301,7 @@ func TestClaudeAccountIsProvider(t *testing.T) {
 	t.Cleanup(catalog.Reset)
 
 	p, ok := find(All(), "claude")
-	if !ok || p.Account == nil || p.Account.User != "Claude Max" || p.Account.Plan != "max" || !p.Ready() {
+	if !ok || p.Account == nil || p.Account.User != "Claude Max" || !p.Account.Unnamed() || p.Account.Plan != "max" || !p.Ready() {
 		t.Fatalf("claude: %+v %v", p, ok)
 	}
 	if p.Anthropic != claudeBase || p.Chat != "" || p.Responses != "" || p.Host() == "" {

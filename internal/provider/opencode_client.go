@@ -54,6 +54,42 @@ func OpenCodeClient(h http.Header, session string) {
 	h.Set("x-opencode-project", "global")
 }
 
+// OpenCodeURL says whether u is at OpenCode's gateway (Zen, Go or the
+// inference API): opencode.ai or a name under it, whatever port the URL
+// gives. What goes there is judged by the URL it goes to, not by the
+// provider's first base (IsOpenCode), so a custom provider whose URL
+// names a port, or one with only some of its endpoints there, is asked
+// as OpenCode asks too.
+func OpenCodeURL(u string) bool {
+	pu, err := url.Parse(strings.TrimSpace(u))
+	return err == nil && openCodeHost(pu.Hostname())
+}
+
+// openCodeHost says whether h (no port) is one of OpenCode's names.
+func openCodeHost(h string) bool {
+	h = strings.TrimSuffix(strings.ToLower(h), ".")
+	return h == "opencode.ai" || strings.HasSuffix(h, ".opencode.ai")
+}
+
+// OpenCodeSession names a session on a request to OpenCode's gateway that
+// names none yet: since September 2026 it answers every request without
+// x-opencode-session 400 "Request is missing x-opencode-session and
+// cannot be routed efficiently" (luci on Discord). A call that is no
+// conversation's turn — a model list, a System One decision, a key check —
+// gets a session of its own, as OpenCode gives its own stateless calls
+// one (packages/core/src/generate.ts: "Gateways require session
+// attribution even for a stateless call"). A turn's is named before this,
+// by OpenCodeClient, and stays; so does one the user set on the provider.
+// Sign calls it, so every signed request has it.
+func OpenCodeSession(h http.Header, u string) {
+	if !OpenCodeURL(u) || h.Get("x-opencode-session") != "" {
+		return
+	}
+	id := openCodeSession("")
+	h.Set("x-opencode-session", id)
+	h.Set("x-opencode-session-id", id)
+}
+
 // OpenCodeFree says whether model is one of OpenCode Zen's free ones on p,
 // which Zen serves only to what looks like OpenCode: besides the headers
 // OpenCodeClient sets, a streamed request offering tools named bash and
@@ -105,7 +141,7 @@ func OpenCodeFreeURL(u string) string {
 	if err != nil || pu.Scheme == "" {
 		return u
 	}
-	if h := strings.ToLower(pu.Hostname()); h != "opencode.ai" && !strings.HasSuffix(h, ".opencode.ai") {
+	if !openCodeHost(pu.Hostname()) {
 		return u
 	}
 	rest, ok := strings.CutPrefix(pu.Path, "/zen")

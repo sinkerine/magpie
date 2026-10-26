@@ -385,6 +385,37 @@ func TestKeepCodexDaemonCurrent(t *testing.T) {
 	}
 }
 
+// The processes are listed only when a pid file says a daemon started
+// before the change: listing them is a PowerShell run on Windows, which
+// the look every 15s made for as long as magpie ran (#2341).
+func TestKeepCodexDaemonCurrentListsOnlyWhenBehind(t *testing.T) {
+	pid := fakeDaemon(t)
+	fakeCodex(t, 0)
+	home, _ := os.UserHomeDir()
+	home = filepath.Join(home, ".codex")
+	lists := 0
+	listProcesses = func(context.Context) ([]proc.Process, error) {
+		lists++
+		return nil, nil
+	}
+	ctx := context.Background()
+	*pid = 50
+	// no pid file: no daemon to be behind
+	KeepCodexDaemonCurrent(ctx, home, time.Now())
+	// one written after the change: it has the list
+	started := time.Now().Add(-time.Hour).Truncate(time.Second)
+	writeDaemonPID(t, home, "50", started)
+	KeepCodexDaemonCurrent(ctx, home, started.Add(-time.Minute))
+	if lists != 0 {
+		t.Fatalf("processes listed %d times with no daemon behind", lists)
+	}
+	// one written before the change: listed, to see it runs
+	KeepCodexDaemonCurrent(ctx, home, time.Now())
+	if lists != 1 {
+		t.Fatalf("processes listed %d times for a daemon behind, want 1", lists)
+	}
+}
+
 // A failed restart is said, not taken for one done.
 func TestKeepCodexDaemonCurrentFails(t *testing.T) {
 	pid := fakeDaemon(t)

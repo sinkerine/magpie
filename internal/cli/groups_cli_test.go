@@ -81,8 +81,19 @@ func TestParseRoutingStays(t *testing.T) {
 			t.Errorf("routing %q: %q %v, want %q", in, got, err, want)
 		}
 	}
-	if _, err := parseRouting("fastest"); err == nil || !strings.Contains(err.Error(), "smart, order, rotate, usage") {
+	if _, err := parseRouting("fastest"); err == nil || !strings.Contains(err.Error(), "smart, order, rotate, usage") || !strings.Contains(err.Error(), "<plugin>/<name>") {
 		t.Errorf("unknown routing: %v", err)
+	}
+	// a gateway plugin's routing is taken as it is written, and named so
+	for _, in := range []string{"latency/fastest", "magpie-fastest/byTTFT", "x.y/a_b-1"} {
+		if got, err := parseRouting(" " + in + " "); err != nil || got != in || routingName(got) != in {
+			t.Errorf("plugin routing %q: %q %v %q", in, got, err, routingName(got))
+		}
+	}
+	for _, in := range []string{"/fastest", "latency/", "a/b/c", "a b/c"} {
+		if _, err := parseRouting(in); err == nil {
+			t.Errorf("routing %q taken", in)
+		}
 	}
 	for in, want := range map[string]string{"auto": "", "session": "session", "turn": "turn", "OFF": "off"} {
 		if got, err := parseStays(in); err != nil || got != want {

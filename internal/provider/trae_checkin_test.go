@@ -140,8 +140,10 @@ func TestTraeCheckinAnswers(t *testing.T) {
 		t.Fatalf("9095: %+v", rs)
 	}
 	dev.asked()
-	if rs := c.checkinNow(ctx, true); rs[0].Outcome != CheckinIneligible || len(dev.asked()) != 0 {
-		t.Fatalf("9095 asked again: %+v", rs)
+	// a press asks again, on the same device: a 9095 from before the
+	// vendor's day turned may be yesterday's (#3326)
+	if rs := c.checkinNow(ctx, true); rs[0].Outcome != CheckinIneligible || strings.Join(dev.asked(), ", ") != "POST /status, POST /claim" {
+		t.Fatalf("9095 pressed: %+v", rs)
 	}
 
 	// a failure that got no answer is tried again the same day
@@ -178,9 +180,10 @@ func TestTraeCheckinAnswers(t *testing.T) {
 }
 
 // #808: with the check-in on and today's not in, a claim answered 9074
-// 「当前参与用户太多，请稍后再试」 (the reporter's bytes) is Trae paying
-// only its own app: the day's answer, so neither the loop nor a press
-// claims again that day; the account is told to check in in Trae's app.
+// 「当前参与用户太多，请稍后再试」 (the reporter's bytes) is Trae refusing
+// the claim: the day's answer, so neither the loop nor a press claims
+// again that day; the account is told Trae CN refused it and to check in
+// in Trae's app (#1920).
 // The next day it is asked as any other.
 func TestTraeCheckin9074IsOwnAppOnly(t *testing.T) {
 	ctx := context.Background()

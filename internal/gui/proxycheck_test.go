@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -15,10 +16,14 @@ import (
 // proxyCheckRig: a trace page at a name that resolves nowhere
 // (trace.example.invalid), answered as 198.51.100.7 in CN by a server the
 // test's dialer sends a direct request to, and a forward proxy that
-// answers it as 203.0.113.9 in US. Nothing leaves the machine: the name
-// is .invalid and both servers are loopback.
-func proxyCheckRig(t *testing.T) (client *http.Client, proxyURL string, asked *int) {
+// answers it as 203.0.113.9 in US (or as exit, when given). Nothing
+// leaves the machine: the name is .invalid and both servers are loopback.
+func proxyCheckRig(t *testing.T, exit ...string) (client *http.Client, proxyURL string, asked *int) {
 	t.Helper()
+	answer := "fl=1\nip=203.0.113.9\nloc=US\n"
+	if len(exit) > 0 {
+		answer = exit[0]
+	}
 	asked = new(int)
 	direct := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(rw, "fl=1\nh=trace.example.invalid\nip=198.51.100.7\nts=1\nloc=CN\nwarp=off\n")
@@ -30,7 +35,7 @@ func proxyCheckRig(t *testing.T) (client *http.Client, proxyURL string, asked *i
 			http.Error(rw, "not the trace page: "+r.URL.String(), http.StatusBadGateway)
 			return
 		}
-		fmt.Fprint(rw, "fl=1\nip=203.0.113.9\nloc=US\n")
+		fmt.Fprint(rw, answer)
 	}))
 	t.Cleanup(proxy.Close)
 	old := proxyTraceURL
@@ -61,6 +66,59 @@ func TestProxyCheckTellsTheProxyFromDirect(t *testing.T) {
 	}
 	if *asked != 1 {
 		t.Fatalf("the proxy was asked %d times, want 1 (the direct request went through it?)", *asked)
+	}
+	if !got.Through.Proxied || got.Direct.Proxied {
+		t.Fatalf("proxied: through %v, direct %v; want true, false", got.Through.Proxied, got.Direct.Proxied)
+	}
+}
+
+// #2369 (Emt-lin): under a TUN that takes every connection (FlClash with
+// auto-route), the direct request leaves by the proxy's exit too, so both
+// say one address. The request through the proxy still went to it, and
+// the answer says so: Proxied, not "as if there were no proxy".
+func TestProxyCheckSaysTheProxyTookItUnderOneExit(t *testing.T) {
+	client, proxyURL, asked := proxyCheckRig(t, "fl=1\nip=198.51.100.7\nloc=CN\n")
+	ctx := context.Background()
+	got := checkProxy(ctx, client, netproxy.With(ctx, proxyURL), true)
+	if got.Through == nil || got.Through.IP != got.Direct.IP || got.Through.Error != "" {
+		t.Fatalf("one exit both ways: through %+v, direct %+v", got.Through, got.Direct)
+	}
+	if !got.Through.Proxied || *asked != 1 {
+		t.Fatalf("the request through the proxy reached it (asked %d), yet proxied = %v", *asked, got.Through.Proxied)
+	}
+}
+
+// A proxy the trace page is passed by (NO_PROXY names it): the request
+// "through" it went direct, and Proxied says so.
+func TestProxyCheckSaysAProxyPassedBy(t *testing.T) {
+	client, proxyURL, asked := proxyCheckRig(t)
+	t.Setenv("ALL_PROXY", proxyURL)
+	t.Setenv("NO_PROXY", "trace.example.invalid")
+	ctx := context.Background()
+	got := checkProxy(ctx, client, ctx, true)
+	if got.Through == nil || got.Through.IP != "198.51.100.7" || *asked != 0 {
+		t.Fatalf("passed by: %+v, the proxy asked %d times", got.Through, *asked)
+	}
+	if got.Through.Proxied {
+		t.Fatal("a request that went direct says it went through the proxy")
+	}
+}
+
+// connectedTo matches a proxy named by host name to the address it
+// resolves to, and tells another port apart.
+func TestProxyCheckConnectedToByName(t *testing.T) {
+	ctx := context.Background()
+	at := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7890}
+	for raw, want := range map[string]bool{
+		"http://localhost:7890":   true,
+		"http://127.0.0.1:7890":   true,
+		"http://127.0.0.1:7891":   false,
+		"socks5://127.0.0.2:7890": false,
+	} {
+		u, _ := url.Parse(raw)
+		if got := connectedTo(ctx, at, u); got != want {
+			t.Errorf("%s: connectedTo = %v, want %v", raw, got, want)
+		}
 	}
 }
 

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -9,14 +10,17 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 )
 
-// advisorTurn is a Claude Code turn with its advisor on, the tool as
-// Claude Code 2.1.299 declares it (read from its request to a fake
-// ANTHROPIC_BASE_URL, --advisor opus with the opus tier on magpie's id).
+// advisorTurn is a Claude Code turn with its advisor on, as Claude Code
+// 2.1.300 sends it (read from its request to a fake ANTHROPIC_BASE_URL in
+// a sandbox HOME, --advisor; the environment text cut short, the agent's
+// tools but Read left out): the server tool, and a {role: "system"} message
+// holding the advisor's instructions and a tool_addition naming it.
 func advisorTurn(model, advisor string) string {
-	return `{"model":"` + model + `","max_tokens":64,"stream":true,` +
-		`"messages":[{"role":"user","content":"hi"}],` +
-		`"tools":[{"name":"Read","description":"read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}},` +
-		`{"type":"advisor_20260301","name":"advisor","model":"` + advisor + `","defer_loading":true}]}`
+	b, err := os.ReadFile("testdata/claude-code-advisor-turn.json")
+	if err != nil {
+		panic(err)
+	}
+	return strings.NewReplacer(`"MODEL"`, `"`+model+`"`, `"ADVISOR"`, `"`+advisor+`"`).Replace(string(b))
 }
 
 // Claude Code's advisor names its model as Claude Code names its own: on
@@ -67,5 +71,72 @@ func TestAdvisorModelAsTheUpstreamNamesIt(t *testing.T) {
 		if !strings.Contains(b, `"name":"Read"`) {
 			t.Errorf("%s: the agent's own tool lost: %s", c.name, b)
 		}
+		advisorSaid(t, c.name, b, c.want != "")
+	}
+}
+
+// advisorSaid checks what an upstream body b tells the model of the
+// advisor: with it on (on), Claude Code's instructions and the
+// tool_addition naming it as Claude Code sent them; with it left out,
+// neither, and Claude Code's own word that it is gone. The rest of the
+// message holding them stays.
+func advisorSaid(t *testing.T, name, b string, on bool) {
+	t.Helper()
+	instructions := strings.Contains(b, "You have access to an `advisor` tool")
+	ref := false
+	gjson.Get(b, "messages").ForEach(func(_, m gjson.Result) bool {
+		m.Get("content").ForEach(func(_, blk gjson.Result) bool {
+			if blk.Get("type").String() == "tool_addition" && blk.Get("tool.name").String() == "advisor" {
+				ref = true
+			}
+			return true
+		})
+		return true
+	})
+	switch {
+	case on && (!instructions || !ref):
+		t.Errorf("%s: advisor on, but its instructions (%v) or tool_addition (%v) lost: %s", name, instructions, ref, b)
+	case !on && (instructions || ref):
+		// the model called advisor() as the agent's tool: "No such tool
+		// available: advisor" (JackChou on Discord)
+		t.Errorf("%s: advisor left out, but its instructions (%v) or tool_addition (%v) still sent: %s", name, instructions, ref, b)
+	case !on && !strings.Contains(b, advisorGone):
+		t.Errorf("%s: advisor left out without saying so: %s", name, b)
+	}
+	if !strings.Contains(b, "Today's date is 2026-10-15.") {
+		t.Errorf("%s: the system message's own text lost: %s", name, b)
+	}
+}
+
+// A translation has no advisor to offer: the tool goes with every other
+// server tool, and Claude Code's instructions to call it are said to be
+// void, so the model doesn't call advisor() as one of the agent's tools
+// (JackChou on Discord: "找不到对应工具").
+func TestAdvisorLeftOutOnTranslation(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		api   func(p *provider.Provider, url string)
+		model string
+	}{
+		{"chat", func(p *provider.Provider, url string) { p.Chat = url + "/v1" }, "glm-5.1"},
+		{"responses", func(p *provider.Provider, url string) { p.Responses = url + "/v1" }, "gpt-5.5"},
+		{"gemini", func(p *provider.Provider, url string) { p.Gemini = url + "/v1beta" }, "gemini-3.5-pro"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			u, url := newBillingUpstream(t)
+			p := provider.Provider{ID: "v", Name: "V", Key: "k", Models: []string{c.model}}
+			c.api(&p, url)
+			if err := provider.Save(p); err != nil {
+				t.Fatal(err)
+			}
+			claudeCodeSends(t, advisorTurn("v/"+c.model, "claude-opus-5-5"))
+			b := u.last(t)
+			if strings.Contains(b, "advisor_") {
+				t.Errorf("the advisor server tool sent: %s", b)
+			}
+			advisorSaid(t, c.name, b, false)
+		})
 	}
 }

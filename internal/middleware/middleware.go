@@ -1,7 +1,7 @@
 // Package middleware runs the gateway middleware plugins declare: a
-// module with onRequest, onEvent and onResponse hooks that the gateway
-// calls on every request an agent sends it, every event of the reply's
-// stream and every whole reply.
+// module with onRequest, onProvider, onEvent and onResponse hooks that the
+// gateway calls on every request an agent sends it, each provider it tries
+// the request on, every event of the reply's stream and every whole reply.
 //
 // It runs in the gateway's own process, in moejs, a JavaScript engine
 // written in Go: a hook on one streamed event costs about a microsecond,
@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Calcium-Ion/moejs"
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/jsmod"
 	"github.com/yetone/magpie/internal/plugin"
 )
@@ -44,9 +45,11 @@ type mw struct {
 	spec, name string
 	mod        *moejs.Module
 	onReq      moejs.Hook
+	onProv     moejs.Hook
 	onEv       moejs.Hook
 	onResp     moejs.Hook
 	hasReq     bool
+	hasProv    bool
 	hasEv      bool
 	hasResp    bool
 	// events are the stream events onEvent is called for, by name; nil
@@ -54,8 +57,15 @@ type mw struct {
 	events  map[string]bool
 	options []byte // the plugin's options, as JSON
 	pool    sync.Pool
+	// strats are its strategies and onUse its onUsage (points.go), which
+	// run in pt
+	strats []strat
+	onUse  moejs.Hook
+	hasUse bool
+	pt     *points
 
 	calls, nanos, failures atomic.Int64
+	orders, rows, dropped  atomic.Int64 // strategy calls, onUsage calls, rows dropped
 	lastErr                atomic.Pointer[string]
 	logged                 atomic.Int64 // lines logged this minute, and the minute
 }
@@ -65,23 +75,32 @@ type set struct {
 	stamp string
 	list  []*mw
 	errs  map[string]string // by spec: why it didn't load
+	// hooked: some module of list has onRequest, onProvider, onEvent or
+	// onResponse
+	hooked      bool
+	droppedSaid atomic.Int64
 }
 
 var (
 	loadMu    sync.Mutex
 	cur       atomic.Pointer[set]
 	nextCheck atomic.Int64
+	// checkedGen is filememo's generation when current last looked
+	checkedGen atomic.Uint64
 )
 
 // current is the middleware in force, loaded again when plugins.json or a
-// middleware's file changed, which is looked at once a second.
+// middleware's file changed, which is looked at once a second, and at
+// once after magpie wrote a file of its own.
 func current() *set {
 	s := cur.Load()
 	now := time.Now().UnixNano()
 	n := nextCheck.Load()
-	if s != nil && (now < n || !nextCheck.CompareAndSwap(n, now+int64(time.Second))) {
+	g := filememo.Gen()
+	if s != nil && g == checkedGen.Load() && (now < n || !nextCheck.CompareAndSwap(n, now+int64(time.Second))) {
 		return s
 	}
+	checkedGen.Store(g)
 	st := stamp()
 	if s != nil && s.stamp == st {
 		return s
@@ -144,6 +163,7 @@ func load(st string) *set {
 			continue
 		}
 		s.list = append(s.list, m)
+		s.hooked = s.hooked || m.hasReq || m.hasProv || m.hasEv || m.hasResp
 	}
 	return s
 }
@@ -172,10 +192,14 @@ func compile(e plugin.Entry, file string) (*mw, error) {
 		return nil, err
 	}
 	m.onReq, m.hasReq = in.hook("onRequest")
+	m.onProv, m.hasProv = in.hook("onProvider")
 	m.onEv, m.hasEv = in.hook("onEvent")
 	m.onResp, m.hasResp = in.hook("onResponse")
-	if !m.hasReq && !m.hasEv && !m.hasResp {
-		return nil, errors.New("exports none of onRequest, onEvent and onResponse")
+	if err := m.discover(in); err != nil {
+		return nil, err
+	}
+	if !m.hasReq && !m.hasProv && !m.hasEv && !m.hasResp && len(m.strats) == 0 && !m.hasUse {
+		return nil, errors.New("exports none of onRequest, onProvider, onEvent, onResponse, strategies and onUsage")
 	}
 	if names, ok := in.strings("events"); ok {
 		m.events = map[string]bool{}
@@ -404,6 +428,15 @@ type State struct {
 	AvgMicro float64  `json:"avgMicros"`
 	Failures int64    `json:"failures"`
 	Last     string   `json:"lastError,omitempty"`
+	// Strategies are the routings it serves ("<plugin>/<name>"), Orders
+	// how many times they were asked; Usage says it has onUsage, Rows how
+	// many rows it was given and Dropped how many it missed, the queue
+	// full
+	Strategies []string `json:"strategies,omitempty"`
+	Orders     int64    `json:"orders,omitempty"`
+	Usage      bool     `json:"usage,omitempty"`
+	Rows       int64    `json:"rows,omitempty"`
+	Dropped    int64    `json:"dropped,omitempty"`
 }
 
 // States are the middleware plugins, by spec.
@@ -418,11 +451,15 @@ func States() map[string]State {
 		for _, h := range []struct {
 			ok   bool
 			name string
-		}{{m.hasReq, "onRequest"}, {m.hasEv, "onEvent"}, {m.hasResp, "onResponse"}} {
+		}{{m.hasReq, "onRequest"}, {m.hasProv, "onProvider"}, {m.hasEv, "onEvent"}, {m.hasResp, "onResponse"}} {
 			if h.ok {
 				st.Hooks = append(st.Hooks, h.name)
 			}
 		}
+		for _, x := range m.strats {
+			st.Strategies = append(st.Strategies, m.routing(x.name))
+		}
+		st.Orders, st.Usage, st.Rows, st.Dropped = m.orders.Load(), m.hasUse, m.rows.Load(), m.dropped.Load()
 		for n := range m.events {
 			st.Events = append(st.Events, n)
 		}

@@ -59,7 +59,7 @@ var movedNames = map[string]string{CommandCodePlanID: "Command Code Plan"}
 
 // pluginCard is the name and icon pp's usage cards show.
 func pluginCard(pp plugin.Provider) (string, string) {
-	if c, ok := movedCards[pp.ID]; ok && Moved(pp.ID) {
+	if c, ok := movedCards[pp.ID]; ok && PluginServes(pp.ID) {
 		return c.name, c.icon
 	}
 	name := pp.Name
@@ -136,19 +136,32 @@ func quotaOfPlugin(q SubscriptionQuota, u plugin.Usage) SubscriptionQuota {
 		q.User = u.User
 	}
 	q.Balance, q.Renew, q.Error = u.Balance, u.Renew, u.Error
+	q.PluginError = u.Error != ""
 	if t, err := time.Parse(time.RFC3339, u.Until); err == nil {
 		q.Until = &t
 	}
 	if r := u.Resets; r != nil {
-		q.Resets = &ResetCredits{Count: r.Count, ByWindow: r.ByWindow, FiveHour: r.FiveHour, Weekly: r.Weekly}
+		q.Resets = &ResetCredits{Count: r.Count, ByWindow: r.ByWindow, FiveHour: r.FiveHour, Weekly: r.Weekly, Team: r.Team}
 		if t, err := time.Parse(time.RFC3339, r.Until); err == nil {
 			q.Resets.Until = &t
 		}
+		for _, e := range r.Each {
+			c := ResetCard{Window: e.Window}
+			if t, err := time.Parse(time.RFC3339, e.Until); err == nil {
+				c.Until = &t
+			}
+			q.Resets.Each = append(q.Resets.Each, c)
+		}
+		sortResetCards(q.Resets.Each)
 	}
 	for _, x := range u.Windows {
 		w := QuotaWindow{Name: x.Name, Used: x.Used, ResetSecs: x.ResetSecs, Display: x.Display,
 			Amount: x.Amount, Limit: x.Limit, Unit: x.Unit,
 			Span: time.Duration(x.Span * float64(time.Second)), Model: strings.ToLower(x.Model), Aside: x.Aside}
+		// a row set aside with text and nothing counted is that text: a
+		// window that counts nothing yet says 0 with a count, or with no
+		// text, and one that stops the account is a reading at 0
+		w.Text = x.Aside && x.Display != "" && x.Used == 0 && x.Amount == 0 && x.Limit == 0
 		if t, err := time.Parse(time.RFC3339, x.ResetsAt); err == nil {
 			w.ResetsAt = &t
 		}

@@ -21,9 +21,12 @@ const searchUsage = `usage:
                                              or with pick=order the first until it is refused)
   magpie search add searxng url=<address> [<key>]
   magpie search add you [<key>]              You.com: free with no key (100 searches a day)
+  magpie search off <api>                    keep one, key and all, but never ask it
+  magpie search on <api>                     ask it again
+  magpie search move <api> <n>               put one at place n in the order they are asked
   magpie search rm <api>                     take one away
 
-  apis: tavily, brave, exa, firecrawl, you, searxng
+  apis: tavily, brave, exa, firecrawl, you, deepseek, searxng
 
   url= is the API's base URL, for an endpoint of your own that answers as that API
   does (e.g. url=https://search.example.com/tavily). Without it the vendor's own is
@@ -37,8 +40,9 @@ const searchUsage = `usage:
 
   A client's web search (Claude Code's WebSearch, Codex's web_search) is done by the
   model's provider when it can search, then by a provider that can (a Claude or ChatGPT
-  account, OpenAI, Anthropic, OpenRouter…), and then by these, in the order they were
-  added: what they find goes to the model as it is, and no model is asked to read it.
+  account, OpenAI, Anthropic, OpenRouter…), and then by these, in their order (the order
+  they were added, until one is moved), skipping one switched off: what they find goes
+  to the model as it is, and no model is asked to read it.
   Without any of them, the client's search is left out.
 
   e.g. magpie search add tavily tvly-…
@@ -49,7 +53,7 @@ func searchCmd(args []string) error {
 	if len(args) == 0 {
 		as := provider.StoredSearchAPIs()
 		if len(as) == 0 {
-			fmt.Println(muted.Render("  no search API · magpie search add <tavily|brave|exa|firecrawl|you|searxng> <key>"))
+			fmt.Println(muted.Render("  no search API · magpie search add <tavily|brave|exa|firecrawl|you|deepseek|searxng> <key>"))
 			return nil
 		}
 		for i, a := range as {
@@ -66,6 +70,9 @@ func searchCmd(args []string) error {
 			line := fmt.Sprintf("  %d. %s  %s", i+1, pad(a.Name(), 14), muted.Render(what))
 			if !a.Ready() {
 				line += "  " + faint.Render("needs its key")
+			}
+			if a.Off {
+				line += "  " + amber.Render("off")
 			}
 			fmt.Println(line)
 			if gateway.CanReadSearchQuota(a) {
@@ -113,6 +120,39 @@ func searchCmd(args []string) error {
 		i := slices.IndexFunc(as, func(x provider.SearchAPI) bool { return x.Vendor == a.Vendor })
 		fmt.Println(green.Render("✓"), as[i].Name(), muted.Render(fmt.Sprintf("search API %d of %d", i+1, len(as))))
 		return nil
+	case "on", "off":
+		if len(args) != 2 {
+			return fmt.Errorf("magpie search %s <api>", args[0])
+		}
+		if err := provider.SwitchSearchAPI(strings.ToLower(args[1]), args[0] == "on"); err != nil {
+			return err
+		}
+		fmt.Println(green.Render("✓"), strings.ToLower(args[1]), args[0])
+		return nil
+	case "move", "mv":
+		n := 0
+		if len(args) == 3 {
+			fmt.Sscan(args[2], &n)
+		}
+		as := provider.StoredSearchAPIs()
+		i := slices.IndexFunc(as, func(x provider.SearchAPI) bool { return len(args) > 1 && x.Vendor == strings.ToLower(args[1]) })
+		if len(args) != 3 || n < 1 || n > len(as) {
+			return fmt.Errorf("magpie search move <api> <n>, n from 1 to %d", len(as))
+		}
+		if i < 0 {
+			return fmt.Errorf("no %s search API is set up", strings.ToLower(args[1]))
+		}
+		order := []string{}
+		for _, a := range as {
+			order = append(order, a.Vendor)
+		}
+		v := order[i]
+		order = slices.Insert(slices.Delete(order, i, i+1), n-1, v)
+		if err := provider.ArrangeSearchAPIs(order); err != nil {
+			return err
+		}
+		fmt.Println(green.Render("✓"), as[i].Name(), muted.Render(fmt.Sprintf("search API %d of %d", n, len(as))))
+		return nil
 	case "rm", "remove":
 		if len(args) != 2 {
 			return fmt.Errorf("magpie search rm <api>")
@@ -123,7 +163,7 @@ func searchCmd(args []string) error {
 		fmt.Println(green.Render("✓"), "removed")
 		return nil
 	}
-	return fmt.Errorf("magpie search [add|rm] (magpie search help)")
+	return fmt.Errorf("magpie search [add|on|off|move|rm] (magpie search help)")
 }
 
 // quotaLine is what one key has used of its limit, as magpie search lists

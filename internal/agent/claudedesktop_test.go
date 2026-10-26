@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/desktopdir"
+	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 )
@@ -143,6 +144,7 @@ func TestClaudeDesktopFresh(t *testing.T) {
 		"inferenceProvider": "gateway", "inferenceGatewayBaseUrl": gateway.URL(),
 		"inferenceGatewayApiKey": "magpie-claude-desktop", "inferenceGatewayAuthScheme": "bearer",
 		"disableDeploymentModeChooser": true, "coworkEgressAllowedHosts": []any{"*"},
+		"claudeAiImport": map[string]any{"enabled": true, "bannerBehavior": "detect"},
 	}
 	if prof := desktopJSON(t, p.prof); !reflect.DeepEqual(prof, want) {
 		t.Errorf("profile: %v", prof)
@@ -366,6 +368,7 @@ func TestClaudeDesktopOnKeepsTheUsersOwnGatewayProfile(t *testing.T) {
 	json.Unmarshal([]byte(body), &want)
 	want["inferenceGatewayApiKey"] = "magpie-claude-desktop"
 	want["inferenceGatewayAuthScheme"] = "bearer"
+	want["claudeAiImport"] = map[string]any{"enabled": true, "bannerBehavior": "detect"}
 	if prof := desktopJSON(t, p.prof); !reflect.DeepEqual(prof, want) {
 		t.Errorf("magpie's profile:\n%v\nwant\n%v", prof, want)
 	}
@@ -655,5 +658,190 @@ func TestClaudeDesktopMSIXChecksTheFoldersDesktopRuns(t *testing.T) {
 	}
 	if got := a.Field("sonnet").Get(); got != "v/a" {
 		t.Errorf("sonnet: %q", got)
+	}
+}
+
+// Claude-3p is a userData of its own, so Desktop on magpie started in the
+// system's language, not the one picked signed in with Anthropic (memory
+// and Osal on Discord: Chinese gone). The language is carried into
+// Claude-3p's config.json, nothing else of Claude's is, and off takes the
+// file magpie made for it away again.
+func TestClaudeDesktopCarriesTheLanguage(t *testing.T) {
+	home, p := desktopSandbox(t)
+	own := "{\n  \"locale\": \"zh-CN\",\n  \"userThemeMode\": \"dark\"\n}\n"
+	desktopWrite(t, p.app, own)
+	before := desktopTree(t, p)
+
+	f := claudeDesktop(home).Field("provider")
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if m := desktopJSON(t, p.app3p); !reflect.DeepEqual(m, map[string]any{"locale": "zh-CN"}) {
+		t.Errorf("Claude-3p's config.json: %v", m)
+	}
+	if b, _ := os.ReadFile(p.app); string(b) != own {
+		t.Errorf("Claude's config.json changed:\n%s", b)
+	}
+	if err := f.Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if after := desktopTree(t, p); !reflect.DeepEqual(after, before) {
+		t.Fatalf("off left:\n%v\nwas:\n%v", after, before)
+	}
+}
+
+// A language already set in 3p mode (Desktop's, or the user's by hand) is
+// theirs: no write of magpie's changes Claude-3p's config.json, on, again,
+// off and on again, and off leaves it there.
+func TestClaudeDesktopKeepsThe3pLanguage(t *testing.T) {
+	home, p := desktopSandbox(t)
+	desktopWrite(t, p.app, `{"locale":"zh-CN"}`)
+	mine := "{\n  \"locale\": \"ja-JP\",\n  \"windowBounds\": {\n    \"width\": 900\n  }\n}\n"
+	desktopWrite(t, p.app3p, mine)
+
+	f := claudeDesktop(home).Field("provider")
+	for i, v := range []string{"magpie", "magpie", "", "magpie"} {
+		if err := f.Set(v); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(p.app3p); string(b) != mine {
+			t.Fatalf("step %d (%q): Claude-3p's config.json is now\n%s", i, v, b)
+		}
+	}
+}
+
+// Wired, and Desktop has written its config.json since: the user then
+// sets the language there by hand. Applying magpie again keeps every key;
+// off keeps the file, which is no longer magpie's alone.
+func TestClaudeDesktopUserEditsThenReapply(t *testing.T) {
+	home, p := desktopSandbox(t)
+	f := claudeDesktop(home).Field("provider")
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p.app3p); err == nil {
+		t.Fatal("config.json written with no language to carry")
+	}
+	desktopWrite(t, p.app, `{"locale":"zh-CN"}`)
+	edited := "{\n  \"locale\": \"zh-TW\",\n  \"hasCompletedOnboarding\": true\n}\n"
+	desktopWrite(t, p.app3p, edited)
+	for _, v := range []string{"magpie", "", "magpie"} {
+		if err := f.Set(v); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(p.app3p); string(b) != edited {
+			t.Fatalf("%q: the user's edit is gone:\n%s", v, b)
+		}
+	}
+}
+
+// Only a language Desktop can name is carried, and a Claude-3p config.json
+// magpie can't read as an object is left as it is, the takeover going on.
+func TestClaudeDesktopLanguageOddValues(t *testing.T) {
+	for _, own := range []string{`{"locale":"../../x"}`, `{"locale":7}`, `{"locale":""}`, `not json`} {
+		home, p := desktopSandbox(t)
+		desktopWrite(t, p.app, own)
+		if err := claudeDesktop(home).Field("provider").Set("magpie"); err != nil {
+			t.Fatal(err)
+		}
+		if b, err := os.ReadFile(p.app3p); err == nil {
+			t.Errorf("%s: carried %s", own, b)
+		}
+	}
+	home, p := desktopSandbox(t)
+	desktopWrite(t, p.app, `{"locale":"zh-CN"}`)
+	desktopWrite(t, p.app3p, `[1]`)
+	if err := claudeDesktop(home).Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(p.app3p); string(b) != `[1]` {
+		t.Errorf("odd config.json written: %s", b)
+	}
+	if m := desktopJSON(t, p.config3p); m["deploymentMode"] != "3p" {
+		t.Errorf("takeover stopped: %v", m)
+	}
+}
+
+// lambdua on X: Desktop on magpie runs in Claude-3p, a userData of its own,
+// so the Code and Cowork sessions it had signed in with Anthropic were out
+// of sight. Desktop imports them itself (Settings → Import) once its
+// claudeAiImport policy is on: magpie's profile gets it, once, on a switch
+// on and, for a Desktop already on magpie, from Sync at the next start.
+// A claudeAiImport the user has, or took away since, stays theirs, and
+// Desktop's own sessions are never touched.
+func TestClaudeDesktopOffersItsSessionImport(t *testing.T) {
+	home, p := desktopSandbox(t)
+	on := map[string]any{"enabled": true, "bannerBehavior": "detect"}
+	// a session Desktop wrote signed in with Anthropic
+	session := filepath.Join(p.dir, "claude-code-sessions", "acct", "org", "local_1.json")
+	desktopWrite(t, session, `{"sessionId":"local_1","title":"mine"}`)
+	a := claudeDesktop(home)
+	if a.Sync == nil {
+		t.Fatal("no Sync: a Desktop already on magpie never gets the import")
+	}
+	// not on magpie: Sync writes nothing
+	before := desktopTree(t, p)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if after := desktopTree(t, p); !reflect.DeepEqual(after, before) {
+		t.Fatalf("Sync off magpie wrote:\n%v", after)
+	}
+
+	// on magpie before this change: a profile with no claudeAiImport and
+	// nothing in the stash; Sync seeds it
+	if err := a.Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if got := desktopJSON(t, p.prof)["claudeAiImport"]; !reflect.DeepEqual(got, on) {
+		t.Fatalf("switch on: claudeAiImport %v", got)
+	}
+	prof := desktopJSON(t, p.prof)
+	delete(prof, "claudeAiImport")
+	b, _ := json.Marshal(prof)
+	desktopWrite(t, p.prof, string(b))
+	forget(desktopImport + p.key)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if got := desktopJSON(t, p.prof)["claudeAiImport"]; !reflect.DeepEqual(got, on) {
+		t.Fatalf("Sync on magpie: claudeAiImport %v", got)
+	}
+
+	// the user turns it off in Desktop's window (the key gone): stays off
+	desktopWrite(t, p.prof, string(b))
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := desktopJSON(t, p.prof)["claudeAiImport"]; has {
+		t.Fatal("seeded again over the user's choice")
+	}
+
+	// a claudeAiImport of the user's own, seen first: kept as it is
+	if err := a.Field("provider").Set(""); err != nil {
+		t.Fatal(err)
+	}
+	forget(desktopImport+p.key, desktopProfile+p.key)
+	theirs := map[string]any{"enabled": false}
+	if err := a.Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if err := edit.SetJSON(p.prof, edit.KV{Path: "claudeAiImport", Value: theirs}); err != nil {
+		t.Fatal(err)
+	}
+	forget(desktopImport + p.key)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if got := desktopJSON(t, p.prof)["claudeAiImport"]; !reflect.DeepEqual(got, theirs) {
+		t.Fatalf("the user's claudeAiImport: %v", got)
+	}
+
+	// Desktop's own sessions are where they were, as they were
+	if got, _ := os.ReadFile(session); string(got) != `{"sessionId":"local_1","title":"mine"}` {
+		t.Fatalf("session: %q", got)
 	}
 }

@@ -25,6 +25,10 @@ type SearchAPI struct {
 	// URL is where it is: a SearXNG's own, or another address for one of
 	// the others (a Firecrawl run by the user); empty is the vendor's.
 	URL string `json:"url,omitempty"`
+	// Off keeps it, key and all, out of every search until it is switched
+	// on again (#2286): to try one API alone, or rest one whose credit is
+	// nearly spent, without taking its key away.
+	Off bool `json:"off,omitempty"`
 }
 
 // How a search picks among a search API's keys (SearchAPI.Pick).
@@ -55,6 +59,7 @@ var SearchVendors = []SearchVendor{
 	{ID: "exa", Name: "Exa", Base: "https://api.exa.ai", KeysURL: "https://dashboard.exa.ai/api-keys"},
 	{ID: "firecrawl", Name: "Firecrawl", Base: "https://api.firecrawl.dev", KeysURL: "https://www.firecrawl.dev/app/api-keys"},
 	{ID: "you", Name: "You.com", Base: "https://ydc-index.io", KeysURL: "https://you.com/platform", KeyOptional: true},
+	{ID: "deepseek", Name: "DeepSeek", Base: "https://api.deepseek.com", KeysURL: "https://platform.deepseek.com/api_keys"},
 	{ID: "searxng", Name: "SearXNG", KeyOptional: true},
 }
 
@@ -157,9 +162,25 @@ func (a SearchAPI) check() error {
 }
 
 // SearchAPIs are the search APIs that can be asked, in the order they are
-// tried.
+// tried: ready, and not switched off.
 func SearchAPIs() []SearchAPI {
-	return slices.DeleteFunc(slices.Clone(load().Searches), func(a SearchAPI) bool { return !a.Ready() })
+	return slices.DeleteFunc(slices.Clone(load().Searches), func(a SearchAPI) bool { return !a.Ready() || a.Off })
+}
+
+// SearchAPIsSet counts the search APIs that can be asked; a
+// providers.json that can't be read is an error, not none.
+func SearchAPIsSet() (int, error) {
+	f, err := read()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, a := range f.Searches {
+		if a.Ready() {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // StoredSearchAPIs are the search APIs as saved, keys and all.
@@ -167,7 +188,8 @@ func StoredSearchAPIs() []SearchAPI { return load().Searches }
 
 // SetSearchAPI adds a search API, last, or changes the one of its vendor
 // where it is; a change with no key keeps the key it has, and one with no
-// Pick the pick it has ("turns" puts the default back).
+// Pick the pick it has ("turns" puts the default back). One switched off
+// stays off.
 func SetSearchAPI(a SearchAPI) error {
 	a.Vendor = strings.ToLower(strings.TrimSpace(a.Vendor))
 	a.Key, a.URL = strings.Join(a.Keys(), ","), strings.TrimSpace(a.URL)
@@ -179,6 +201,9 @@ func SetSearchAPI(a SearchAPI) error {
 	i := slices.IndexFunc(f.Searches, func(x SearchAPI) bool { return x.Vendor == a.Vendor })
 	if i >= 0 && a.Key == "" {
 		a.Key = f.Searches[i].Key
+	}
+	if i >= 0 {
+		a.Off = f.Searches[i].Off
 	}
 	switch {
 	case pick == "turns":
@@ -213,8 +238,57 @@ func RemoveSearchAPI(vendor string) error {
 	return store(f)
 }
 
+// SwitchSearchAPI switches the vendor's search API on or off (#2286),
+// keeping its key, address and place.
+func SwitchSearchAPI(vendor string, on bool) error {
+	f, err := read()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(f.Searches, func(x SearchAPI) bool { return x.Vendor == vendor })
+	if i < 0 {
+		return fmt.Errorf("no %s search API is set up", vendor)
+	}
+	if f.Searches[i].Off == !on {
+		return nil
+	}
+	f.Searches[i].Off = !on
+	return store(f)
+}
+
+// ArrangeSearchAPIs puts the search APIs in the order of the vendors named
+// (#2286), the order they are tried in. One not named keeps its place
+// after them; a name of none set up is refused, so an order sent from a
+// page drawn before one was removed changes nothing.
+func ArrangeSearchAPIs(order []string) error {
+	f, err := read()
+	if err != nil {
+		return err
+	}
+	out := make([]SearchAPI, 0, len(f.Searches))
+	for _, v := range order {
+		i := slices.IndexFunc(f.Searches, func(x SearchAPI) bool { return x.Vendor == v })
+		if i < 0 {
+			return fmt.Errorf("no %s search API is set up", v)
+		}
+		if slices.ContainsFunc(out, func(x SearchAPI) bool { return x.Vendor == v }) {
+			return fmt.Errorf("%s is named twice", v)
+		}
+		out = append(out, f.Searches[i])
+	}
+	for _, a := range f.Searches {
+		if !slices.Contains(order, a.Vendor) {
+			out = append(out, a)
+		}
+	}
+	f.Searches = out
+	return store(f)
+}
+
 // RestoreSearchAPIs puts search APIs from a backup in, each replacing the
 // one of its vendor here; one that came without a key keeps the key here.
+// They are asked in the backup's order, switched on or off as they were
+// there (#2286), and one only here is asked after them.
 func RestoreSearchAPIs(as []SearchAPI) error {
 	if len(as) == 0 {
 		return nil
@@ -223,19 +297,22 @@ func RestoreSearchAPIs(as []SearchAPI) error {
 	if err != nil {
 		return err
 	}
+	out := []SearchAPI{}
 	for _, a := range as {
-		if _, ok := SearchVendorOf(a.Vendor); !ok {
+		if _, ok := SearchVendorOf(a.Vendor); !ok || slices.ContainsFunc(out, func(x SearchAPI) bool { return x.Vendor == a.Vendor }) {
 			continue
 		}
-		if i := slices.IndexFunc(f.Searches, func(x SearchAPI) bool { return x.Vendor == a.Vendor }); i >= 0 {
-			if a.Key == "" {
-				a.Key = f.Searches[i].Key
-			}
-			f.Searches[i] = a
-		} else {
-			f.Searches = append(f.Searches, a)
+		if i := slices.IndexFunc(f.Searches, func(x SearchAPI) bool { return x.Vendor == a.Vendor }); i >= 0 && a.Key == "" {
+			a.Key = f.Searches[i].Key
+		}
+		out = append(out, a)
+	}
+	for _, a := range f.Searches {
+		if !slices.ContainsFunc(out, func(x SearchAPI) bool { return x.Vendor == a.Vendor }) {
+			out = append(out, a)
 		}
 	}
+	f.Searches = out
 	return store(f)
 }
 

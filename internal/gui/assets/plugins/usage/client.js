@@ -40,16 +40,17 @@ magpie.plugin("usage", (ctx) => {
     <p class="usage-note" id="usageScope" data-t>Gateway calls only; session-log calls are in Requests. Local rejections are excluded from totals.</p>
     <section class="stats" id="stats"></section>
     <section class="chart" id="chart"></section>
-    <div class="row-head"><span class="label" data-t>Agents</span></div>
+    <div class="row-head"><button class="fold" type="button" data-fold="agents" aria-expanded="true" aria-controls="usageAgents"><span class="label" data-t>Agents</span></button></div>
     <div class="list" id="usageAgents"></div>
     <div class="us-hid" id="usageAgentsHid" hidden><button class="text us-hidline" type="button" aria-expanded="false"></button><div class="list" hidden></div></div>
-    <div class="row-head"><span class="label" data-t>Models</span></div>
+    <div class="row-head"><button class="fold" type="button" data-fold="models" aria-expanded="true" aria-controls="usageModels"><span class="label" data-t>Models</span></button></div>
     <div class="list" id="usageModels"></div>
-    <div class="row-head" id="usageAccountsHead" hidden><span class="label" data-t>Accounts</span></div>
+    <div class="row-head" id="usageAccountsHead" hidden><button class="fold" type="button" data-fold="accounts" aria-expanded="true" aria-controls="usageAccounts"><span class="label" data-t>Accounts</span></button></div>
     <div class="list" id="usageAccounts" hidden></div>
-    <div class="row-head" id="usageKeysHead" hidden><span class="label" data-t>Gateway keys</span></div>
+    <div class="row-head" id="usageKeysHead" hidden><button class="fold" type="button" data-fold="keys" aria-expanded="true" aria-controls="usageKeys"><span class="label" data-t>Gateway keys</span></button></div>
     <div class="list" id="usageKeys" hidden></div>
     <p class="usage-note" id="usageNote"></p>
+    <div class="plugin-slot" data-slot="usage" hidden></div>
   </div>
   <div class="usage-pane" id="ledgerPane" hidden>
     <div class="sess-tools">
@@ -71,6 +72,7 @@ magpie.plugin("usage", (ctx) => {
       <section class="led-trend">
         <div class="led-bar">
           <div class="segs" id="ledMetric"></div>
+          <div class="segs led-style" id="ledStyle"></div>
           <span class="grow"></span>
           <span class="led-split"><span class="led-by" data-t>Split by</span><span class="segs" id="ledSplit"></span></span>
         </div>
@@ -126,6 +128,7 @@ magpie.plugin("usage", (ctx) => {
     <p class="usage-note" id="sessNote"></p>
   </div>
 `,
+    mount() { mountUsageFolds(); },
     open() { return loadUsage(true).catch((e) => status(e.message, "err")); },
     refresh(again) {
       // on the Overview, where the allowances are, coming back is opening them (#1588)
@@ -135,5 +138,8 @@ magpie.plugin("usage", (ctx) => {
     reload() { return refreshUsage(true); },
     costs() { renderCosts(); },
     tab() { return usageTab; },
+    // the reader goes to another page: the Requests give back what a
+    // click lent them (ledLeave)
+    leave() { if (usageTab === "requests") ledLeave(); },
   });
 });

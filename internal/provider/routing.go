@@ -9,6 +9,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -27,7 +28,20 @@ const (
 	// Weighted spreads a provider's requests over its keys by each key's
 	// weight (KeyAccount.Weight, #841), smoothly: 3 and 1 go a, a, b, a…
 	Weighted = "weight"
+	// FreeFirst spends what costs nothing first: the models its vendor
+	// serves at no cost to the subscription's allowance or credits, before
+	// the ones that spend it (routes.FreeFirst).
+	FreeFirst = "free"
 )
+
+// pluginRouting is a routing a plugin serves: "<plugin>/<name>".
+var pluginRouting = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// PluginRouting says whether routing is one a plugin serves,
+// "<plugin>/<name>" (a JS gateway plugin's strategies). providers.json
+// keeps one as saved, served now or not: one no plugin serves is tried in
+// its listed order.
+func PluginRouting(routing string) bool { return pluginRouting.MatchString(routing) }
 
 // SetRouting changes how a provider's requests spread over its keys or
 // accounts.
@@ -168,6 +182,22 @@ type Limit struct {
 	// RunsOut is when the soonest of what the window has left is lost,
 	// apart from its reset (QuotaWindow.RunsOutAt): zero when not known.
 	RunsOut time.Time
+	// Credits: the account goes on past this window on its credits
+	// (QuotaWindow.Credits)
+	Credits bool
+}
+
+// OnCredits says whether the account goes on past its allowance on its
+// credits, as its last reading says (a ChatGPT account holding them,
+// QuotaWindow.Credits): a window used up doesn't stop it. Whether it is
+// let spend them is the user's (CodexCredits).
+func (a Allowance) OnCredits() bool {
+	for _, l := range a {
+		if l.Credits {
+			return true
+		}
+	}
+	return false
 }
 
 // Restarts is when an auto-used reset starts the account's windows again,
@@ -670,19 +700,6 @@ func StaleAllowance(agent, user string) {
 	delete(loginUsageCache.m, key)
 	delete(loginUsageCache.pending, key) // nor a reading asked for before
 	loginUsageCache.Unlock()
-	// the built-in keeps Grok's usage by home; a Grok moved to its plugin
-	// keeps it as "plugin:grok"'s, the line above
-	if agent == "grok" {
-		gs := grokLogins()
-		grokHomeUsage.Lock()
-		for _, g := range gs {
-			if strings.EqualFold(g.User, user) {
-				delete(grokHomeUsage.m, g.Home)
-				delete(grokHomeUsage.pending, g.Home)
-			}
-		}
-		grokHomeUsage.Unlock()
-	}
 	usedCache.Lock()
 	if usedCache.at != nil {
 		usedCache.at[agent] = time.Time{}
@@ -735,7 +752,7 @@ func allowanceOf(ws []QuotaWindow, now time.Time) Allowance {
 		if w.Aside {
 			continue
 		}
-		l := Limit{Used: w.Used, Span: w.Span, Model: w.Model, Amount: w.Amount, Of: w.Limit, Unit: w.Unit, matches: w.matches, partial: w.partial, Name: w.Name}
+		l := Limit{Used: w.Used, Span: w.Span, Model: w.Model, Amount: w.Amount, Of: w.Limit, Unit: w.Unit, matches: w.matches, partial: w.partial, Name: w.Name, Credits: w.Credits}
 		if ids := families[w.Model]; ids != nil && w.Family != "" && w.matches == nil {
 			l.Model = ""
 			l.matches = func(model string) bool { return ids[model] }

@@ -101,6 +101,20 @@ func TestUpdateAutoCmd(t *testing.T) {
 			t.Fatalf("%s: every %d", a, got)
 		}
 	}
+	// notify: a version found waits for a click to be downloaded (#2296),
+	// the other choices left as they are; download puts it back
+	if err := updateCmd([]string{"update", "auto", "notify"}); err != nil {
+		t.Fatal(err)
+	}
+	if s := settings.Load(); !s.NoAutoDownload || s.NoAutoUpdate || s.UpdateEvery != 360 {
+		t.Fatalf("notify: download held %v, off %v, every %d", s.NoAutoDownload, s.NoAutoUpdate, s.UpdateEvery)
+	}
+	if err := updateCmd([]string{"update", "auto", "download"}); err != nil {
+		t.Fatal(err)
+	}
+	if s := settings.Load(); s.NoAutoDownload {
+		t.Fatal("download: still held")
+	}
 	if err := updateCmd([]string{"update", "auto", "2h"}); err == nil {
 		t.Fatal("2h taken")
 	}

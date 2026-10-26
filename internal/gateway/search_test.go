@@ -239,6 +239,67 @@ func TestWebSearchForAModelThatCannot(t *testing.T) {
 	}
 }
 
+func TestSearchZeroCacheSplitKeepsWrites(t *testing.T) {
+	fresh(t)
+	apis := newSearchAPIs(t)
+	if err := provider.SetSearchAPI(apis.api("tavily", "tvly-k")); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var asked []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		asked = append(asked, string(b))
+		n := len(asked)
+		mu.Unlock()
+		if n == 1 {
+			writeStream(w, []string{
+				anthCacheStart(30, false),
+				`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"web_search","input":{}}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"latest go\"}"}}`,
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}`,
+				`{"type":"message_stop"}`,
+			}, false, "")
+			return
+		}
+		writeStream(w, []string{
+			anthCacheStart(20, true), anthText("Go 1.27.1 is out."),
+			`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}`,
+			`{"type":"message_stop"}`,
+		}, false, "")
+	}))
+	t.Cleanup(up.Close)
+	if err := provider.Save(provider.Provider{ID: "up", Name: "UP", Key: "k", Models: []string{"m"}, Anthropic: up.URL}); err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"up/m","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"What is the latest Go?"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`))
+	r.Header.Set("x-api-key", Token)
+	r.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	lanGuard(New().Handler()).ServeHTTP(w, r)
+	if w.Code != 200 || textOf(w.Body.String()) != "Go 1.27.1 is out." {
+		t.Fatalf("search reply = %d %s", w.Code, w.Body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(asked) != 2 || !strings.Contains(asked[1], `"tool_result"`) || !strings.Contains(asked[1], "https://go.dev/dl/") {
+		t.Fatalf("model did not receive search results in a second round: %v", asked)
+	}
+	apis.mu.Lock()
+	searched := strings.Join(apis.asked, "|")
+	apis.mu.Unlock()
+	if searched != "tavily: latest go" {
+		t.Fatalf("search API calls = %q", searched)
+	}
+	client := newSniffer(provider.Anthropic, "text/event-stream")
+	client.write(w.Body.Bytes())
+	if client.u.CacheWrite != 50 {
+		t.Fatalf("zero delta after search round reduced client cache writes: got %d, want 50", client.u.CacheWrite)
+	}
+}
+
 func TestWebSearchAskedOfEachAPI(t *testing.T) {
 	for _, c := range []struct {
 		proto provider.Protocol
@@ -594,4 +655,50 @@ func TestPluginSaidToSearch(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A request's body is looked at for web search without a copy of it, and
+// not parsed at all for a provider that searches by itself: Codex offers
+// web_search on every turn, and each relayed turn was parsed whole.
+func TestSearchAskedLooksCheaply(t *testing.T) {
+	long := strings.Repeat("a long prompt with words in it ", 7000)
+	plain := []byte(`{"model":"m","input":"` + long + `"}`)
+	if n := testing.AllocsPerRun(20, func() { searchAsked(provider.Responses, plain) }); n != 0 {
+		t.Errorf("a %dKB body with no search in it: %v allocations, want 0", len(plain)/1024, n)
+	}
+	asks := []byte(`{"model":"gpt-5","input":"` + long + `","tools":[{"type":"web_search"}]}`)
+	codex := provider.Provider{ID: "codex", Responses: provider.CodexBase, Account: &provider.Account{Agent: "codex"}}
+	if searchedForIt(codex, provider.Responses, "gpt-5", asks) {
+		t.Error("Codex searches by itself, and magpie searched for it")
+	}
+	if n := testing.AllocsPerRun(20, func() { searchedForIt(codex, provider.Responses, "gpt-5", asks) }); n > 20 {
+		t.Errorf("a provider that searches by itself: %v allocations, the body parsed", n)
+	}
+	other := provider.Provider{ID: "x", Responses: "https://example.test/v1"}
+	if !searchedForIt(other, provider.Responses, "gpt-5", asks) {
+		t.Error("a provider that doesn't search: magpie didn't search for it")
+	}
+	if searchedForIt(other, provider.Responses, "gpt-5", plain) {
+		t.Error("a body offering no search: magpie searched for it")
+	}
+}
+
+func BenchmarkSearchedForIt(b *testing.B) {
+	long := strings.Repeat("a long prompt with words in it ", 7000)
+	asks := []byte(`{"model":"gpt-5","input":"` + long + `","tools":[{"type":"web_search"}]}`)
+	plain := []byte(`{"model":"gpt-5","input":"` + long + `"}`)
+	codex := provider.Provider{ID: "codex", Responses: provider.CodexBase, Account: &provider.Account{Agent: "codex"}}
+	other := provider.Provider{ID: "x", Responses: "https://example.test/v1"}
+	b.Run("codex-asks", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			searchedForIt(codex, provider.Responses, "gpt-5", asks)
+		}
+	})
+	b.Run("other-plain", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			searchedForIt(other, provider.Responses, "gpt-5", plain)
+		}
+	})
 }

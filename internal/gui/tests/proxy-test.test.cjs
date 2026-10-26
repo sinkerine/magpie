@@ -3,7 +3,8 @@
 // works. Test asks Cloudflare's trace page through it and direct
 // (POST /api/proxy/check) and the line under the row's text says the
 // address each left from: working (two addresses), the same address both
-// ways (it isn't taking the requests), the proxy failing, no proxy in
+// ways with the proxy connected to (a TUN's one exit, #2369, not a
+// failure) and without (the proxy passed by), the proxy failing, no proxy in
 // force, and the check itself failing. Testing… shows while it runs, the
 // result outlives a redraw of Settings and goes when the proxy changes.
 // Every language, Chromium and WebKit, at 1100 and 420 wide; no backend,
@@ -59,10 +60,14 @@ function server(lang, st) {
 const US = { ip: "203.0.113.9", loc: "US", ms: 312 }, CN = { ip: "198.51.100.7", loc: "CN", ms: 41 };
 // [name, proxy, answer, the line, a failure?]
 const CASES = (w) => [
-  ["works", PROXY, { proxy: "http://127.0.0.1:7890", source: "settings", through: US, direct: CN },
+  ["works", PROXY, { proxy: "http://127.0.0.1:7890", source: "settings", through: { ...US, proxied: true }, direct: CN },
     w("Works: through the proxy requests leave from {where}, {ms} ms; direct ones from {direct}", { where: "203.0.113.9 (US)", ms: 312, direct: "198.51.100.7 (CN)" }), false],
-  ["same", PROXY, { proxy: "http://127.0.0.1:7890", source: "settings", through: CN, direct: CN },
-    w("Through the proxy requests leave from {where}, the same address as direct ones: they leave as if there were no proxy", { where: "198.51.100.7 (CN)" }), true],
+  // #2369 (Emt-lin): a TUN gives both one exit, while the request through
+  // the proxy connected to it: not a failure
+  ["one-exit", PROXY, { proxy: "http://127.0.0.1:7890", source: "settings", through: { ...CN, proxied: true }, direct: CN },
+    w("The proxy took the requests, but they leave from {where} as direct ones do: a TUN or system VPN may send every request out one exit, so the address can't tell the two paths apart", { where: "198.51.100.7 (CN)" }), false],
+  ["passed-by", PROXY, { proxy: "http://127.0.0.1:7890", source: "settings", through: CN, direct: CN },
+    w("The request through the proxy didn't connect to it and leaves from {where}, the same address as direct ones: the proxy is passed by", { where: "198.51.100.7 (CN)" }), true],
   ["down", PROXY, { proxy: "http://127.0.0.1:7890", source: "settings", through: { error: "connect: connection refused" }, direct: CN },
     w("The proxy failed: {error}. Direct requests leave from {direct}", { error: "connect: connection refused", direct: "198.51.100.7 (CN)" }), true],
   ["none", "", { source: "none", direct: CN },

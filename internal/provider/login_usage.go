@@ -85,11 +85,6 @@ func loginUsageAt(ctx context.Context, agent string) (map[string]SubscriptionQuo
 		return out, asked
 	}
 	out := map[string]SubscriptionQuota{}
-	if agent == "grok" {
-		if _, ok := pluginOfAgent(agent); !ok {
-			return grokLoginUsage(ctx), asked
-		}
-	}
 	logins, ok := usageLogins(agent)
 	if !ok {
 		return out, asked
@@ -268,32 +263,10 @@ func builtinLogins(agent string) (logins []Login, ok bool) {
 		logins = Logins(agent)
 	case "copilot":
 		logins = copilotLoginList()
-	case "zcode":
-		logins = zcodeLoginList()
-	case "kiro":
-		logins = kiroLoginList()
-	case "workbuddy", WorkBuddyAIID:
-		logins = wbLoginList(wbSiteOf(agent))
-	case CommandCodePlanID:
-		logins = cmdLoginList()
-	case "qoder", QoderCNID:
-		logins = loginsOf(qoderLoginsOf(agent))
-	case "zed":
-		logins = zedLoginList()
-	case "devin":
-		logins = devinLoginList()
-	case "factory":
-		logins = factoryLoginList()
-	case MiMoID:
-		logins = mimoLoginList()
 	case ChatGPTAPIID:
 		logins = siwcLoginList()
 	case "gemini", "antigravity":
 		logins = googleLoginList(agent)
-	case "cursor": // one account, the one cursor-agent is signed in to
-		if user, plan, ok := cursorIdentity(); ok {
-			logins = []Login{{Agent: agent, User: user, Plan: plan, Active: true, On: true}}
-		}
 	default:
 		return nil, false
 	}
@@ -315,38 +288,8 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	if strings.HasPrefix(l.Agent, "plugin:") {
 		return pluginLoginQuota(ctx, l)
 	}
-	if l.Agent == "qoder" || l.Agent == QoderCNID {
-		return qoderLoginQuota(ctx, l)
-	}
-	if l.Agent == "zed" {
-		return zedLoginQuota(ctx, l)
-	}
-	if l.Agent == "devin" {
-		return devinLoginQuota(ctx, l)
-	}
-	if l.Agent == "factory" {
-		return factoryLoginQuota(ctx, l)
-	}
-	if l.Agent == MiMoID {
-		return mimoLoginQuota(ctx, l)
-	}
-	if l.Agent == "cursor" {
-		return cursorSubscriptionUsage(ctx, l.Plan)
-	}
 	if l.Agent == "gemini" || l.Agent == "antigravity" {
 		return googleLoginQuota(ctx, l)
-	}
-	if l.Agent == "zcode" {
-		return zcodeLoginQuota(ctx, l)
-	}
-	if l.Agent == "kiro" {
-		return kiroLoginQuota(ctx, l)
-	}
-	if w := wbSiteOf(l.Agent); w != nil {
-		return wbLoginQuota(ctx, w, l)
-	}
-	if l.Agent == CommandCodePlanID {
-		return cmdLoginQuota(ctx, l)
 	}
 	if l.Agent == "copilot" {
 		for _, c := range copilotLogins(copilotConfigDir()) {
@@ -394,12 +337,20 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	}
 	var tok, accountID string
 	var err error
+	var renew codexRenew
 	switch {
 	case l.Agent == "claude": // Claude Code reads its own (claudeWindows)
 	case l.Active:
-		tok, accountID, err = codexToken(ctx, codexAuthPath())
+		tok, accountID, err = codexToken(ctx, codexHome())
+		renew = func(ctx context.Context, stale string) (string, string, error) {
+			return codexTokenRenewing(ctx, codexHome(), stale)
+		}
 	default:
 		tok, accountID, err = savedLoginToken(ctx, l.Agent, l.User)
+		agent, user := l.Agent, l.User
+		renew = func(ctx context.Context, stale string) (string, string, error) {
+			return renewSavedLoginFrom(ctx, agent, user, stale)
+		}
 	}
 	if err == nil {
 		if l.Agent == "claude" {
@@ -408,7 +359,7 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 			}
 		} else {
 			var plan string
-			if plan, q.Windows, q.Resets, q.Balance, q.Held, err = codexWindows(ctx, tok, accountID); plan != "" {
+			if plan, q.Windows, q.Resets, q.Balance, q.Held, err = codexWindowsRenewing(ctx, tok, accountID, renew); plan != "" {
 				q.Plan = plan
 			}
 			q.Until = codexUntil(codexLoginAuth(l), time.Now())
@@ -489,16 +440,22 @@ func loginReadingKnown(l Login) (loginUsageEntry, bool) {
 }
 
 // codexLoginAuth is the auth.json of a ChatGPT account magpie knows: the
-// file Codex is signed in with, or the one kept for it.
+// sign-in Codex goes by (auth.json or its keychain item), or the one kept for it.
 func codexLoginAuth(l Login) []byte {
 	if l.Active {
-		b, _ := readAccountFile(codexAuthPath())
+		b, _, _ := readCodexLogin(codexHome(), false)
 		return b
 	}
 	loginsMu.Lock()
 	defer loginsMu.Unlock()
 	for _, x := range readLogins() {
 		if x.Agent == "codex" && strings.EqualFold(x.User, l.User) {
+			// as Codex keeps it in its other folder, when it is signed in there
+			if home := codexHeldIn(x); home != "" {
+				if b, _, err := readCodexLogin(home, false); err == nil {
+					return b
+				}
+			}
 			return x.Auth
 		}
 	}

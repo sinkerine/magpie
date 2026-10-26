@@ -635,7 +635,9 @@ func (l *Library) syncHooks(t *Target, b *backups, res *Result) {
 	add := map[string][]json.RawMessage{}
 	var added []HookEntry
 	for _, w := range ws {
-		if w.done {
+		// an agent gone from here is given nothing new; what it has stays
+		// its until unticked
+		if w.done || t.Gone {
 			continue
 		}
 		// the same entry of the user's own already runs: it isn't written

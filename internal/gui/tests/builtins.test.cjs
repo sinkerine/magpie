@@ -19,22 +19,26 @@ const assets = path.resolve(__dirname, "../assets");
 
 // as plugins/*'s manifests say them, in pluginrt.Registered's order (by id)
 const PLUGINS = [
+  { id: "budget", name: "Key limits", sub: "Hold each gateway key to the tokens or estimated cost you set for it", one: "1 key with a limit", many: "{n} keys with a limit" },
   { id: "gateway", name: "Gateway page", sub: "The gateway's state and keys, how to connect a client, its models and recent calls", one: "1 gateway key", many: "{n} gateway keys" },
   { id: "groups", name: "Routing groups", sub: "Several models agents pick as one: each request goes to the right one, and to the next when one fails", one: "1 group in use", many: "{n} groups in use" },
   { id: "library", name: "Library", sub: "Instructions, MCP servers, skills and hooks, kept once and given to every agent", one: "1 item given to agents", many: "{n} items given to agents" },
-  { id: "middleware", name: "Gateway middleware", sub: "Run the JavaScript middleware plugins on agents' requests and replies", one: "1 middleware on", many: "{n} middleware on" },
+  { id: "middleware", name: "JS gateway plugins", sub: "Run the JavaScript gateway plugins: middleware on agents' requests and replies, routings and usage observers", one: "1 gateway plugin on", many: "{n} gateway plugins on" },
   { id: "otel", name: "Observability", sub: "Send each request's traces and metrics to an OpenTelemetry collector, such as Langfuse", one: "Sending to a collector", many: "Sending to a collector" },
   { id: "redact", name: "Privacy masking", sub: "Secrets, personal data and your own words go to vendors as placeholders, and come back as they were", one: "Masking is on", many: "Masking is on" },
-  { id: "rotation", name: "Routing strategies", sub: "The routings besides Smart: In order, In turn, Least used first, Weekly pace and By weight", one: "1 provider or group routed so", many: "{n} providers and groups routed so" },
+  { id: "rotation", name: "Routing strategies", sub: "The routings besides Smart: In order, In turn, Least used first, Weekly pace, By weight and Free first", one: "1 provider or group routed so", many: "{n} providers and groups routed so" },
   { id: "routing", name: "Routing", sub: "Each request as the gateway routes it, the accounts it weighed and what each answered, and your routing groups", one: "1 group in use", many: "{n} groups in use" },
+  { id: "search", name: "Web search", sub: "Models that can't search the web search with a provider that can, or a search API", one: "1 search source set up", many: "{n} search sources set up" },
   { id: "sessions", name: "Sessions", sub: "Your agents' past conversations: read, search, resume and export them", one: "Recording gateway conversations", many: "Recording gateway conversations" },
+  { id: "tools", name: "Plugin tools", sub: "Offer the tools your plugins give to every agent, as an MCP server", one: "1 plugin gives tools", many: "{n} plugins give tools" },
   { id: "usage", name: "Usage", sub: "Your allowances, what was spent and on what, each request, and what filled the context window" },
   { id: "warmups", name: "Warm-up and check-in", sub: "Start a subscription's usage window at a time you pick, and claim vendors' daily check-in credits", one: "1 warm-up or check-in on", many: "{n} warm-ups and check-ins on" },
 ];
-// a new install's (the Essentials preset): all off but the Gateway, Routing
-// and Usage pages, the routing strategies, the gateway middleware and privacy
-// masking, which are essential, and two routing groups the user made
-const START = { gateway: [true, 0], groups: [false, 2], library: [false, 0], middleware: [true, 0], otel: [false, 0], redact: [true, 0], rotation: [true, 0], routing: [true, 0], sessions: [false, 0], usage: [true, 0], warmups: [false, 0] };
+// the Essentials preset, picked by the user: all off but the Gateway, Routing
+// and Usage pages, the routing strategies, the gateway middleware, privacy
+// masking, web search, key limits and plugin tools, which are essential,
+// and two routing groups the user made
+const START = { budget: [true, 0], gateway: [true, 0], groups: [false, 2], library: [false, 0], middleware: [true, 0], otel: [false, 0], redact: [true, 0], rotation: [true, 0], routing: [true, 0], search: [true, 0], sessions: [false, 0], tools: [true, 0], usage: [true, 0], warmups: [false, 0] };
 
 // the Gateway page's settings, as pluginrt.SchemaOf makes them
 const GATEWAY_SCHEMA = {
@@ -107,7 +111,8 @@ function server(lang, posts, broken) {
 // the pages' tabs shown, the page shown
 const tabs = (page) => page.evaluate(() => [...document.querySelectorAll("#nav button[data-view]")].filter((b) => !b.hidden && b.offsetParent && getComputedStyle(b).display !== "none").map((b) => b.dataset.view));
 const viewShown = (page) => page.evaluate(() => [...document.querySelectorAll("main.view")].filter((v) => !v.hidden).map((v) => v.id));
-const KEPT = ["agents", "providers", "routing", "gateway", "usage", "plugins"];
+// the tabs with Sessions and Library off, the preset's masking on
+const KEPT = ["agents", "providers", "routing", "gateway", "usage", "masking", "plugins"];
 const rowsOf = (page) => page.evaluate(() => [...document.querySelectorAll("#builtinList .feat-row")].map((r) => {
   const b = r.querySelector('[role="switch"]');
   return { id: r.dataset.id, name: r.querySelector(".name").textContent, on: b.getAttribute("aria-checked"), disabled: b.disabled, why: r.querySelector(".feat-why")?.textContent || "" };
@@ -168,13 +173,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual([rt.on, rt.disabled], ["true", false], `${where}: the Routing page, on`);
         const ro = rows.find((r) => r.id === "rotation");
         assert.deepEqual([ro.on, ro.disabled], ["true", false], `${where}: the routing strategies, on`);
-        for (const id of ["middleware", "redact"]) {
+        for (const id of ["budget", "middleware", "redact", "search", "tools"]) {
           const r = rows.find((r) => r.id === id);
           assert.deepEqual([r.on, r.disabled], ["true", false], `${where}: ${id}, on`);
         }
         const us = rows.find((r) => r.id === "usage");
         assert.deepEqual([us.on, us.disabled], ["true", false], `${where}: the Usage page, on`);
-        for (const r of rows.filter((r) => !["groups", "gateway", "middleware", "redact", "rotation", "routing", "usage"].includes(r.id))) assert.deepEqual([r.on, r.disabled, r.why], ["false", false, ""], `${where}: ${r.id}`);
+        for (const r of rows.filter((r) => !["budget", "groups", "gateway", "middleware", "redact", "rotation", "routing", "search", "tools", "usage"].includes(r.id))) assert.deepEqual([r.on, r.disabled, r.why], ["false", false, ""], `${where}: ${r.id}`);
         await page.locator('#builtinList [data-id="groups"] [role="switch"]').click({ force: true });
         await page.waitForTimeout(100);
         assert.deepEqual(posts, [], `${where}: a locked switch posts nothing`);
@@ -202,24 +207,38 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual(posts, [["library", true]], where);
         if (width >= 800) assert.deepEqual(await tabs(page), ["agents", "library", ...KEPT.slice(1)], `${where}: Library back`);
         assert.deepEqual(await viewShown(page), ["view-plugins"], `${where}: Plugins stays`);
+        // Observability's, Routing's and Usage's rows can be below the fold:
+        // the reader scrolls to them with the wheel, since the page puts back
+        // a scroll that isn't the reader's (scrollOnPurpose), a click's own
+        // too. The wheel turns over what shows of the list (its top may have
+        // scrolled away, and a wheel there scrolls nothing), as often as the
+        // row needs: at 420 the rows wrap and Usage's is more than one turn
+        // down
+        const below = (id) => page.evaluate((id) => { const r = document.querySelector(`#builtinList [data-id="${id}"] [role="switch"]`).getBoundingClientRect(), foot = document.querySelector("footer.foot"); return r.bottom > Math.min(document.getElementById("view-plugins").getBoundingClientRect().bottom, foot && foot.offsetParent ? foot.getBoundingClientRect().top : Infinity); }, id);
+        const wheelTo = async (id) => {
+          for (let i = 0; i < 5 && await below(id); i++) {
+            const at = await page.evaluate(() => { const l = document.getElementById("builtinList").getBoundingClientRect(), v = document.getElementById("view-plugins").getBoundingClientRect(); return { x: l.x + 20, y: (Math.max(l.top, v.top) + Math.min(l.bottom, v.bottom)) / 2 }; });
+            await page.mouse.move(at.x, at.y);
+            await page.mouse.wheel(0, 400);
+            await page.waitForFunction(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true)))));
+          }
+          assert.equal(await below(id), false, `${where}: ${id}'s row reached by the wheel`);
+        };
         // and Observability: its Settings tab is back
+        await wheelTo("otel");
         await page.locator('#builtinList [data-id="otel"] [role="switch"]').click();
         await page.waitForSelector('#builtinList [data-id="otel"] [aria-checked="true"]');
         assert.ok(await page.locator("#setTab-otel").evaluate((b) => getComputedStyle(b).display !== "none"), `${where}: Observability back`);
-        // Routing switched off: its tab and the panel's go, the page stays
+        // Routing switched off: its tab and the panel's go, the page stays.
+        await wheelTo("routing");
         await page.locator('#builtinList [data-id="routing"] [role="switch"]').click();
         await page.waitForSelector('#builtinList [data-id="routing"] [aria-checked="false"]');
         assert.deepEqual(posts.at(-1), ["routing", false], where);
         if (width >= 800) assert.deepEqual(await tabs(page), ["agents", "library", ...KEPT.slice(1).filter((k) => k !== "routing")], `${where}: Routing gone`);
         assert.deepEqual(await viewShown(page), ["view-plugins"], `${where}: Plugins stays`);
-        // and Usage: its tab goes. Its row can be below the fold: the reader
-        // scrolls to it with the wheel, since the page puts back a scroll
-        // that isn't the reader's (scrollOnPurpose), a click's own too
+        // and Usage: its tab goes
         const usageSwitch = page.locator('#builtinList [data-id="usage"] [role="switch"]');
-        const list = await page.locator("#builtinList").boundingBox();
-        await page.mouse.move(list.x + 20, list.y + 20);
-        await page.mouse.wheel(0, 400);
-        await page.waitForFunction(() => { const r = document.querySelector('#builtinList [data-id="usage"] [role="switch"]').getBoundingClientRect(); return r.bottom <= document.getElementById("view-plugins").getBoundingClientRect().bottom; });
+        await wheelTo("usage");
         await usageSwitch.click();
         await page.waitForSelector('#builtinList [data-id="usage"] [aria-checked="false"]');
         assert.deepEqual(posts.at(-1), ["usage", false], where);

@@ -8,7 +8,10 @@ import (
 	"testing"
 
 	"github.com/yetone/magpie/internal/agentenv"
+	"github.com/yetone/magpie/internal/budget"
+	"github.com/yetone/magpie/internal/gwbudget"
 	"github.com/yetone/magpie/internal/gwmw"
+	"github.com/yetone/magpie/internal/gwtool"
 	"github.com/yetone/magpie/internal/masking"
 	"github.com/yetone/magpie/internal/middleware"
 	"github.com/yetone/magpie/internal/provider"
@@ -24,6 +27,8 @@ func TestMain(m *testing.M) {
 	serveRotation()
 	groupsServed = provider.ServeGroups()
 	serveMiddleware()
+	searchOn = gwtool.Serve(gwtool.WebSearch)
+	limitsOn = gwbudget.Limit(budget.Limiter{})
 	code, err := isolatedTests(m)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -77,6 +82,8 @@ func isolatedTests(m *testing.M) (int, error) {
 	// The fakes of ChatGPT's backend read turns plain; codex_zstd_test's
 	// send them zstd, as the real one is sent.
 	provider.CodexZstdForTests(false)
+	// and speak HTTP: codex_socket_test's fakes speak the WebSocket
+	codexSocketOff.Store(true)
 	// Finding an inert CLI also prevents discovery from falling back to
 	// one installed at an absolute system path. Tests can prepend their
 	// own fakes, as fakeClaude does, and still use ordinary shell tools.
@@ -111,7 +118,9 @@ func isolatedTests(m *testing.M) (int, error) {
 	// and no rest waits on a reading in the background: it would ask a
 	// test's fake upstream after the test ended (#2036, CodeAlex52)
 	awaitAllowance = func(context.Context, string, string) bool { return false }
-	return m.Run(), nil
+	// no route writes a request body in place while it is held
+	guardHeldBodies()
+	return heldWrittenAfter(m.Run()), nil
 }
 
 // The package's tests run as an isolated test binary: nothing the marker
@@ -176,5 +185,32 @@ func withoutGroups(t *testing.T) {
 	t.Cleanup(func() {
 		stop()
 		groupsServed = provider.ServeGroups()
+	})
+}
+
+// searchOn is plugins/search on: the gateway's tests offer and answer
+// magpie's web search, as a user with it on has.
+var searchOn func()
+
+// limitsOn is plugins/budget on: the gateway's tests hold gateway keys to
+// their limits, as a user with it on has.
+var limitsOn func()
+
+// withoutLimits is plugins/budget off for t, with no refresh to turn it
+// on: a key held to a limit is refused with nothing sent.
+func withoutLimits(t *testing.T) {
+	limitsOn()
+	t.Cleanup(func() { limitsOn = gwbudget.Limit(budget.Limiter{}) })
+}
+
+// withoutSearch is plugins/search off for t, in a process serving the
+// gateway (gwtool.Gate): magpie's web search is neither offered nor
+// answered.
+func withoutSearch(t *testing.T) {
+	searchOn()
+	stop := gwtool.Gate()
+	t.Cleanup(func() {
+		stop()
+		searchOn = gwtool.Serve(gwtool.WebSearch)
 	})
 }

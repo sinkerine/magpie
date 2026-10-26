@@ -106,6 +106,8 @@ func TestAgentMCPFiles(t *testing.T) {
 			fs:   entry{"type": "stdio", "command": "npx", "args": []any{"-y", "@mcp/fs"}, "env": entry{"K": "V"}},
 			web:  entry{"type": "http", "url": "https://example.com/mcp", "headers": entry{"Authorization": "Bearer x"}},
 			sse:  entry{"type": "sse", "url": "https://example.com/sse"},
+			// on a Mac WorkBuddy is there by its app, not its folder
+			pre: func(t *testing.T, h string) { holdApp(t, h, "WorkBuddy.app", "com.tencent.workbuddy.mac") },
 		},
 		{
 			// CodeBuddy Code reads the first of .mcp.json, mcp.json and

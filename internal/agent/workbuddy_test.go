@@ -32,6 +32,8 @@ func TestWorkBuddy(t *testing.T) {
 		return ms
 	}
 
+	// found by its folder, as off a Mac (TestWorkBuddyOnMacIsItsApp)
+	notOnMac(t)
 	a := workbuddy(home)
 	if !a.Detected() {
 		t.Fatal("not detected")
@@ -214,6 +216,7 @@ func TestWorkBuddyAIWritesItsOwnFolder(t *testing.T) {
 	os.WriteFile(filepath.Join(home, ".workbuddy-ai", "argv.json"), []byte("{}"), 0o644)
 	os.WriteFile(filepath.Join(home, ".workbuddy-ai", "device-id"), []byte("d"), 0o644)
 
+	notOnMac(t)
 	a := workbuddyAI(home)
 	if a.ID != "workbuddy-ai" || a.Path != intl {
 		t.Fatalf("agent: %s at %s", a.ID, a.Path)

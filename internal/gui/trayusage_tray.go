@@ -48,7 +48,7 @@ func (h *host) watchTrayUsage() {
 			}
 			if tip == "" {
 				currency, rate := trayCurrency()
-				tip = trayIdleTip(trayTotalSum(usage.Today), currency, rate)
+				tip = trayIdleTip(trayMoney(trayTotalSum(usage.Today), s.TrayNoCost), currency, rate)
 			}
 			if runtime.GOOS != "darwin" {
 				cells = nil

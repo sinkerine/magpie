@@ -264,6 +264,45 @@ func TestUp(t *testing.T) {
 	}
 }
 
+// #2341: a wsl.exe that failed to say which distros run is asked again only
+// after upFailedAge, not every upAge: each ask that times out holds the
+// caller 10s and leaves a wsl.exe behind. An answer is still kept only upAge.
+func TestUpFailedKept(t *testing.T) {
+	oldOn, oldRun := On, Run
+	t.Cleanup(func() { On, Run = oldOn, oldRun; Forget() })
+	On = true
+	Forget()
+	asks := 0
+	var err error
+	Run = func(_ time.Duration, args ...string) ([]byte, error) {
+		asks++
+		return utf16le("Ubuntu\r\n"), err
+	}
+	aged := func(d time.Duration) {
+		up.Lock()
+		up.at = time.Now().Add(-d)
+		up.Unlock()
+	}
+	err = errors.New("timed out")
+	if Up("Ubuntu") || asks != 1 {
+		t.Fatalf("failed: Up, %d asks", asks)
+	}
+	aged(upAge + time.Second)
+	if Up("Ubuntu") || asks != 1 {
+		t.Fatalf("a failure was asked again after %v: %d asks", upAge, asks)
+	}
+	aged(upFailedAge + time.Second)
+	err = nil
+	if !Up("Ubuntu") || asks != 2 {
+		t.Fatalf("after %v: %d asks", upFailedAge, asks)
+	}
+	aged(upAge + time.Second)
+	Up("Ubuntu")
+	if asks != 3 {
+		t.Fatalf("an answer was kept past %v: %d asks", upAge, asks)
+	}
+}
+
 // #1264: with Settings' Detect agents in WSL off, Find (Claude Code for a
 // Claude subscription, when Windows has none) asks wsl.exe nothing.
 func TestFindWithDetectionOff(t *testing.T) {

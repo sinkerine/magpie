@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"slices"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/budget"
+	"github.com/yetone/magpie/internal/gwbudget"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/usage"
 )
@@ -28,7 +30,8 @@ const remoteKeyLimitHeader = "X-Magpie-Limit-Reset"
 // keyLimited holds a gateway key's requests to its limit (#585, see
 // package budget for the rules): one that would go over is refused with a
 // 429 before any provider is asked, saying the key, the limit and when it
-// resets; one let in holds a reservation until it ends. Reads, the
+// resets; one let in holds a reservation until it ends. A key with a limit
+// while plugins/budget is off is refused with a 503, and nothing is sent. Reads, the
 // bridge's tool callbacks and counting tokens cost nothing and pass.
 func keyLimited(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -51,22 +54,45 @@ func keyLimited(next http.Handler) http.Handler {
 			size, model = int64(len(b)), budget.ModelOf(b)
 		}
 		now := limitClock()
-		release, refused := budget.Reserve(who, size, model, now)
-		if refused != nil {
-			msg := refused.Error()
-			w.Header().Set("Retry-After", strconv.Itoa(refused.RetryAfter(now)))
-			// the Anthropic and OpenAI SDKs would otherwise retry a 429
+		release, err := reserveFor(who, size, model, now)
+		if err != nil {
+			status, errType := http.StatusServiceUnavailable, "gateway_key_limit_off"
+			var refused gwbudget.Refusal
+			if errors.As(err, &refused) {
+				status, errType = http.StatusTooManyRequests, "gateway_key_limit"
+				w.Header().Set("Retry-After", strconv.Itoa(refused.RetryAfter(now)))
+				w.Header().Set(remoteKeyLimitHeader, refused.ResetAt().Format(time.RFC3339))
+			}
+			// the Anthropic and OpenAI SDKs would otherwise retry a 429 or 503
 			w.Header().Set("X-Should-Retry", "false")
-			w.Header().Set(remoteKeyLimitHeader, refused.Reset.Format(time.RFC3339))
-			writeError(w, protoOfPath(r.URL.Path), http.StatusTooManyRequests, msg)
+			writeError(w, protoOfPath(r.URL.Path), status, err.Error())
 			c := callerOf(r)
-			appendUsage(r, usage.Record{Time: now, Agent: c.agent, Via: c.via, Requested: model, Status: http.StatusTooManyRequests, Rejected: true,
-				Error: msg, ErrType: "gateway_key_limit", Endpoint: r.URL.Path, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header)})
+			appendUsage(r, usage.Record{Time: now, Agent: c.agent, Via: c.via, Requested: model, Status: status, Rejected: true,
+				Error: err.Error(), ErrType: errType, Endpoint: r.URL.Path, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header)})
 			return
 		}
 		defer release()
 		next.ServeHTTP(w, r)
 	})
+}
+
+// reserveFor holds a request of who's to its key's limits through the
+// gateway's budget point (gwbudget): its release, or why it isn't let in,
+// a gwbudget.Refusal or, for a key held to a limit while no limiter serves
+// it, gwbudget.ErrUnlimited. A request without a limit is let in as it is.
+func reserveFor(who access.Identity, size int64, model string, now time.Time) (release func(), err error) {
+	l, err := gwbudget.Limiting(who)
+	if err != nil {
+		return nil, err
+	}
+	if l == nil {
+		return func() {}, nil
+	}
+	release, refused := l.Reserve(who, size, model, now)
+	if refused != nil {
+		return nil, refused
+	}
+	return release, nil
 }
 
 // protoOfPath is the API a path is of, for an error said its way.

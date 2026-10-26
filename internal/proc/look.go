@@ -108,7 +108,7 @@ func looked(key string, ask func() lookAnswer) lookAnswer {
 
 // lookWindow is lookFresh, or lookFreshInTests in a test binary.
 func lookWindow() time.Duration {
-	if os.Getenv(sandboxVar) != "" {
+	if Isolated() {
 		return lookFreshInTests
 	}
 	return lookFresh

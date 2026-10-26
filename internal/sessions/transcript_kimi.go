@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"cmp"
 	"encoding/json"
+	"path/filepath"
 )
 
 // Kimi Code's conversation, read from a session's main wire.jsonl (#2056,
 // infinitr0us). From protocol 1.4 on a turn is its turn.prompt (the user's
 // input; one whose origin isn't the user, a skill's activation or a
-// subagent's system_trigger, is shown folded) and the loop events written as it
+// system_trigger, is shown folded, but for a subagent's task in its own
+// file) and the loop events written as it
 // runs: content.part (text or think), tool.call (name, args, toolCallId)
 // and tool.result (toolCallId, result.output). These alone are read, since
 // they are there for every 1.4 and 1.5 session, finished or still running:
@@ -38,6 +40,7 @@ type kimiLine struct {
 	} `json:"input"`
 	Origin struct {
 		Kind string `json:"kind"`
+		Name string `json:"name"`
 	} `json:"origin"`
 	Event struct {
 		Type       string          `json:"type"`
@@ -94,6 +97,9 @@ func kimiTranscript(path string, keep func([]byte) bool, add func(bool, Part) bo
 		if json.Unmarshal(b, &l) != nil {
 			return true
 		}
+		if kimiTask(path, l) {
+			l.Origin.Kind = "user"
+		}
 		for _, p := range kimiParts(l, names) {
 			if !add(p.Role != "assistant", p) {
 				return false
@@ -102,6 +108,15 @@ func kimiTranscript(path string, keep func([]byte) bool, add func(bool, Part) bo
 		return true
 	})
 	return err
+}
+
+// kimiTask is whether a line is the task a subagent was given: in its own
+// wire file (agents/agent-<n>), a turn.prompt from Kimi Code's system_trigger
+// named subagent (#2290), its first message, as a Claude Code or OpenCode
+// subagent's is.
+func kimiTask(path string, l kimiLine) bool {
+	return l.Type == "turn.prompt" && l.Origin.Kind == "system_trigger" && l.Origin.Name == "subagent" &&
+		filepath.Base(filepath.Dir(path)) != "main"
 }
 
 // kimiParts are what one line of a wire file said.

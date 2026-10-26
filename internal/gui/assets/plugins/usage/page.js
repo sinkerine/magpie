@@ -1,7 +1,120 @@
 // The Usage page's code (client.js has its markup and hooks): run after
 // app.js, whose helpers and state it shares, and before start.js shows the
 // first page.
+let usageHidOpen = false; // the hidden agents shown under their line
+
+// What was read back from the archive, by "<date>/<id>": the archive's
+// copy, or {busy} while it is read, or {error}.
+const archivedCalls = new Map();
+
+function headersPanel(label, first, headers) {
+  const panel = el("section", "call-body");
+  const head = el("div", "call-body-head");
+  const lines = [first, ...Object.keys(headers || {}).sort().flatMap((k) => headers[k].map((v) => `${k}: ${v}`))].filter(Boolean);
+  head.append(el("span", "call-body-label", label), el("span", "grow"), copyBtn(lines.join("\n"), label));
+  const pre = el("pre");
+  pre.append(el("code", "", lines.join("\n")));
+  panel.append(head, pre);
+  return panel;
+}
+
+// The archived file, whole, however large: to the browser in magpie web,
+// to Downloads in the app (#447).
+async function downloadArchive(name, b) {
+  const [date, aid] = name.split("/");
+  const q = `date=${encodeURIComponent(date)}&id=${encodeURIComponent(aid)}`;
+  if (web) {
+    const a = el("a");
+    a.href = "/api/archive/file?" + q;
+    a.download = "";
+    a.click();
+    return;
+  }
+  b.classList.add("busy");
+  b.disabled = true;
+  try {
+    const r = await api("archive/export?" + q, {});
+    status(t("Saved to {path}", { path: r.path }), "ok");
+  } catch (e) {
+    status(t(e.message), "err");
+  } finally {
+    b.classList.remove("busy");
+    b.disabled = false;
+  }
+}
+
+// one body read back from the archive: shown, or, past 256 KB, only its
+// size — the server leaves it out — for the file to be downloaded whole
+function archiveBodyPanel(label, part, id, key = id) {
+  if (part.omitted) {
+    const panel = el("section", "call-body");
+    const head = el("div", "call-body-head");
+    head.append(el("span", "call-body-label", t(label)), el("span", "call-body-count", fmtBytes(part.size)));
+    panel.append(head, el("p", "call-archive-big", t("Too long to show here. Download the archive to read it whole.")));
+    return panel;
+  }
+  // cut where the archive stops: its limit, or 256 KB in one from before #447
+  const cut = part.truncated && (part.size ? t("first {n} of {size}", { n: fmtBytes(new Blob([part.body]).size), size: fmtBytes(part.size) }) : true);
+  return callBodyPanel(label, part.body, cut, id, key);
+}
+
+// A call the archive kept, by "<date>/<id>": read back when asked, and its
+// file downloaded, drawn again by redraw as it is read — under a request's
+// row on the Usage page, and under a Routing trace's (plugins/routing draws
+// it once this file has loaded; the Gateway page's recent calls show their
+// own bodies, and no longer the archive's copy as well).
+function archivePanel(name, id, redraw) {
+  const box = el("section", "call-archive");
+  const [date, aid] = name.split("/");
+  const got = archivedCalls.get(name);
+  const head = el("div", "call-body-head");
+  head.append(el("span", "call-body-label", t("Request archive")), el("code", "call-archive-id", name), el("span", "grow"));
+  box.append(head);
+  const dl = el("button", "text call-archive-dl", t("Download"));
+  dl.onclick = (ev) => { ev.stopPropagation(); downloadArchive(name, dl); };
+  if (!got || got.busy || got.error) {
+    const b = el("button", "text", t(got?.busy ? "Fetching…" : "Fetch from archive"));
+    b.disabled = !!got?.busy;
+    b.onclick = (ev) => {
+      ev.stopPropagation();
+      archivedCalls.set(name, { busy: true });
+      redraw();
+      api(`archive?date=${encodeURIComponent(date)}&id=${encodeURIComponent(aid)}`)
+        .then((a) => archivedCalls.set(name, a))
+        .catch((e) => archivedCalls.set(name, { error: t(e.message) }))
+        .finally(redraw);
+    };
+    head.append(b);
+    if (got?.error) box.append(el("div", "call-archive-err", got.error));
+    else head.append(dl); // one not in the bucket has nothing to download
+    return box;
+  }
+  head.append(el("span", "call-body-truncated call-archive-note", t("Secrets taken out")), dl);
+  if (got.large) {
+    box.append(el("p", "call-archive-big", t("This archive is {size}, too large to show here. Download it to read it.", { size: got.bytes > 0 ? fmtBytes(got.bytes) : t("very large") })));
+    return box;
+  }
+  const grid = el("div", "call-details");
+  grid.append(
+    headersPanel(t("Request Headers"), `${got.request.method || ""} ${got.request.path || ""}`.trim(), got.request.headers),
+    headersPanel(t("Response Headers"), got.response.status ? `HTTP ${got.response.status}` : "", got.response.headers),
+    archiveBodyPanel("Request Body", got.request, undefined, id + "|archive|req"),
+    archiveBodyPanel("Response Body", got.response, id + "|archive"),
+  );
+  box.append(grid);
+  return box;
+}
+
 const PERIODS = [["today", "Today"], ["7d", "7 days"], ["30d", "30 days"], ["all", "All"]];
+
+// The reader's time zone, which magpie reads the period's days, the chart's
+// hours and a picked day in: magpie web may be read from another zone than
+// the computer's, whose days put a call at 9:00 in UTC+8 under 1:00 (Outvi V
+// on Discord). None, and magpie reads its own.
+function usageZone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch { return ""; }
+}
+const usageZoneQ = () => (usageZone() ? "&tz=" + encodeURIComponent(usageZone()) : "");
 
 // asked: the reader opened the page, so a Claude account's usage is read
 // at once, by running Claude Code's own /usage, rather than when its last
@@ -19,7 +132,7 @@ async function loadUsage(asked) {
   renderUsageLoading();
   if (!asked) loadQuotas();
   const p = period, read = ++usageRead;
-  const next = await api("usage?period=" + encodeURIComponent(p));
+  const next = await api("usage?period=" + encodeURIComponent(p) + usageZoneQ());
   if (read !== usageRead || view !== "usage" || usageTab !== "usage" || period !== p) return;
   usage = next;
   renderUsage();
@@ -206,7 +319,7 @@ function renderUsageLoading() {
   for (const id of ["usageAgents", "usageAgentsHid", "usageModels", "usageKeys"]) $("#" + id).hidden = true;
   // the allowances' head is renderQuotas' alone: the quotas it heads are
   // still there while the period loads (#809, Hu9956: 用量界面红框这行会延迟几秒才会出现)
-  for (const h of $$("#view-usage .row-head:not(#quotaHead)")) h.hidden = true;
+  for (const h of $$("#view-usage .row-head:not(#quotaHead, .plugin-panel > .row-head)")) h.hidden = true;
   $("#usageNote").textContent = "";
 }
 
@@ -224,6 +337,8 @@ function costHead(c, note, title) {
   cost.append(el("span", note ? "unpriced" : "", note || t("effective prices")));
   cost.title = title;
 }
+// a request magpie sent a provider by itself to test it (SourceProbe)
+const probeWhy = () => t("magpie sent this itself to test the provider (Test, Detect APIs or a model list), not for an agent. It is not counted in any total.");
 const unpricedCalls = (n) => t(n === 1 ? "{n} call unpriced" : "{n} calls unpriced", { n: ledNum(n) });
 const unpricedCallsWhy = (n) => n ? t(n === 1 ? "{n} call had no known price and is not counted" : "{n} calls had no known price and are not counted", { n }) : t("Estimated using effective model prices, including custom prices");
 // renderCosts redraws whatever on the Usage page shows a cost, once the
@@ -295,9 +410,84 @@ function fitChartLabels() {
 }
 new ResizeObserver(fitChartLabels).observe($("#view-usage"));
 
+// The Overview's lists — Agents, Models, Accounts, Gateway keys — each fold
+// away under their heading (#2378: 日常看账号维度较多，都要拉到最底下), and
+// stay folded across a reload (magpie.usageFolded, the folded ones' names).
+let usageFolded = new Set();
+try { usageFolded = new Set(JSON.parse(localStorage.getItem("magpie.usageFolded") || "[]")); } catch {}
+const USAGE_FOLDS = { agents: ["usageAgents", "usageAgentsHid"], models: ["usageModels"], accounts: ["usageAccounts"], keys: ["usageKeys"] };
+const USAGE_FOLD_TITLES = {
+  agents: ["Show the agents", "Fold the agents away"],
+  models: ["Show the models", "Fold the models away"],
+  accounts: ["Show the accounts", "Fold the accounts away"],
+  keys: ["Show the gateway keys", "Fold the gateway keys away"],
+};
+function mountUsageFolds() {
+  for (const b of $$("#usagePane .row-head .fold[data-fold]")) {
+    b.prepend(svg(CHEV_R, 11, 1.6));
+    b.onclick = () => {
+      const id = b.dataset.fold;
+      if (usageFolded.has(id)) usageFolded.delete(id); else usageFolded.add(id);
+      try { localStorage.setItem("magpie.usageFolded", JSON.stringify([...usageFolded])); } catch {}
+      showUsageFolds();
+      backToReader($("#view-usage"));
+    };
+  }
+  showUsageFolds();
+}
+// a folded list is out of sight by its class, so the page's own hidden
+// (no calls, no accounts) is left as it is
+function showUsageFolds() {
+  for (const b of $$("#usagePane .row-head .fold[data-fold]")) {
+    const id = b.dataset.fold, folded = usageFolded.has(id);
+    b.setAttribute("aria-expanded", String(!folded));
+    b.title = t(USAGE_FOLD_TITLES[id][folded ? 0 : 1]);
+    for (const box of USAGE_FOLDS[id]) $("#" + box)?.classList.toggle("folded", folded);
+  }
+}
+
+// usageParts: a line of counts, each kept whole in a span of its own and
+// " · " between them, where the line may wrap ("{a} in · {b} out" is two)
+function usageParts(texts) {
+  const out = [];
+  for (const x of texts.flatMap((s) => s.split(" · "))) out.push(...(out.length ? [" · "] : []), el("span", "", x));
+  return out;
+}
+
+// The Overview's token totals count what went in and out; the cache's
+// tokens, read and written, can be counted in them too (#2378), as the
+// Requests tab's total always has them. Kept as the reader left it
+// (magpie.usageWithCache).
+let usageWithCache = false;
+try { usageWithCache = localStorage.getItem("magpie.usageWithCache") === "1"; } catch {}
+const cacheOf = (x) => (x.cache_read || 0) + (x.cache_write || 0);
+const usageTokens = (x) => tokensOf(x) + (usageWithCache ? cacheOf(x) : 0);
+// the tokens tile's label: a pop-up of the two ways to count
+function usageTokensPick() {
+  const b = el("button", "kpi-pick");
+  b.type = "button";
+  b.setAttribute("aria-haspopup", "menu");
+  b.append(el("span", "", t(usageWithCache ? "tokens with cache" : "tokens")), svg(CHEV, 10, 1.6));
+  b.title = t("Count the cache's tokens in the totals, or leave them out");
+  b.onclick = (e) => {
+    e.stopPropagation();
+    if (b.classList.contains("open")) return closeProtoMenu();
+    openProtoMenu(b, [
+      { v: "", name: "Without cache", note: "Input and output" },
+      { v: "1", name: "With cache", note: "Cache read and written counted too" },
+    ], usageWithCache ? "1" : "", (v) => {
+      usageWithCache = v === "1";
+      try { localStorage.setItem("magpie.usageWithCache", usageWithCache ? "1" : "0"); } catch {}
+      renderUsage();
+    }, "Token totals", "sess-menu");
+  };
+  return b;
+}
+
 function renderUsage() {
   const u = usage;
   const view = $("#view-usage");
+  showUsageFolds();
   view.classList.remove("loading");
   view.removeAttribute("aria-busy");
   renderPeriod();
@@ -309,7 +499,7 @@ function renderUsage() {
   $("#chart").hidden = empty;
   for (const id of ["usageAgents", "usageModels"]) $("#" + id).hidden = empty;
   if (empty) $("#usageAgentsHid").hidden = true;
-  for (const h of $$("#view-usage .row-head:not(#quotaHead)")) h.hidden = empty;
+  for (const h of $$("#view-usage .row-head:not(#quotaHead, .plugin-panel > .row-head)")) h.hidden = empty;
   $("#usageKeysHead").hidden = $("#usageKeys").hidden = empty || !u.callerKeys?.length;
   // each subscription account's share, by the account that answered (#557)
   $("#usageAccountsHead").hidden = $("#usageAccounts").hidden = empty || !u.accounts?.length;
@@ -324,19 +514,26 @@ function renderUsage() {
   const tile = (n, label, sub, title) => {
     const t = el("div", "kpi");
     if (title) t.title = title;
-    t.append(el("b", "", n), el("span", "", label));
-    if (sub) t.append(el("small", "", sub));
+    t.append(el("b", "", n), typeof label === "string" ? el("span", "", label) : label);
+    // a line in parts keeps each whole, wrapping between them rather than
+    // cutting the last off
+    if (Array.isArray(sub)) {
+      const s = el("small", "parts");
+      s.append(...usageParts(sub));
+      t.append(s);
+    } else if (sub) t.append(el("small", "", sub));
     stats.append(t);
   };
-  tile(fmtN(tokensOf(u)), t("tokens"), t("{a} in · {b} out", { a: fmtN(u.input), b: fmtN(u.output) }));
+  tile(fmtN(usageTokens(u)), usageTokensPick(), [t("{a} in · {b} out", { a: fmtN(u.input), b: fmtN(u.output) }), ...(usageWithCache && cacheOf(u) ? [t("{a} cache", { a: fmtN(cacheOf(u)) })] : [])]);
   // cache reads are billed at a fraction of input, so how much of the prompt
   // came from cache is the number that explains the bill; input here already
   // excludes the cached tokens, read and written (the gateway subtracts
   // them), so what was written counts in the prompt too: left out, a prompt
   // written to the cache again at every turn showed a rate near 100%. The
   // written count is secondary and only fits in the tooltip.
-  const promptTokens = u.input + u.cache_read + u.cache_write;
-  const hit = u.cache_read && promptTokens ? t("hit rate {p}", { p: Math.round(100 * u.cache_read / promptTokens) + "%" }) : "";
+  // a vendor that counts no cache (cache_unknown) is left out (#3464)
+  const hitRate = cacheHitOf(u);
+  const hit = u.cache_read && hitRate !== null ? t("hit rate {p}", { p: Math.round(100 * hitRate) + "%" }) : "";
   tile(fmtN(u.cache_read), t("cache read"), hit, u.cache_write ? t("{n} written", { n: fmtN(u.cache_write) }) + cacheTTLs(u, fmtN) : "");
   tile(fmtN(u.reasoning), t("reasoning"), t("inside output"));
   tile(String(u.calls), t(u.calls === 1 ? "call" : "calls"), [u.errors ? t("{n} failed", { n: u.errors }) : "", u.retried ? t("{n} answered on a retry", { n: u.retried }) : "", u.unpriced ? t("{n} unpriced", { n: u.unpriced }) : ""].filter(Boolean).join(" · "), u.unpriced ? unpricedCallsWhy(u.unpriced) : "");
@@ -345,7 +542,7 @@ function renderUsage() {
   const chart = $("#chart");
   chart.replaceChildren();
   const bars = el("div", "bars");
-  const peak = Math.max(1, ...u.series.map(tokensOf));
+  const peak = Math.max(1, ...u.series.map(usageTokens));
   const labels = el("div", "labels");
   const n = u.series.length;
   const every = n <= 8 ? 1 : n <= 31 ? Math.ceil(n / 6) : Math.ceil(n / 5);
@@ -354,11 +551,12 @@ function renderUsage() {
   u.series.forEach((p, i) => {
     const b = el("div", "bar");
     const inp = el("i", "in"), out = el("i", "out");
-    inp.style.height = (100 * p.input / peak).toFixed(1) + "%";
+    // counted with the cache, its tokens are in the prompt's part
+    inp.style.height = (100 * (usageTokens(p) - p.output) / peak).toFixed(1) + "%";
     out.style.height = (100 * p.output / peak).toFixed(1) + "%";
     b.append(out, inp);
     const when = u.bucket === "hour" ? `${p.label}:00` : u.bucket === "week" ? t("week of {label}", { label: dayOf(p) }) : dayOf(p);
-    b.title = p.calls ? t(p.calls === 1 ? "{when} · {tokens} tokens · {n} call" : "{when} · {tokens} tokens · {n} calls", { when, tokens: fmtN(tokensOf(p)), n: p.calls }) + (fmtCost(p) ? " · ≈" + fmtCost(p) : "") : t("{when} · nothing", { when });
+    b.title = p.calls ? t(p.calls === 1 ? "{when} · {tokens} tokens · {n} call" : "{when} · {tokens} tokens · {n} calls", { when, tokens: fmtN(usageTokens(p)), n: p.calls }) + (fmtCost(p) ? " · ≈" + fmtCost(p) : "") : t("{when} · nothing", { when });
     bars.append(b);
     const last = i === n - 1 && (n - 1) % every >= every / 2;
     labels.append(el("span", "", i % every === 0 || last ? dayOf(p) : ""));
@@ -366,7 +564,7 @@ function renderUsage() {
   chart.append(el("div", "peak", fmtN(peak)), bars, labels);
   fitChartLabels();
 
-  const total = Math.max(1, tokensOf(u));
+  const total = Math.max(1, usageTokens(u));
   const list = (id, groups, act) => {
     const box = typeof id === "string" ? $("#" + id) : id;
     box.replaceChildren();
@@ -401,16 +599,16 @@ function renderUsage() {
       r.append(who);
       const share = el("div", "share");
       const fill = el("i");
-      fill.style.width = Math.max(1.5, 100 * tokensOf(g) / total).toFixed(1) + "%";
+      fill.style.width = Math.max(1.5, 100 * usageTokens(g) / total).toFixed(1) + "%";
       share.append(fill);
-      share.title = t("{n}% of tokens", { n: Math.round(100 * tokensOf(g) / total) });
+      share.title = t("{n}% of tokens", { n: Math.round(100 * usageTokens(g) / total) });
       r.append(share);
       const num = el("div", "num");
       // how much of its prompt came from the cache, counted as the cache
       // read tile counts it (#925)
-      const prompt = g.input + g.cache_read + (g.cache_write || 0);
-      const hit = g.cache_read && prompt ? " · " + t("hit rate {p}", { p: Math.round(100 * g.cache_read / prompt) + "%" }) : "";
-      num.append(el("b", "", fmtN(tokensOf(g))), el("small", "", t("{a} in · {b} out", { a: fmtN(g.input), b: fmtN(g.output) }) + (g.cache_read ? " · " + t("{n} cached", { n: fmtN(g.cache_read) }) : "") + hit));
+      const hitRate = cacheHitOf(g);
+      const hit = g.cache_read && hitRate !== null ? " · " + t("hit rate {p}", { p: Math.round(100 * hitRate) + "%" }) : "";
+      num.append(el("b", "", fmtN(usageTokens(g))), el("small", "", t("{a} in · {b} out", { a: fmtN(g.input), b: fmtN(g.output) }) + (g.cache_read ? " · " + t("{n} cached", { n: fmtN(g.cache_read) }) : "") + hit));
       r.append(num);
       r.append(el("div", "cost", fmtCost(g) ? "≈" + fmtCost(g) : ""));
       if (act) act(r, g);
@@ -548,23 +746,74 @@ try {
   const m = localStorage.getItem("magpie.ledMetric");
   if (["tokens", "cost", "calls", "speed"].includes(m)) ledMetric = m;
 } catch {}
+// Columns or lines (molvqingtai on Discord), kept per viewer as the metric
+// is; anything but "line", or a read that fails, is columns.
+let ledLine = false;
+try { ledLine = localStorage.getItem("magpie.ledChart") === "line"; } catch {}
+
+// The filters a click set for the reader rather than one they picked in a
+// filter's menu: someone in the chart's ranking or a day of its columns
+// ("a click lists only theirs"), or a way in from elsewhere (the tray
+// panel's Open Usage, a route Routing sent here). They last while the
+// Requests are looked at, and go when the reader leaves them, for another
+// tab or page (TJHHHH on Discord: a click on Codex in the ranking had
+// every later visit list only Codex's requests). A filter picked in its
+// menu stays, as one picked in a Mac app's does.
+const ledLent = new Set();
+const LED_UNLEND = {
+  agent: () => { ledAgent = ""; },
+  provider: () => { ledProvider = ""; },
+  model: () => { ledModel = ""; ledQuery = ""; $("#ledQ").value = ""; },
+  callerKey: () => { ledCallerKey = ""; },
+  day: () => { ledDay = ""; },
+  purpose: () => { ledPurpose = ""; },
+  computer: () => { ledComputer = ""; },
+  via: () => { ledVia = ""; },
+};
+// the reader picked this filter themselves: it stays
+const ledOwn = (k) => ledLent.delete(k);
 
 let ledRouteInfo = null, ledBeforeRoute = null;
 window.openUsageRoute = (route) => {
-  if (!ledBeforeRoute) ledBeforeRoute = { period, ledOffset, ledPurpose, ledAgent, ledProvider, ledAccount, ledCallerKey, ledFailed, ledRetried, ledQuery, ledModel, ledComputer, ledDay, ledVia };
+  if (!ledBeforeRoute) ledBeforeRoute = { period, ledOffset, ledPurpose, ledAgent, ledProvider, ledAccount, ledCallerKey, ledFailed, ledRetried, ledQuery, ledModel, ledComputer, ledDay, ledVia, lent: [...ledLent] };
   ledRoute = route.id;
   ledRouteInfo = route;
   ledOffset = 0; ledPurpose = ""; ledAgent = ""; ledProvider = ""; ledAccount = ""; ledCallerKey = ""; ledFailed = false; ledRetried = false; ledQuery = ""; ledModel = ""; ledComputer = ""; ledVia = "";
   ledDay = "";
+  ledLent.clear();
   $("#ledQ").value = "";
   period = "all";
   usageTab = "requests";
   ledger = null;
   show("usage");
 };
+// the one request a route from Routing listed gives way to the list as it
+// was before it
+function ledRouteOff() {
+  ledRoute = 0; ledRouteInfo = null;
+  if (ledBeforeRoute) {
+    ({ period, ledOffset, ledPurpose = "", ledAgent, ledProvider, ledAccount = "", ledCallerKey, ledFailed, ledRetried = false, ledQuery, ledModel, ledComputer = "", ledDay = "", ledVia = "" } = ledBeforeRoute);
+    ledLent.clear();
+    for (const k of ledBeforeRoute.lent || []) ledLent.add(k);
+  }
+  ledBeforeRoute = null;
+  $("#ledQ").value = ledQuery;
+}
+// ledLeave: the reader leaves the Requests; what a click lent them goes
+// (the rows drawn for them aren't shown again on the way back)
+function ledLeave() {
+  const routed = !!ledRoute;
+  if (routed) ledRouteOff();
+  if (!ledLent.size && !routed) return;
+  for (const k of ledLent) LED_UNLEND[k]();
+  ledLent.clear();
+  ledOffset = 0;
+  ledger = null;
+}
 
 function ledParams(extra) {
   const q = new URLSearchParams({ period });
+  if (usageZone()) q.set("tz", usageZone());
   if (ledDay) q.set("day", ledDay);
   if (ledAgent) q.set("agent", ledAgent);
   if (ledPurpose) q.set("purpose", ledPurpose);
@@ -605,17 +854,31 @@ const ledAborted = (e) => e?.name === "AbortError";
 // quiet: a refresh while it's looked at, redrawn only on a change
 async function loadLedger(quiet) {
   if (!ledger && !quiet) renderLedgerLoading();
+  // a pick over rows shown: they stay, dimmed, till its answer comes, so
+  // the pick is seen taken (#1990, overstarry: over a long history the
+  // read takes seconds, and the table sat as it was, as if the pick
+  // hadn't been)
+  else if (!quiet) ledPending(true);
   loadLedHeat().catch(() => {});
   const want = ledParams({ offset: ledOffset, limit: LED_PAGE });
   let l;
   try { l = await ledRead("page", "usage/requests?", want); } catch (e) {
     if (ledAborted(e)) return; // another page or filter was picked, and is read instead
+    ledPending(false);
     throw e;
   }
   if (want !== ledParams({ offset: ledOffset, limit: LED_PAGE })) return; // another page or filter was picked meanwhile
+  ledPending(false);
   if (quiet && JSON.stringify(l) === JSON.stringify(ledger)) return;
   ledger = l;
   if (view === "usage" && usageTab === "requests") renderLedger();
+}
+
+function ledPending(on) {
+  const wrap = $("#ledWrap");
+  wrap.classList.toggle("led-pending", on);
+  if (on) wrap.setAttribute("aria-busy", "true");
+  else wrap.removeAttribute("aria-busy");
 }
 
 function renderLedgerLoading() {
@@ -655,7 +918,7 @@ function ledServed(r) {
   }
   if (!r.swapped) return el("span", "model-value", r.served);
   const k = el("span", "swap", r.served);
-  k.title = window.swapWhy ? window.swapWhy({ model: r.model, served: r.served }) : "";
+  k.title = window.swapWhy ? window.swapWhy({ model: r.model, served: r.served, upstream: r.upstream }, { pinUnknown: true }) : "";
   return k;
 }
 
@@ -734,7 +997,7 @@ function ledDetail(r, cols) {
   // whole of it, where the row's cache columns are out of sight (#1839).
   // In leaves the cache out, as Anthropic counts it.
   if (r.in || r.out || r.cache_read || r.cache_write || !ledFailed_(r)) {
-    add("Tokens", t("{i} in · {o} out · {r} cache read · {w} cache creation", { i: ledNum(r.in || 0), o: ledNum(r.out || 0), r: ledNum(r.cache_read || 0), w: ledNum(r.cache_write || 0) }) + cacheTTLs(r, ledNum), "led-tokens");
+    add("Tokens", t("{i} in · {o} out · {r} cache read · {w} cache creation", { i: ledNum(r.in || 0), o: ledNum(r.out || 0), r: ledNum(r.cache_read || 0), w: ledNum(r.cache_write || 0) }) + cacheTTLs(r, ledNum) + (r.cache_unknown ? " · " + t("The vendor doesn't count the cache") : ""), "led-tokens");
   }
   if (ledRowSpeed(r)) add("Speed", t("{n} tok/s", { n: ledNum(Math.round(ledRowSpeed(r))) }));
   else if (ledFloorSpeed(r)) add("Speed", "≥" + t("{n} tok/s", { n: ledNum(Math.round(ledFloorSpeed(r))) }));
@@ -869,8 +1132,10 @@ function ledContentBox(c) {
 // the window's chart can also say how fast the replies came (#860)
 const LED_TREND = [...LED_METRICS, ["speed", "Speed"]];
 // "modelAt" is a model at the provider it went to, so one model's speed at
-// each provider is ranked side by side (inaction on Discord)
-const LED_SPLITS = [["model", "Model"], ["modelAt", "Model · provider"], ["provider", "Provider"], ["agent", "Agent"]];
+// each provider is ranked side by side (inaction on Discord); "callerKey"
+// the gateway key that made it, "none" for calls with none, offered while
+// the period has a key's calls (#2521)
+const LED_SPLITS = [["model", "Model"], ["modelAt", "Model · provider"], ["provider", "Provider"], ["agent", "Agent"], ["callerKey", "Gateway key"]];
 // cacheTTLs: a call's cache writes split by how long they are kept, where
 // some were for an hour (Anthropic bills those at 2× input, 5 minutes'
 // at 1.25×); nothing when none were
@@ -917,8 +1182,8 @@ function renderLedgerDash(l) {
   dash.hidden = !l.total && !l.day;
   if (dash.hidden) return;
   const total = allTokens(l);
-  const prompt = l.input + l.cache_write + l.cache_read;
-  const rate = prompt ? l.cache_read / prompt : 0;
+  // of the calls whose vendor counted the cache: none when no call's was (#3464)
+  const rate = cacheHitOf(l);
   const strip = $("#ledKpi");
   strip.replaceChildren();
   const block = (label, value, sub, cls, title) => {
@@ -937,7 +1202,11 @@ function renderLedgerDash(l) {
   // a line holding a count's button wraps rather than cut the button off
   // (German's "nach erneutem Versuch beantwortet" runs past a narrow card)
   const jumps = (...parts) => { const s = line(...parts); s.classList.add("jumps"); return s; };
-  block("Tokens", fmtN(total), line(t("{a} in · {b} out", { a: fmtN(l.input), b: fmtN(l.output) }), " · ", t("{a} cache", { a: fmtN(l.cache_read + l.cache_write) })), "", ledNum(total));
+  // its parts kept whole, the cache's going under in a card too narrow for
+  // all three rather than cut (#2378: 缓存 879… in a wide window's five cards)
+  const tokParts = line(...usageParts([t("{a} in · {b} out", { a: fmtN(l.input), b: fmtN(l.output) }), t("{a} cache", { a: fmtN(l.cache_read + l.cache_write) })]));
+  tokParts.classList.add("parts");
+  block("Tokens", fmtN(total), tokParts, "", ledNum(total));
   // a request is counted once, by how it ended: one a later try answered
   // is not a failure, and is counted beside them as answered on a retry
   // (小一 on Discord). Each count is a button for its requests in the list.
@@ -955,9 +1224,9 @@ function renderLedgerDash(l) {
   if (l.retried) strip.lastChild.append(jumps(jump(t("{n} answered on a retry", { n: ledNum(l.retried) }), "retried", t("Show only the requests answered on a retry"))));
   const c = fmtCost(l);
   block("Cost", c ? "≈" + c : "—", line(l.unpriced ? t(l.unpriced === 1 ? "{n} call had no known price and is not counted" : "{n} calls had no known price and are not counted", { n: l.unpriced }) : t("effective prices")), c ? "cost" : "");
-  const hit = block("Cache hit rate", (100 * rate).toFixed(1) + "%", null, "", t("The share of the prompt read from the cache"));
+  const hit = block("Cache hit rate", rate === null ? "—" : (100 * rate).toFixed(1) + "%", cacheLeftOut(l) ? line(cacheLeftOut(l)) : null, "", t("The share of the prompt read from the cache"));
   const meter = el("div", "meter"), fill = el("i");
-  fill.style.width = (100 * rate).toFixed(1) + "%";
+  fill.style.width = (100 * (rate || 0)).toFixed(1) + "%";
   meter.append(fill);
   hit.append(meter);
   // how fast the streamed replies wrote, and how long they took to begin (#860):
@@ -970,6 +1239,118 @@ function renderLedgerDash(l) {
     "", [gs?.title, t("Output tokens a second after the first, over the streamed replies") + ". " + t("A reply that reasoned counts only its answer, from its first text: the reasoning was written before the stream showed it") + ". " + t("No answer text: speed includes reasoning only when visible reasoning streamed; hidden reasoning has no speed")].filter(Boolean).join("\n"));
   speedCard.append(Object.assign(line(ttft), { className: "sub ttft" }));
   drawLedTrend();
+}
+
+// the chart's two looks, as a pair of icons beside the metrics: columns
+// (the default) or lines
+const LED_STYLES = [["bars", "Bar chart", "M3.5 13V8.5M8 13V3.5M12.5 13V6.5"], ["line", "Line chart", "M2.5 11.5 6 7.5l3 2.5 4.5-6"]];
+function ledStyle(host) {
+  const cur = ledLine ? "line" : "bars";
+  host.setAttribute("role", "group");
+  host.setAttribute("aria-label", t("Chart style"));
+  host.replaceChildren();
+  for (const [id, name, d] of LED_STYLES) {
+    const b = el("button", "opt" + (id === cur ? " on" : ""));
+    b.type = "button";
+    b.dataset.style = id;
+    b.title = t(name);
+    b.setAttribute("aria-label", t(name));
+    b.setAttribute("aria-pressed", id === cur ? "true" : "false");
+    b.append(svg(d, 14, 1.7));
+    b.onclick = () => {
+      if (id === cur) return;
+      ledLine = id === "line";
+      try { localStorage.setItem("magpie.ledChart", id); } catch {}
+      drawLedTrend();
+    };
+    host.append(b);
+  }
+  slide(host, "ledStyle");
+}
+
+// The chart as lines (drawLedColumns' box.drawn): the columns drawn on its
+// axis are taken away and each one told apart becomes a line through its
+// points. Tokens, cost and requests stay stacked, each line where its part
+// of the column ended, with its band softly filled under it, so the top
+// line is the total as the column's top was; speeds don't add up, so each
+// model's line is at its own speed, broken where it had none, over the
+// point's own speed dashed. The tooltip, the hover, a day's pick and the
+// ranking's emphasis are drawLedColumns' own, over the same slots.
+// A smooth line through points [x, y], as d3's curveMonotoneX draws it
+// (Fritsch–Carlson): it bends between points but never past one, so a
+// quiet hour isn't drawn dipping under zero or a peak over its value.
+// "from" starts it ("M", or "L" to go on from where a path is).
+function ledCurve(ps, from = "M") {
+  const n = ps.length, f = (v) => v.toFixed(1);
+  if (!n) return "";
+  let d = from + f(ps[0][0]) + " " + f(ps[0][1]);
+  if (n === 1) return d;
+  const s = [], m = [];
+  for (let i = 0; i < n - 1; i++) s.push((ps[i + 1][1] - ps[i][1]) / (ps[i + 1][0] - ps[i][0]));
+  for (let i = 1; i < n - 1; i++) {
+    const h0 = ps[i][0] - ps[i - 1][0], h1 = ps[i + 1][0] - ps[i][0], p = (s[i - 1] * h1 + s[i] * h0) / (h0 + h1);
+    m[i] = s[i - 1] * s[i] <= 0 ? 0 : (Math.sign(s[i - 1]) + Math.sign(s[i])) * Math.min(Math.abs(s[i - 1]), Math.abs(s[i]), Math.abs(p) / 2);
+  }
+  m[0] = n > 2 ? (3 * s[0] - m[1]) / 2 : s[0];
+  m[n - 1] = n > 2 ? (3 * s[n - 2] - m[n - 2]) / 2 : s[0];
+  for (let i = 0; i < n - 1; i++) {
+    const [xa, ya] = ps[i], [xb, yb] = ps[i + 1], dx = (xb - xa) / 3;
+    d += "C" + f(xa + dx) + " " + f(ya + dx * m[i]) + " " + f(xb - dx) + " " + f(yb - dx * m[i + 1]) + " " + f(xb) + " " + f(yb);
+  }
+  return d;
+}
+
+function ledLines(g, Y, x0, slot, segs) {
+  const l = ledger, pts = l?.series || [], metric = ledMetric, split = ledSplit;
+  for (const r of segs) r.remove();
+  segs.length = 0;
+  if (!l) return;
+  const speed = metric === "speed";
+  const { top } = ledCategories(l.chartBy ? { by: l.chartBy } : l, split, metric);
+  const X = (i) => x0 + slot * i, dot = slot >= 12 ? 4.5 : 3;
+  const at = (i, v) => [X(i), Y(v)];
+  // stacked, each one goes under those before it, so a band never covers
+  // the line under it
+  let head = null;
+  const totals = pts.map((p) => ledValue(metric, p));
+  // one series: its line, the dots at its points and the band under it
+  const series = (key, color, vals, base, dashed) => {
+    const s = sv("g", { class: "col ln", "data-k": key, "data-day": l.day || "", "data-color": color }, { stroke: color });
+    // each unbroken run is one smooth curve; a point alone in its run has
+    // no line to sit on, so it is a dot
+    let line = "", dots = "", run = [];
+    const end = () => {
+      if (run.length === 1 && !dashed) dots += "M" + run[0][0].toFixed(1) + " " + run[0][1].toFixed(1) + "h0";
+      line += ledCurve(run);
+      run = [];
+    };
+    vals.forEach((v, i) => { if (v == null) end(); else run.push(at(i, v)); });
+    end();
+    if (!line) return;
+    if (base) {
+      const up = ledCurve(vals.map((v, i) => at(i, v)));
+      const down = ledCurve(base.map((v, i) => at(i, v)).reverse(), "L");
+      s.append(sv("path", { d: up + down + "Z", class: "band" }, { fill: color }));
+    }
+    s.append(sv("path", { d: line, class: "line" + (dashed ? " all" : "") }));
+    if (dots) s.append(sv("path", { d: dots, class: "dots" }, { strokeWidth: dot }));
+    head = g.insertBefore(s, speed ? null : head);
+    segs.push(s);
+  };
+  if (speed) {
+    series("\0all", "var(--muted)", totals.map((v) => (v > 0 ? v : null)), null, true);
+    for (const c of top) series(c.id, c.color, pts.map((p) => ledSpeed(p.by?.[split]?.[c.id]) || null));
+    return;
+  }
+  // from the bottom up: each one's part on what is under it, "Other" last
+  let under = pts.map(() => 0);
+  const parts = top.map((c) => [c.id, c.color, pts.map((p) => ledPart(metric, p.by?.[split]?.[c.id] || {}))]);
+  parts.push(["\0other", "var(--faint)", pts.map((p, i) => Math.max(0, totals[i] - parts.reduce((a, x) => a + x[2][i], 0)))]);
+  for (const [key, color, vs] of parts) {
+    const over = under.map((u, i) => u + vs[i]);
+    if (vs.some((v) => v > 0)) series(key, color, over, under);
+    under = over;
+  }
 }
 
 function drawLedTrend() {
@@ -986,16 +1367,21 @@ function drawLedTrend() {
     slide(host, key);
   };
   pill($("#ledMetric"), "ledMetric", LED_TREND, ledMetric, (id) => { ledMetric = id; try { localStorage.setItem("magpie.ledMetric", id); } catch {} drawLedTrend(); });
-  pill($("#ledSplit"), "ledSplit", LED_SPLITS, ledSplit, (id) => { ledSplit = id; drawLedTrend(); });
+  ledStyle($("#ledStyle"));
+  const keyed = (l.callerKeys || []).length > 0;
+  if (ledSplit === "callerKey" && !keyed) ledSplit = "model";
+  pill($("#ledSplit"), "ledSplit", LED_SPLITS.filter(([id]) => id !== "callerKey" || keyed), ledSplit, (id) => { ledSplit = id; drawLedTrend(); });
   const chart = $("#ledChart"), rank = $("#ledRank");
+  chart.drawn = ledLine ? ledLines : null;
   drawLedColumns(chart, l, ledSplit, ledMetric, false, (day) => {
     ledDay = ledDay === day ? "" : day;
+    ledLent.add("day");
     ledOffset = 0;
     loadLedger().catch((e) => status(e.message, "err"));
   });
   rank.chart = chart;
   if (!rank.rail) ledRail($("#ledRail"), rank);
-  const picked = ledSplit === "provider" ? ledProvider : ledSplit === "agent" ? ledAgent
+  const picked = ledSplit === "provider" ? ledProvider : ledSplit === "agent" ? ledAgent : ledSplit === "callerKey" ? ledCallerKey
     : ledSplit === "modelAt" ? (ledProvider && ledModel ? ledProvider + "/" + ledModel : "") : ledModel;
   drawLedRank(rank, l, ledSplit, ledMetric, picked, (x) => {
     // a click lists only that one's requests; on the one listed, all again
@@ -1005,9 +1391,11 @@ function drawLedTrend() {
       ledProvider = off ? "" : x.id.slice(0, cut);
       ledModel = off ? "" : x.id.slice(cut + 1);
       ledQuery = ledModel; q.value = ledQuery;
-    } else if (ledSplit === "provider") ledProvider = ledProvider === x.id ? "" : x.id;
-    else if (ledSplit === "agent") ledAgent = ledAgent === x.id ? "" : x.id;
-    else { const q = $("#ledQ"); ledModel = ledModel === x.id ? "" : x.id; ledQuery = ledModel; q.value = ledQuery; }
+      ledLent.add("provider").add("model");
+    } else if (ledSplit === "provider") { ledProvider = ledProvider === x.id ? "" : x.id; ledLent.add("provider"); }
+    else if (ledSplit === "agent") { ledAgent = ledAgent === x.id ? "" : x.id; ledLent.add("agent"); }
+    else if (ledSplit === "callerKey") { ledCallerKey = ledCallerKey === x.id ? "" : x.id; ledLent.add("callerKey"); }
+    else { const q = $("#ledQ"); ledModel = ledModel === x.id ? "" : x.id; ledQuery = ledModel; q.value = ledQuery; ledLent.add("model"); }
     ledOffset = 0;
     loadLedger().catch((e) => status(e.message, "err"));
   }, false);
@@ -1190,6 +1578,12 @@ function ledHScroll() {
   if (!over) return;
   bar.firstElementChild.style.width = wrap.scrollWidth - wrap.clientWidth + bar.clientWidth + "px";
   bar.scrollLeft = wrap.scrollLeft;
+  // a sticky box keeps clear of its scroller's padding, so at bottom 0 it
+  // stood the view's bottom padding above the window's foot, the table
+  // showing through the strip under it: it goes down over that padding
+  const view = bar.closest(".view");
+  const pad = view ? parseFloat(getComputedStyle(view).paddingBottom) || 0 : 0;
+  bar.style.bottom = -pad + "px";
 }
 $("#ledWrap").addEventListener("scroll", () => { const bar = $("#ledHScroll"); if (bar.scrollLeft !== $("#ledWrap").scrollLeft) bar.scrollLeft = $("#ledWrap").scrollLeft; }, { passive: true });
 $("#ledHScroll").addEventListener("scroll", () => { const wrap = $("#ledWrap"); if (wrap.scrollLeft !== $("#ledHScroll").scrollLeft) wrap.scrollLeft = $("#ledHScroll").scrollLeft; }, { passive: true });
@@ -1230,10 +1624,11 @@ new ResizeObserver(() => {
 }).observe($("#ledChart"));
 
 // the third: a column a narrow window leaves out, its value in the row's
-// details (#860)
+// details (#860), 2 for one left out only when that isn't enough; the
+// fourth, the header's tooltip
 const LED_COLS = [
   ["Time"], ["Agent"], ["Requested"], ["Provider · account"], ["Sent", "", true], ["Served"], ["Effort", "", true],
-  ["In", "n"], ["Out", "n"], ["Cache write", "n", true], ["Cache read", "n", true], ["Cost", "n"], ["Duration", "n"], ["Speed", "n"], ["Status"],
+  ["In", "n"], ["Out", "n"], ["Cache write", "n", true], ["Cache read", "n", true], ["Cost", "n"], ["TTFT", "n", 2, "Time to first token"], ["Duration", "n"], ["Speed", "n"], ["Status"],
 ];
 
 // the tokens a reply was seen to write and the ms it took, as
@@ -1272,7 +1667,8 @@ const ledRowSpeed = (r) => { const d = ledDecode(r); return d ? d.n / (d.w / 100
 // stream it read 2–5% under for a reply of 1,400 tokens or more, 11–33% for
 // a shorter one or one asked with a tool's result, so only a reply of 1,000
 // or more is told. 0 when it tells none, and a call magpie timed tells its
-// own (ledDecode). Only the row's: the period's speed counts timed calls.
+// own (ledDecode). Only the row's: the period's speed counts timed calls
+// and session files' floors (usage.Row.Floor), not a gateway row's below.
 // Claude Code's, Claude Desktop's and Codex's files only (usage.FloorAgents):
 // a call's time is from what asked for it, never from inside it. OpenCode's
 // isn't checked against real sessions, and tells none.
@@ -1283,17 +1679,46 @@ const ledRowSpeed = (r) => { const d = ledDecode(r); return d ? d.n / (d.w / 100
 // more and the answer 100 tokens or more, as a measured one is. A Codex turn
 // of one call that tells neither tells its output over the whole turn, the
 // wait in it, by the same 1,000-token rule as any whole-time floor (Fallmonkey
-// on Discord: 11 tokens in 2.75 s read ≥4 tok/s). ledFloor_ says the tokens,
-// the ms, and which it is (answer, turn).
+// on Discord: 11 tokens in 2.75 s read ≥4 tok/s).
+// A gateway call that tells no speed of its own (夜松云 on Discord: the
+// Requests tab's speed was blank for some rows) has the same two floors, as
+// its time is from when it came to its last token: one that reasoned with no
+// first text recorded (a tool call after hidden reasoning), its answer after
+// the first token, unless its content came in a burst; else one not streamed,
+// or not timed, its output over its whole time, by the 1,000-token rule.
+// ledFloor_ says the tokens, the ms, and which it is (answer, turn, gateway).
 const LED_FLOOR_AGENTS = new Set(["claude", "claude-desktop", "codex"]);
+const ledWhole_ = (r) => r.out >= 1000 && r.ms >= 1000 && r.out * 1000 <= 10000 * r.ms;
 const ledFloor_ = (r) => {
-  if (r.source !== "log" || !LED_FLOOR_AGENTS.has(r.agent) || ledFailed_(r) || ledRowSpeed(r)) return null;
+  if (ledFailed_(r) || ledRowSpeed(r)) return null;
+  if (r.source !== "log") {
+    const n = r.out - (r.reasoning || 0), w = r.ms - r.ttft_ms;
+    if (r.ttft_ms > 0 && r.reasoning > 0 && !(r.first_text_ms > 0) && n >= LED_CODEX_BODY && w >= LED_CODEX_WINDOW_MS && n * 1000 <= 10000 * w && !(r.flow_ms > 0 && r.flow_ms * 4 < w)) return { n, w, answer: true, gateway: true };
+    return ledWhole_(r) ? { n: r.out, w: r.ms, gateway: true } : null;
+  }
+  if (!LED_FLOOR_AGENTS.has(r.agent)) return null;
   if (ledCodexTurn(r)) {
     const n = r.out - (r.reasoning || 0), w = r.ms - r.ttft_ms;
     if (r.reasoning > 0 && n >= LED_CODEX_BODY && w >= LED_CODEX_WINDOW_MS && n * 1000 <= 10000 * w) return { n, w, answer: true };
-    return r.out >= 1000 && r.ms >= 1000 && r.out * 1000 <= 10000 * r.ms ? { n: r.out, w: r.ms, turn: true } : null;
+    return ledWhole_(r) ? { n: r.out, w: r.ms, turn: true } : null;
   }
-  return r.out >= 1000 && r.ms >= 1000 && r.out * 1000 <= 10000 * r.ms ? { n: r.out, w: r.ms } : null;
+  return ledWhole_(r) ? { n: r.out, w: r.ms } : null;
+};
+// why a row tells no speed of its own, in words for its tooltip, so a dash
+// is never left unexplained: ledDecode's reasons, in its order
+const ledNoSpeed_ = (r) => {
+  if (ledFailed_(r)) return t("A failed request tells no speed");
+  if (!(r.ms > 0)) return t("No duration was recorded to time a speed from");
+  if (!(r.out > 0)) return t("No output tokens to time a speed from");
+  if (!(r.ttft_ms > 0)) return r.source === "log" ? t("The session file has no first token to time a speed from") : t("Not streamed: no first token to time a speed from");
+  const think = r.reasoning > 0, visible = think && !(r.first_text_ms > 0) && r.first_reasoning_ms >= r.ttft_ms && r.flow_ms > 0 && r.reasoning <= r.out;
+  const n = think && !visible ? r.out - r.reasoning : r.out;
+  if (!(n > 0)) return t("All its output was reasoning: no answer after it to time a speed from");
+  const from = visible ? r.first_reasoning_ms : think && r.first_text_ms > 0 ? r.first_text_ms : r.ttft_ms, w = r.ms - from;
+  const little = t("Too little came after the first token to time a speed by: {n} tokens in {ms}", { n: ledNum(n), ms: ledTook(Math.max(0, w)) });
+  if (w < 100) return little;
+  if (n * 1000 > 10000 * w || r.flow_ms > 0 && r.flow_ms * 4 < w || think && r.first_text_ms > 0 && n * (r.first_text_ms - r.ttft_ms) > 20 * r.reasoning * w) return t("It came in one burst at its end, not as it was written, so how fast it was written isn't seen");
+  return little;
 };
 const ledFloorSpeed = (r) => { const f = ledFloor_(r); return f ? f.n / (f.w / 1000) : 0; };
 
@@ -1303,20 +1728,23 @@ function ledFit() {
   const wrap = $("#ledWrap"), table = wrap.querySelector("table.led");
   let hint = $("#ledTight");
   if (!table) { if (hint) hint.hidden = true; return; }
-  table.classList.remove("tight", "tighter");
+  table.classList.remove("tight", "tight2", "tighter");
   const over = () => wrap.scrollWidth > wrap.clientWidth + 1;
   const tight = over();
   table.classList.toggle("tight", tight);
   // still too wide (#860: a Windows window at 175%, its wider fonts): the
   // price reference line goes too, in the cost's tooltip and the details
   // as well, and names are cut shorter, whole in their tooltips
+  // still too wide: the first token's column goes (#2522), and only
+  // then what follows
+  if (tight && over()) table.classList.add("tight2");
   if (tight && over()) table.classList.add("tighter");
   if (!hint) {
     hint = el("span", "led-tight");
     hint.id = "ledTight";
     $("#ledSum").after(hint);
   }
-  hint.textContent = hint.title = t("Sent, Effort and the cache are in each row's details");
+  hint.textContent = hint.title = table.classList.contains("tight2") ? t("Sent, Effort, the first token and the cache are in each row's details") : t("Sent, Effort and the cache are in each row's details");
   hint.hidden = !tight;
 }
 
@@ -1328,7 +1756,10 @@ function renderLedger() {
   const missingProvider = ledProvider && !providers.some((p) => p.id === ledProvider);
   const accounts = l.accounts || [];
   const missingAccount = ledAccount && !accounts.some((a) => a.id === ledAccount);
-  const missingCaller = ledCallerKey && !callers.some((k) => k.id === ledCallerKey);
+  // "none": the calls no gateway key made, a choice beside the keys when
+  // there are such calls, so one key's are told from the rest (#2521)
+  const noKey = callers.length > 0 && (ledCallerKey === "none" || (l.by?.callerKey || []).some((s) => s.id === "none"));
+  const missingCaller = ledCallerKey && ledCallerKey !== "none" && !callers.some((k) => k.id === ledCallerKey);
   const computers = computerOpts(l.computers);
   const missingComputer = ledComputer && !computers.some((c) => c.v === ledComputer);
   if (missingAgent || missingProvider || missingAccount || missingCaller || missingComputer) {
@@ -1351,15 +1782,15 @@ function renderLedger() {
   costHead(fmtCost(l), l.unpriced ? unpricedCalls(l.unpriced) : "", unpricedCallsWhy(l.unpriced));
 
   // the filters: choices seen in the period, and failures alone
-  sessPick($("#ledPurpose"), "All purposes", ledPurpose, purposeOptions(l.purposes || [], ledPurpose), "Purpose", (v) => { ledPurpose = v; ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
+  sessPick($("#ledPurpose"), "All purposes", ledPurpose, purposeOptions(l.purposes || [], ledPurpose), "Purpose", (v) => { ledPurpose = v; ledOwn("purpose"); ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
   $("#ledPurpose").title = t("Purpose");
-  sessPick($("#ledComputer"), "All computers", ledComputer, computers, "Computer", (v) => { ledComputer = v; ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
-  sessPick($("#ledAgent"), "All agents", ledAgent, l.agents.map((a) => ({ v: a.id, name: a.name, note: "" })), "Agent", (v) => { ledAgent = v; ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
-  sessPick($("#ledProvider"), "All providers", ledProvider, providers.map((p) => ({ v: p.id, name: t(p.name), note: "" })), "Provider", (v) => { ledProvider = v; ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
-  sessPick($("#ledAccount"), "All accounts", ledAccount, accounts.map((a) => ({ v: a.id, name: a.id, note: (a.providers || []).map((p) => t(p)).join(" · ") })), "Account", (v) => { ledAccount = v; ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
+  sessPick($("#ledComputer"), "All computers", ledComputer, computers, "Computer", (v) => { ledComputer = v; ledOwn("computer"); ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
+  sessPick($("#ledAgent"), "All agents", ledAgent, l.agents.map((a) => ({ v: a.id, name: a.name, note: "" })), "Agent", (v) => { ledAgent = v; ledOwn("agent"); ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
+  sessPick($("#ledProvider"), "All providers", ledProvider, providers.map((p) => ({ v: p.id, name: t(p.name), note: "" })), "Provider", (v) => { ledProvider = v; ledOwn("provider"); ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
+  sessPick($("#ledAccount"), "All accounts", ledAccount, accounts.map((a) => ({ v: a.id, name: a.name || a.id, note: [a.name && a.id, ...(a.providers || []).map((p) => t(p))].filter(Boolean).join(" · ") })), "Account", (v) => { ledAccount = v; ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
   sessPick($("#ledKey"), "All gateway keys", ledCallerKey, callers.map((k) => ({
     v: k.id, name: k.name, note: "",
-  })), "Gateway keys", (v) => { ledCallerKey = v; ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
+  })).concat(noKey ? [{ v: "none", name: t("No gateway key"), note: "" }] : []), "Gateway keys", (v) => { ledCallerKey = v; ledOwn("callerKey"); ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
   const seg = $("#ledStatus");
   seg.replaceChildren();
   // every request, those the agent got an error for, and those answered
@@ -1399,7 +1830,7 @@ function renderLedger() {
     // are the rows the filter keeps, so with one source picked the total cell
     // would read that one's figures under the whole period's count
     const all = {};
-    for (const k of ["calls", "errors", "input", "output", "cache_read", "cache_write", "cost", "timed", "ttft_ms", "decode_ms", "decode_out"]) {
+    for (const k of ["calls", "errors", "input", "output", "cache_read", "cache_write", "cache_unknown", "cache_unknown_calls", "cost", "timed", "ttft_ms", "decode_ms", "decode_out"]) {
       all[k] = (thru[k] || 0) + (dir[k] || 0) + (rep[k] || 0);
     }
     const tile = (b, label, calls, tot, pick) => {
@@ -1417,6 +1848,7 @@ function renderLedger() {
         const next = ledVia === pick ? "" : pick;
         if (next === ledVia) return;
         ledVia = next;
+        ledOwn("via");
         ledOffset = 0;
         loadLedger().catch((e) => status(e.message, "err"));
       };
@@ -1449,10 +1881,7 @@ function renderLedger() {
   $("#ledRouteClear").title = t("Clear filter");
   $("#ledRouteClear").setAttribute("aria-label", t("Clear filter"));
   $("#ledRouteClear").onclick = () => {
-    ledRoute = 0; ledRouteInfo = null;
-    if (ledBeforeRoute) ({ period, ledOffset, ledPurpose = "", ledAgent, ledProvider, ledAccount = "", ledCallerKey, ledFailed, ledRetried = false, ledQuery, ledModel, ledComputer = "", ledDay = "", ledVia = "" } = ledBeforeRoute);
-    ledBeforeRoute = null;
-    $("#ledQ").value = ledQuery;
+    ledRouteOff();
     loadLedger().catch((e) => status(e.message, "err"));
   };
   renderLedgerDash(l);
@@ -1474,7 +1903,12 @@ function renderLedger() {
   wrap.classList.remove("none");
   const table = el("table", "led");
   const head = el("tr");
-  for (const [name, cls, opt] of LED_COLS) head.append(el("th", (cls || "") + (opt ? " lc-opt" : ""), t(name)));
+  const optCls = (opt) => opt === 2 ? " lc-opt2" : opt ? " lc-opt" : "";
+  for (const [name, cls, opt, tip] of LED_COLS) {
+    const th = el("th", (cls || "") + optCls(opt), t(name));
+    if (tip) th.title = t(tip);
+    head.append(th);
+  }
   table.append(el("thead"), el("tbody"));
   table.tHead.append(head);
   for (const r of l.rows) {
@@ -1484,7 +1918,7 @@ function renderLedger() {
     tr.tabIndex = 0;
     tr.setAttribute("aria-expanded", ledOpen.has(key) ? "true" : "false");
     const td = (child, cls, title) => {
-      const c = el("td", (cls || "") + (LED_COLS[tr.childElementCount]?.[2] ? " lc-opt" : ""));
+      const c = el("td", (cls || "") + optCls(LED_COLS[tr.childElementCount]?.[2]));
       if (typeof child === "string") c.textContent = child; else c.append(child);
       if (title) c.title = title;
       tr.append(c);
@@ -1504,10 +1938,17 @@ function renderLedger() {
     // one made on another computer, whose usage sync brought (#542)
     const at = r.computerName ? t("{agent} · on {computer}", { agent: name, computer: r.computerName }) : name;
     who.append(icon(r.icon || "generic"), el("span", "", [r.via ? t("{agent} · via {host}", { agent: at, host: r.via }) : at, r.callerKeyLabel || r.callerKeyName].filter(Boolean).join(" · ")));
-    // a request magpie made by itself, apart from the agents' own (#1839)
-    if (r.agent === "magpie") who.append(ownBadge());
+    // a request magpie made by itself, apart from the agents' own (#1839);
+    // one that tested the provider (the editor's Test, Detect APIs, a model
+    // list) is counted nowhere, and says so (neiko on Discord)
+    const probe = r.source === "probe";
+    if (r.agent === "magpie") {
+      const own = ownBadge();
+      if (probe) own.title = probeWhy();
+      who.append(own);
+    }
     td(who, "", [r.kind, r.session && t("session {id}", { id: r.session })].filter(Boolean).join(" · "));
-    td(r.req || "—", "model" + (r.req ? "" : " faint"), r.req || t("Not kept for requests before this version"));
+    td(r.req || "—", "model" + (r.req ? "" : " faint"), r.req || (probe ? "" : t("Not kept for requests before this version")));
     const local = r.source === "log";
     // A session file names the provider it was set up to call, which is
     // where a call that went straight to a vendor went: nothing stood
@@ -1549,6 +1990,11 @@ function renderLedger() {
       k.title = t("Reported by the app that made it, through POST /v1/magpie/usage/requests: the call went straight to its vendor, not through magpie.");
       badges.append(k);
     }
+    if (probe) {
+      const k = el("span", "src probe", window.kindName ? window.kindName(r.kind) : r.kind);
+      k.title = probeWhy();
+      badges.append(k);
+    }
     if (badges.childElementCount) wc.append(badges);
     // the model sent is what the gateway sent the vendor: a session file has none
     // The log names a model, but does not capture the outbound HTTP request.
@@ -1557,8 +2003,12 @@ function renderLedger() {
     td(r.effort || "—", r.effort ? "" : "faint");
     td(ledNum(r.in), "n");
     td(ledNum(r.out), "n", r.reasoning ? t("{n} reasoning, inside output", { n: ledNum(r.reasoning) }) : "");
-    td(ledNum(r.cache_write), "n" + (r.cache_write ? "" : " faint"), cacheTTLs(r, ledNum).replace(/^ · /, ""));
-    td(ledNum(r.cache_read), "n" + (r.cache_read ? "" : " faint"));
+    // a vendor that counts no cache wrote and read none we know of, not 0 (#3464)
+    if (r.cache_unknown) for (let i = 0; i < 2; i++) td("—", "n faint", t("The vendor doesn't count the cache"));
+    else {
+      td(ledNum(r.cache_write), "n" + (r.cache_write ? "" : " faint"), cacheTTLs(r, ledNum).replace(/^ · /, ""));
+      td(ledNum(r.cache_read), "n" + (r.cache_read ? "" : " faint"));
+    }
     const cost = td(r.priced ? "≈" + fmtCost({ cost: r.cost, unpriced: 0 }) : "—", "n cost" + (r.priced ? "" : " faint"), r.priced ? (r.pricing_model ? t("API price reference") + ": " + r.pricing_model : "") : t("No known price for this model"));
     if (r.priced && r.pricing_model) {
       const reference = el("div", "price-reference", t("Price reference: {model}", { model: r.pricing_model }));
@@ -1569,18 +2019,26 @@ function renderLedger() {
     // asked for it to its last; some have none, and are dashes, not 0 ms
     const timed = r.source === "log";
     const untimed = !Number.isFinite(r.ms) || r.ms <= 0;
+    // the wait for its first token, in a column of its own to compare down
+    // the list: the duration holds it and the writing after it (#2522).
+    // One not streamed, or that failed before any, has none
+    td(r.ttft_ms > 0 ? (timed ? "≈" : "") + ledTook(r.ttft_ms) : "—", "n ttft" + (r.ttft_ms > 0 ? "" : " faint"),
+      r.ttft_ms > 0 ? [t("{n} ms", { n: ledNum(r.ttft_ms) }), timed ? t("About: told from the session file's times, a little more or less than it took") : ""].filter(Boolean).join(" · ") : "");
     const durationBand = untimed ? "" : r.ms <= 10000 ? "fast" : r.ms <= 30000 ? "slow" : "long";
     td(untimed ? "—" : (timed ? "≈" : "") + ledTook(r.ms), "n duration " + (untimed ? "faint" : "duration-" + durationBand),
       [!untimed ? t("{n} ms", { n: ledNum(r.ms) }) : "", !untimed ? t("Duration colors: ≤10 s green · 10–30 s amber · >30 s red") : "", timed && !untimed ? t("About: told from the session file's times, a little more or less than it took") : "", r.ttft_ms ? t("TTFT {ms}", { ms: ledTook(r.ttft_ms) }) : ""].filter(Boolean).join(" · "));
     // how fast it wrote once it began, as CC Switch's log has it (#860)
-    const v = ledRowSpeed(r), floor = ledFloorSpeed(r);
+    const v = ledRowSpeed(r), floor = ledFloorSpeed(r), f = ledFloor_(r);
+    const ttft = r.ttft_ms > 0 ? " · " + t("TTFT {ms}", { ms: ledTook(r.ttft_ms) }) : "";
     td(v ? t("{n} tok/s", { n: ledNum(Math.round(v)) }) : floor ? "≥" + t("{n} tok/s", { n: ledNum(Math.round(floor)) }) : "—", "n speed" + (v || floor ? "" : " faint"),
       v ? (r.reasoning > 0 && r.first_text_ms > 0 ? t("{n} answer tokens in {ms} after the first text, the {r} reasoning tokens before it left out", { n: ledNum(ledDecode(r).n), ms: ledTook(ledDecode(r).w), r: ledNum(r.reasoning) })
-        : t("{n} output tokens in {ms} after the first", { n: ledNum(ledDecode(r).n), ms: ledTook(ledDecode(r).w) })) + " · " + t("TTFT {ms}", { ms: ledTook(r.ttft_ms) })
-        : floor && ledFloor_(r).answer ? t("At least: {n} answer tokens in {ms} after the first token, the {r} reasoning tokens left out. The session file has no first text, so reasoning after the first token is counted too", { n: ledNum(ledFloor_(r).n), ms: ledTook(ledFloor_(r).w), r: ledNum(r.reasoning) }) + " · " + t("TTFT {ms}", { ms: ledTook(r.ttft_ms) })
-        : floor && ledFloor_(r).turn ? t("At least: {n} output tokens in {ms}, the whole turn. What came after the first token ({after}) is too little to time a speed by: under a second or under 100 tokens, so the wait for it is counted too", { n: ledNum(r.out), ms: ledTook(r.ms), after: ledTook(r.ms - r.ttft_ms) }) + " · " + t("TTFT {ms}", { ms: ledTook(r.ttft_ms) })
+        : t("{n} output tokens in {ms} after the first", { n: ledNum(ledDecode(r).n), ms: ledTook(ledDecode(r).w) })) + ttft
+        : floor && f.gateway && f.answer ? t("At least: {n} answer tokens in {ms} after the first token, the {r} reasoning tokens left out. No first text was recorded, so reasoning after the first token is counted too", { n: ledNum(f.n), ms: ledTook(f.w), r: ledNum(r.reasoning) }) + ttft
+        : floor && f.gateway ? t("At least: {n} output tokens in {ms}, from the request to its last token, the wait for the first one counted too", { n: ledNum(r.out), ms: ledTook(r.ms) }) + ". " + ledNoSpeed_(r) + ttft
+        : floor && f.answer ? t("At least: {n} answer tokens in {ms} after the first token, the {r} reasoning tokens left out. The session file has no first text, so reasoning after the first token is counted too", { n: ledNum(f.n), ms: ledTook(f.w), r: ledNum(r.reasoning) }) + ttft
+        : floor && f.turn ? t("At least: {n} output tokens in {ms}, the whole turn. What came after the first token ({after}) is too little to time a speed by: under a second or under 100 tokens, so the wait for it is counted too", { n: ledNum(r.out), ms: ledTook(r.ms), after: ledTook(r.ms - r.ttft_ms) }) + ttft
         : floor ? t("At least: {n} output tokens in {ms}, from the line that asked for it to its last. The session file has no first token, so the wait for it is counted too", { n: ledNum(r.out), ms: ledTook(r.ms) })
-        : r.ttft_ms || untimed || ledFailed_(r) ? "" : timed ? t("The session file has no first token to time a speed from") : t("Not streamed: no first token to time a speed from"));
+        : ledNoSpeed_(r));
     const st = el("span", "st");
     // a status when the gateway logged the call; a session file has none,
     // and says only whether it went well
@@ -1632,11 +2090,12 @@ function renderLedger() {
   $("#ledQ").oninput = (e) => {
     ledQuery = e.target.value;
     ledModel = "";
+    ledOwn("model");
     clearTimeout(typing);
     typing = setTimeout(() => { ledOffset = 0; loadLedger().catch((err) => status(err.message, "err")); }, 250);
   };
   $("#ledQ").onkeydown = (e) => {
-    if (e.key === "Escape" && e.target.value) { e.stopPropagation(); e.target.value = ""; ledQuery = ""; ledModel = ""; ledOffset = 0; loadLedger().catch((err) => status(err.message, "err")); }
+    if (e.key === "Escape" && e.target.value) { e.stopPropagation(); e.target.value = ""; ledQuery = ""; ledModel = ""; ledOwn("model"); ledOffset = 0; loadLedger().catch((err) => status(err.message, "err")); }
   };
   $("#ledExport").onclick = async () => {
     const b = $("#ledExport");
@@ -1664,6 +2123,93 @@ function renderLedger() {
 //
 // The agents' own sessions, read from their session files: what each cost,
 // and the command that picks it up again. A segment of the Usage page.
+
+// A session's row and details, as this list and the Sessions page's
+// (plugins/sessions/client.js) both draw them.
+
+// sessModelNames lists models for a cost note, one an agent recorded no
+// name for told as such: joined bare, the note read "Not counted: , with
+// no known price" (tony, Discord)
+const sessModelNames = (models) => [...new Set(models.map((m) => m || t("a model with no name")))].join(", ");
+
+// wslBadge marks a session an agent ran in a WSL distro, read through
+// \\wsl.localhost; its resume command runs it there through wsl.exe
+function wslBadge(s) {
+  const b = el("span", "badge wsl", "WSL " + s.wsl);
+  b.title = t("In WSL {distro}: resumed there through wsl.exe", { distro: s.wsl });
+  return b;
+}
+
+// sessModelsText: a session's models, the first two and how many more, and
+// where magpie's gateway sent its calls, the most first: a routing group's
+// member and the reasoning it was asked for
+function sessModelsText(s) {
+  const via = s.via?.length ? "→ " + [s.via[0].model, s.via[0].effort].filter(Boolean).join(" · ") + (s.via.length > 1 ? " +" + (s.via.length - 1) : "") : "";
+  return sessModelNames(s.models.slice(0, 2).map((m) => m.model)) + (s.models.length > 2 ? " +" + (s.models.length - 2) : "") + (via ? " " + via : "");
+}
+
+// sessUsageDetail adds to a session's details what it spent by model, and
+// what the gateway sent its calls to, at what reasoning; line(label, value)
+// adds a line of the details
+function sessUsageDetail(d, s, line) {
+  if (s.models?.length) {
+    const m = el("div", "sess-models");
+    for (const x of s.models) {
+      m.append(el("span", "model", x.model || t("a model with no name")),
+        el("span", "n", t("{a} in · {b} out", { a: fmtN(x.input), b: fmtN(x.output) }) + (x.cache_read ? " · " + t("{n} cached", { n: fmtN(x.cache_read) }) : "") + (x.cache_write ? " · " + t("{n} written", { n: fmtN(x.cache_write) }) : "")),
+        el("span", "c" + (x.priced ? "" : " none"), x.priced ? "≈" + fmtCost({ cost: x.cost }) : "—"));
+    }
+    d.append(m);
+  }
+  (s.via || []).forEach((v, i) => line(i ? "" : t("Routed"), viaText(v) + " · " + t("{n} tokens", { n: fmtN(v.tokens) }) + (v.credited ? " · " + ledCredits(v).textContent : "")));
+}
+
+// one place a session's calls went through magpie, in words
+function viaText(v) {
+  return `${v.provider}/${v.model}` + (v.effort ? " · " + v.effort : "") + " · " + t("{n} calls", { n: v.calls });
+}
+
+const ledExpanded = new WeakSet();
+const LED_KINDS = { tool_use: "Tool call", tool_result: "Tool result", thinking: "Thinking", context: "Context", image: "Image" };
+const LED_ROLES = { user: "You", assistant: "Assistant", tool: "Tool" };
+
+// one thing said: who said it, and its words in a box; long ones show a part and
+// unroll, and reasoning and what the agent put in itself are folded; model,
+// when given, is said muted after it (a session's reader names the model
+// of each reply, #2253)
+function ledSaid(p, model) {
+  const head = el("div", "cx-h");
+  head.append(el("span", "cx-role " + p.role, t(LED_KINDS[p.kind] || LED_ROLES[p.role] || p.role)));
+  if (p.name) head.append(el("code", "cx-name", p.name));
+  if (model) {
+    const m = el("span", "cx-model", model);
+    m.title = t("Model") + ": " + model;
+    head.append(m);
+  }
+  const words = el("pre", "cx-t", p.text);
+  if (p.cut) words.append(el("em", "cx-cut", "\n" + t("… {n} more characters not shown", { n: ledNum(p.cut) })));
+  if (p.kind === "thinking" || p.kind === "context") {
+    const d = el("details", "cx-part fold");
+    const sum = el("summary");
+    sum.append(head);
+    d.append(sum, words);
+    return d;
+  }
+  const part = el("div", "cx-part");
+  part.append(head, words);
+  if (p.text.length > 700 || p.text.split("\n").length > 9) {
+    part.classList.toggle("clamp", !ledExpanded.has(p));
+    const more = el("button", "text cx-more", t(ledExpanded.has(p) ? "Collapse content" : "Show full content"));
+    more.type = "button";
+    more.onclick = () => {
+      const clamped = part.classList.toggle("clamp");
+      if (clamped) ledExpanded.delete(p); else ledExpanded.add(p);
+      more.textContent = t(clamped ? "Show full content" : "Collapse content");
+    };
+    part.append(more);
+  }
+  return part;
+}
 
 const USAGE_TABS = [["usage", "Overview"], ["requests", "Requests"], ["sessions", "Sessions"], ["context", "Context"]];
 let usageTab = "usage";
@@ -1714,6 +2260,7 @@ let sessOver = null;
 let sessOverAt = "";
 let sessOverLoading = "";
 let sessTopOpen = ""; // the top session opened to its details
+let sessListOpen = ""; // with the Sessions page switched off, the listed session opened here to its details (#2311)
 const sessFull = new Map(); // a top session's key → the session read whole, or "…" while it is read
 
 function renderUsageTab() {
@@ -1723,6 +2270,7 @@ function renderUsageTab() {
     const b = el("button", "opt" + (id === usageTab ? " on" : ""), t(name));
     b.onclick = () => {
       if (id === usageTab) return;
+      if (usageTab === "requests") ledLeave();
       usageTab = id;
       try { localStorage.setItem("magpie.usageTab", id); } catch {}
       $("#usageCost").replaceChildren();
@@ -1751,7 +2299,7 @@ async function loadSessions() {
   const stop = first ? sessWatchIndex() : () => {};
   let s, st, o;
   try {
-    [s, st, o] = await Promise.all([api("sessions"), api("sessions/stats?days=" + sessDays()), api("sessions/overview?" + q)]);
+    [s, st, o] = await Promise.all([api("sessions"), api("sessions/stats?days=" + sessDays()), sessOverview(q)]);
   } finally { stop(); }
   if (range !== sessRange) return; // another range was picked meanwhile; its load draws
   const fresh = q === sessOverQ(); // no filter changed meanwhile
@@ -1763,6 +2311,19 @@ async function loadSessions() {
   if (view === "usage" && usageTab === "sessions") renderSessions();
 }
 
+// sessOverview reads a query's overview, once while a read of it is under
+// way: the page's reload, a filter's and a range's each asked for their
+// own, and over a long history each read is a long one (#2278)
+const sessOverReads = new Map();
+function sessOverview(q) {
+  let read = sessOverReads.get(q);
+  if (!read) {
+    read = api("sessions/overview?" + q).finally(() => sessOverReads.delete(q));
+    sessOverReads.set(q, read);
+  }
+  return read;
+}
+
 // the overview's query: the range and the filters
 const sessOverQ = () => new URLSearchParams({ days: sessDays(), agent: sessAgent === "all" ? "" : sessAgent, model: sessModel, cwd: sessFolder }).toString();
 // loadSessOverview reads the overview again when a filter changes, and draws
@@ -1772,7 +2333,7 @@ function loadSessOverview() {
   if (sessOverLoading === q) return;
   sessOverLoading = q;
   const done = () => { if (sessOverLoading === q) sessOverLoading = ""; };
-  api("sessions/overview?" + q).then((o) => {
+  sessOverview(q).then((o) => {
     done();
     if (q !== sessOverQ()) return;
     sessOver = o;
@@ -2160,7 +2721,7 @@ function renderSessions() {
     stats.classList.remove("six");
     stats.classList.add("empty");
     const filtered = sessAgent !== "all" || sessModel || sessFolder || q;
-    stats.append(el("div", "none", !all.length && !rows.length ? t("No sessions yet. Claude Code's, Codex's, OpenCode's and Pi's sessions on this computer show up here, with what each cost and the command that resumes it.") : filtered ? t("No session matches.") : t("Nothing in this range.")));
+    stats.append(el("div", "none", !all.length && !rows.length ? t("No sessions yet. Claude Code's, Codex's, Hermes, OpenCode's and Pi's sessions on this computer show up here, with what each cost and the command that resumes it.") : filtered ? t("No session matches.") : t("Nothing in this range.")));
     if (from && all.some((s) => byAgent(s) && byFolder(s) &&
       (!sessModel || s.models.some((m) => m.model === sessModel)) &&
       (!q || [s.title, s.cwd, s.id, s.name, ...s.models.map((m) => m.model)].some((x) => (x || "").toLowerCase().includes(q))))) {
@@ -2606,9 +3167,12 @@ function renderSessTop() {
     const r = el("div", "row sess sess-top");
     r.append(icon(icons.get(s.agent) || "generic"));
     const who = el("div", "who");
-    who.append(el("div", "name", s.title || t("(no prompt)")));
-    const sub = el("div", "sub", [s.cwd ? baseName(s.cwd) : "", names[s.agent] || s.agent, s.models?.[0], ago(s.last)].filter(Boolean).join(" · "));
-    sub.title = s.cwd || "";
+    // a session magpie saw only through the gateway (#2285: a Pi
+    // subagent's, its file in a temp folder) has no folder and no prompt
+    // unless gateway conversations are recorded: say so, not "(no prompt)"
+    who.append(el("div", "name", s.title || t(s.gateway ? "(prompt not recorded)" : "(no prompt)")));
+    const sub = el("div", "sub", [s.cwd ? baseName(s.cwd) : s.gateway ? t("Gateway session") : "", names[s.agent] || s.agent, s.models?.[0], ago(s.last)].filter(Boolean).join(" · "));
+    sub.title = s.cwd || (s.gateway ? t("Seen only through the gateway: the agent kept no session file magpie can read. Turn on Record gateway conversations in Sessions to keep its prompts.") : "");
     who.append(sub);
     r.append(who);
     const fc = fmtCost({ cost: s.cost, unpriced: !s.priced });
@@ -2864,12 +3428,25 @@ function sessSpent(s) {
 // A row of the Usage page's list: what the session spent. It opens on the
 // Sessions page, where it is resumed, read in full and deleted (#752: the
 // two lists were one done twice, each lacking half).
+// A row opens its session on the Sessions page. With that page switched off
+// (Plugins › Built-in) there is nowhere to open it, so the row unfolds the
+// session's details in place, as a top session's do, instead of looking like
+// a link and doing nothing when clicked (#2311, betacatZ).
 function sessionItem(s) {
   const item = el("div", "sess-item");
+  item.sess = s;
   const r = el("div", "row sess sess-link");
+  const key = s.agent + ":" + s.id;
+  const here = featuresOff.has("sessions");
+  const unfolded = here && sessListOpen === key;
   r.tabIndex = 0;
-  r.setAttribute("role", "link");
-  r.title = t("Open in Sessions");
+  if (here) {
+    r.setAttribute("role", "button");
+    r.setAttribute("aria-expanded", String(unfolded));
+  } else {
+    r.setAttribute("role", "link");
+    r.title = t("Open in Sessions");
+  }
   r.append(icon(s.icon || "generic"));
   const who = el("div", "who");
   who.append(el("div", "name", s.title || t("(no prompt)")));
@@ -2879,16 +3456,27 @@ function sessionItem(s) {
   who.append(sub);
   r.append(who, ...sessSpent(s));
   const go = el("span", "sess-go");
-  go.append(svg(CHEV_R, 12, 1.6));
+  go.append(svg(here ? CHEV : CHEV_R, 12, 1.6));
+  if (unfolded) go.classList.add("up");
   r.append(go);
   const open = (e) => {
     if (window.getSelection()?.toString()) return;
-    if (featuresOff.has("sessions")) return; // Sessions is switched off: there is no page to open it on
-    magpie.call("sessions", "reveal", s, e);
+    if (!featuresOff.has("sessions")) return magpie.call("sessions", "reveal", s, e);
+    // Sessions is switched off: there is no page to open it on
+    sessListOpen = sessListOpen === key ? "" : key;
+    // one open at a time: the one that was folds
+    for (const o of item.parentElement?.querySelectorAll(":scope > .sess-item.open") || []) if (o !== item) o.replaceWith(sessionItem(o.sess));
+    const next = sessionItem(s);
+    item.replaceWith(next);
+    next.querySelector(".row.sess").focus({ preventScroll: true });
   };
   r.onclick = open;
   r.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(e); } };
   item.append(r);
+  if (unfolded) {
+    item.classList.add("open");
+    item.append(sessionDetail(s));
+  }
   return item;
 }
 
@@ -3008,7 +3596,7 @@ function refreshUsage(now = false) {
         else if (usage && performance.now() - quotasAsked > 60e3) { quotasAsked = performance.now(); loadQuotas(); }
         if (usage) {
           const p = period, read = ++usageRead;
-          const u = await api("usage?period=" + encodeURIComponent(p));
+          const u = await api("usage?period=" + encodeURIComponent(p) + usageZoneQ());
           if (read === usageRead && view === "usage" && usageTab === "usage" && p === period) {
             if (JSON.stringify(u) !== JSON.stringify(usage)) { usage = u; renderUsage(); }
             // this read claimed the newest one: a pick it superseded had put the
@@ -3055,6 +3643,8 @@ if (mode === "window" && params.get("view") === "usage") {
   ledComputer = params.get("computer") || "";
   const v = params.get("via") || "";
   ledVia = v === "through" || v === "direct" || v === "reported" ? v : "";
+  // a way in, not the reader's pick: they go once the Requests are left
+  for (const [k, x] of [["provider", ledProvider], ["agent", ledAgent], ["purpose", ledPurpose], ["computer", ledComputer], ["via", ledVia]]) if (x) ledLent.add(k);
   const u = new URL(location.href);
   for (const k of ["tab", "provider", "agent", "computer", "card", "purpose", "via", "period"]) u.searchParams.delete(k);
   history.replaceState(null, "", u);
