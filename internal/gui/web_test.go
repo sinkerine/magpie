@@ -92,7 +92,7 @@ func TestWebNoAuthGuardBypass(t *testing.T) {
 	}
 	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) })
 	rec := httptest.NewRecorder()
-	webHandler(false, "3430", "", 0, next).ServeHTTP(rec, httptest.NewRequest("GET", "/api/state", nil))
+	webHandler("3430", "", 0, next).ServeHTTP(rec, httptest.NewRequest("GET", "/api/state", nil))
 	if rec.Code != http.StatusTeapot {
 		t.Fatalf("no-auth request: %d", rec.Code)
 	}
@@ -100,7 +100,7 @@ func TestWebNoAuthGuardBypass(t *testing.T) {
 
 func TestWebGuardBookmark(t *testing.T) {
 	const key = "0123456789abcdef-2033"
-	h := webHandler(true, "3430", key, webCookieAge, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) }))
+	h := webHandler("3430", key, webCookieAge, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) }))
 	do := func(r *http.Request) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)

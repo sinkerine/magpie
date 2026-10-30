@@ -41,6 +41,8 @@ func syncHome(t *testing.T) string {
 	t.Setenv("SENPI_CODING_AGENT_DIR", "")
 	t.Setenv("PRIME_AGENT_CODING_AGENT_DIR", "")
 	t.Setenv("MOTHX_DIR", "")
+	t.Setenv("PENGUIN_HOME", "")
+	t.Setenv("PENGUIN_PROJECT_ID", "")
 	t.Setenv("PI_CODING_AGENT_DIR", "")
 	t.Setenv("PI_CONFIG_DIR", "")
 	t.Setenv("OMP_PROFILE", "")
@@ -227,6 +229,10 @@ func TestSyncCatalogRewritesAgentLists(t *testing.T) {
 	home := syncHome(t)
 	piModels := filepath.Join(home, ".pi", "agent", "models.json")
 	writeFile(t, piModels, `{"providers":{"mine":{"baseUrl":"http://x"},"magpie":{"name":"magpie","models":[]}}}`)
+	// connected: a block of magpie's name in an agent not on magpie is the
+	// user's own (TestCatalogSyncLeavesAHandWrittenMagpieBlock)
+	writeFile(t, filepath.Join(home, ".pi", "agent", "settings.json"), `{"defaultProvider":"magpie","defaultModel":"relay/glm-4.6"}`)
+	setUpInMagpie("pi")
 	crushCfg := filepath.Join(home, ".config", "crush", "crush.json")
 	crushBody := `{"providers":{"mine":{"base_url":"http://x"}}}`
 	writeFile(t, crushCfg, crushBody)

@@ -98,7 +98,9 @@ func parseLoginImport(agent, data string) ([]loginImport, error) {
 			if line == "" || strings.HasPrefix(line, "#") {
 				continue
 			}
-			if strings.ContainsAny(line, " \t") {
+			// an address (a sign-in's callback among them) is never sent to
+			// the vendor as a token
+			if strings.ContainsAny(line, " \t") || looksLikeAddress(line) {
 				out = append(out, loginImport{err: "not a refresh token"})
 				continue
 			}
@@ -376,7 +378,7 @@ func importLogin(ctx context.Context, agent string, e loginImport, name string, 
 	switch agent {
 	case "codex":
 		raw := map[string]any{"tokens": map[string]any{"refresh_token": e.refreshToken}}
-		if _, err := codexRefresh(ctx, raw); err != nil {
+		if _, err := codexRefresh(ctx, raw, codexRefreshForced); err != nil {
 			return refused("ChatGPT", err)
 		}
 		t := raw["tokens"].(map[string]any)

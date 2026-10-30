@@ -62,7 +62,7 @@ func TestSmartUnusedAccountWindows(t *testing.T) {
 	sticks.Lock()
 	sticks.m[key] = stick{who: cs[0].who(), rest: cs[0].rest, model: cs[0].model, turn: 1, at: now}
 	sticks.Unlock()
-	got, _, a, _ := affine(p.ID, "", false, h, provider.Chat, body, got, pl)
+	got, _, a, _ := affine(p.ID, "", false, false, h, provider.Chat, body, body, got, pl)
 	if !a.Kept || a.Why != "turn" || got[0].p.Account.User != "used" {
 		t.Fatalf("active turn lost affinity: %+v, first %s", a, got[0].p.Account.User)
 	}

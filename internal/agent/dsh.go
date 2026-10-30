@@ -96,7 +96,12 @@ func dshAt(at place) *Agent {
 	// DeepSeek Harness Desktop, on this machine (a distro has none)
 	desktop := func() bool { return at.spell == nil && (&Agent{ID: "dsh"}).HasApp() }
 	path := filepath.Join(dir, "config.yaml")
-	if files := dshProfiles(dir); len(files) > 0 {
+	// a stopped distro's folder is never listed: that starts it (#3896)
+	var files []string
+	if !at.cold {
+		files = dshProfiles(dir)
+	}
+	if len(files) > 0 {
 		path = files[0]
 	} else if desktop() {
 		path = dshDesktopFile(dir)
@@ -446,6 +451,11 @@ func dshParse(path, raw string) (head []string, items []dshItem, err error) {
 	}
 	opened := false // a "---" or "[]" came before the first entry
 	for _, l := range splitLinesKeep(raw) {
+		// magpie's notes are left out, and dshWrite puts them back: a
+		// route is compared with the lines magpie would write
+		if edit.IsNote(l) {
+			continue
+		}
 		t := strings.TrimSpace(l)
 		switch {
 		case strings.HasPrefix(l, "- ") || l == "-":
@@ -510,6 +520,9 @@ func dshWrite(path string, head []string, items []dshItem) error {
 		}
 		out = append(out, "[]") // dsh wants a list, even an empty one
 	}
+	// a route on the gateway says so (edit.Mark)
+	orig, _ := edit.Read(path)
+	out = edit.MarkYAMLLines(out, string(orig))
 	return edit.WriteAtomic(path, []byte(strings.Join(out, "\n")+"\n"))
 }
 
@@ -1456,16 +1469,19 @@ type dshPiLevels struct {
 var dshThinking = []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 // dshModelLevels are the levels of dsh's a catalog model takes, each with
-// the effort sent for it: its own, and off for its none.
+// the effort sent for it: the model's own name for it (modelEffort), so a
+// plugin's light and extra_high are dsh's low and xhigh and are sent as
+// light and extra_high, and off for its none.
 func dshModelLevels(efforts []string) ([]string, *dshPiLevels) {
 	var levels []string
 	var out dshPiLevels
 	for _, l := range dshThinking {
-		e := l
+		w := l
 		if l == "off" {
-			e = "none"
+			w = "none"
 		}
-		if !contains(efforts, e) {
+		e := modelEffort(efforts, w)
+		if e == "" {
 			continue
 		}
 		levels = append(levels, l)

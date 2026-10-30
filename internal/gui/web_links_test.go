@@ -1,8 +1,11 @@
 package gui
 
 import (
+	"net"
 	"slices"
 	"testing"
+
+	"github.com/yetone/magpie/internal/gateway"
 )
 
 // magpie web behind a reverse proxy (#372): MAGPIE_PUBLIC_URL with no port
@@ -31,5 +34,19 @@ func TestNetworkLinksPublicURL(t *testing.T) {
 	t.Setenv("MAGPIE_PUBLIC_URL", "https://magpie.example.com")
 	if got := NetworkLinks("3430", ""); !slices.Equal(got, []string{"https://magpie.example.com/"}) {
 		t.Fatalf("no-auth link: %v", got)
+	}
+}
+
+// The links printed for other machines are at the gateway's own addresses
+// (gateway.LANHosts), one for one: Settings showed a computer's static
+// public address under the gateway and not under the page.
+func TestNetworkLinksAtTheGatewaysHosts(t *testing.T) {
+	t.Setenv("MAGPIE_PUBLIC_URL", "")
+	var want []string
+	for _, h := range gateway.LANHosts() {
+		want = append(want, "http://"+net.JoinHostPort(h, "3430")+"/?k=k")
+	}
+	if got := NetworkLinks("3430", "/?k=k"); !slices.Equal(got, want) {
+		t.Errorf("%v, want %v", got, want)
 	}
 }

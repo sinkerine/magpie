@@ -11,12 +11,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/codexcat"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
@@ -101,6 +103,10 @@ func isolate(t testing.TB) {
 	// a minute, and CachedCards hands them on whatever their age
 	forgetPlanQuotas()
 	ForgetBalances()
+	// nor when another test asked a saved account's list
+	codexSavedAsked.Lock()
+	codexSavedAsked.m = map[string]time.Time{}
+	codexSavedAsked.Unlock()
 	t.Cleanup(func() {
 		claudeKeychain, claudeBase, claudeExecutable = oldKeychain, oldBase, oldExe
 		DevinExecutable = oldDevin
@@ -233,6 +239,16 @@ func TestAccountsAreProviders(t *testing.T) {
 		}
 	}
 	codex.Unlisted = false
+	Save(codex)
+	// and so do the image models unticked in its editor (321sssrt on X)
+	codex.HiddenDrawers = []string{"gpt-image-2"}
+	if err := Save(codex); err != nil {
+		t.Fatal(err)
+	}
+	if codex, _ = find(All(), "codex"); !slices.Equal(codex.HiddenDrawers, []string{"gpt-image-2"}) || !codex.DrawerHidden("gpt-image-2") {
+		t.Fatalf("hidden image models lost on an account: %v", codex.HiddenDrawers)
+	}
+	codex.HiddenDrawers = nil
 	Save(codex)
 
 	// signed out: gone, and a stale picks entry is not a provider
@@ -628,5 +644,21 @@ func TestClaudeCredentialsMarshalLeavesTheBlob(t *testing.T) {
 	wg.Wait()
 	if o := c.raw["claudeAiOauth"].(map[string]any); o["accessToken"] != "sk-ant-oat01-a" || o["subscriptionType"] != nil {
 		t.Fatalf("the blob was written into: %v", o)
+	}
+}
+
+// CodexSignInPlan reads the plan from Codex's own sign-in, and codexcat
+// asks it there (the auto-review default on a Free plan, cybercaius).
+func TestCodexSignInPlan(t *testing.T) {
+	home := signIn(t)
+	if got := CodexSignInPlan(); got != "pro" {
+		t.Fatalf("plan %q", got)
+	}
+	if codexcat.SignInPlan == nil || codexcat.SignInPlan() != "pro" {
+		t.Fatal("codexcat doesn't read the sign-in's plan")
+	}
+	os.Remove(filepath.Join(home, ".codex", "auth.json"))
+	if got := CodexSignInPlan(); got != "" {
+		t.Fatalf("signed out: plan %q", got)
 	}
 }

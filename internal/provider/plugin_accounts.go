@@ -22,6 +22,48 @@ import (
 // pluginAgent is what logins.json lists a plugin provider's accounts as.
 func pluginAgent(pp plugin.Provider) string { return "plugin:" + pp.ID }
 
+// publicPlugin is whether every way to sign in to the plugin's provider is
+// keyless, its credential one the plugin gives whatever is typed: OpenCode
+// Zen Free's shared "public". Such an account is nobody's, so with
+// subscription accounts off (#1535, discovery.go) it is still listed and
+// served. Before, Zen Free signed in all the same with them off, the
+// Plugins page said so, and magpie listed it nowhere (lileo0668 on
+// Discord: "signed in, but magpie can't list it").
+func publicPlugin(pp plugin.Provider) bool {
+	if len(pp.Methods) == 0 {
+		return false
+	}
+	for _, m := range pp.Methods {
+		if m.Type != "api" || !m.Keyless {
+			return false
+		}
+	}
+	return true
+}
+
+// publicLogins are a public plugin's accounts while subscription accounts
+// are off, read from the plugin alone: logins.json and plugin-auth.json
+// are left unread then (discovery.go), so the first is in use and every
+// one is on.
+func publicLogins(pp plugin.Provider) []pluginLogin {
+	agent, labels := pluginAgent(pp), pluginLabels(pp, nil)
+	var out []pluginLogin
+	for _, a := range pp.Accounts {
+		saved := savedLogin{Agent: agent, User: labels[a.Key], Home: a.Key, On: true}
+		out = append(out, pluginLogin{sideLogin{Login{Agent: agent, User: saved.User, On: true}, saved}, a})
+	}
+	if len(out) > 0 {
+		out[0].Active = true
+	}
+	return out
+}
+
+// publicAccount is whether p is a public plugin's provider (publicPlugin),
+// served while subscription accounts are off.
+func (p Provider) publicAccount() bool {
+	return p.IsPlugin() && publicPlugin(*p.Account.plugin)
+}
+
 // pluginLabels names each account: by named (the agent's own, as the
 // agent is signed in now), else its id, else the end of its key, else what
 // it signed in with; a name two share gets the account's slot. The slot
@@ -93,6 +135,13 @@ type pluginLogin struct {
 	acct plugin.Account
 }
 
+// cliMarked says a sign-in carries the "cli" mark of the agent's own
+// sign-in: true as a mover wrote it before, "true" as the Devin plugin
+// writes it since 0.1.24 (plugins #396).
+func cliMarked(md map[string]any) bool {
+	return md["cli"] == true || md["cli"] == "true"
+}
+
 // pluginOwn says a plugin sign-in is the agent's own (its CLI's, its
 // app's), which the plugin reads where the agent keeps it. The movers mark
 // it so (migrate_side.go, migrate_kiro.go, migrate_workbuddy.go,
@@ -101,7 +150,7 @@ func pluginOwn(id string, auth map[string]any) bool {
 	md, _ := auth["metadata"].(map[string]any)
 	switch id {
 	case "devin", CommandCodePlanID:
-		return md["cli"] == true
+		return cliMarked(md)
 	case "grok":
 		return samePath(str(auth["refresh"]), GrokHome())
 	case "cursor":
@@ -159,6 +208,9 @@ var pluginOwnUser = func(id string) string {
 // it is only hidden, and shows again once the agent signs in anew.
 func pluginLogins(pp plugin.Provider) []pluginLogin {
 	if settings.AccountDiscoveryOff() {
+		if publicPlugin(pp) {
+			return publicLogins(pp)
+		}
 		return nil
 	}
 	agent := pluginAgent(pp)

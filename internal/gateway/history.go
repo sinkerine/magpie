@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yetone/magpie/internal/provider"
@@ -299,6 +300,15 @@ func History(day string) (days []HistoryDay, routes []Route, cut bool) {
 				})
 			}
 		} else if d.day == day || !ok || c.size != d.size {
+			if d.day == day && (!ok || c.size != d.size) {
+				// counted first, routes left as lines: a busy day's every
+				// route parsed at once, to keep its latest historyMax, was
+				// hundreds of MB, and a small server running the Context
+				// tab went down (Yayoi_no_yume on X)
+				n := 0
+				readDay(d.path, func([]byte) bool { n++; return true })
+				c, ok = counted{size: d.size, n: n}, true
+			}
 			n, skip := 0, -1
 			if d.day == day && ok && c.size == d.size {
 				skip = c.n - historyMax - historySlack
@@ -334,7 +344,11 @@ func History(day string) (days []HistoryDay, routes []Route, cut bool) {
 // route done after the later ones began.
 const historySlack = 200
 
+// historyParsed counts the routes History has parsed, for the tests.
+var historyParsed atomic.Int64
+
 func appendRoute(routes []Route, line []byte) []Route {
+	historyParsed.Add(1)
 	var r Route
 	if json.Unmarshal(line, &r) != nil {
 		return routes
@@ -401,12 +415,13 @@ func tally(d dayFile, c counted) counted {
 // answered as deepseek-v4-1-flash) wasn't swapped (usage.SameSpelled), nor
 // was one answered under Google's name for the deployment serving its
 // Gemini model (gemini-3.8-flash as gemini-3.8-flash-n) or xAI's for a Grok
-// one (grok-4.7 as grok-4.7-build), usage.ServingName.
+// one (grok-4.7 as grok-4.7-build), usage.ServingName, nor one answered
+// under the name its provider's list gives it (usage.ListedAs).
 func (r *Route) routedAgain() {
 	for i := range r.Tries {
 		if tr := &r.Tries[i]; tr.Swapped && usage.GroupRouted(tr.Model, tr.Served) {
 			tr.Swapped, tr.Routed = false, true
-		} else if tr.Swapped && (usage.SameSpelled(tr.Model, tr.Served) || usage.ServingName(tr.Model, tr.Served)) {
+		} else if tr.Swapped && (usage.SameSpelled(tr.Model, tr.Served) || usage.ServingName(tr.Model, tr.Served) || usage.ListedAs(tr.ID, tr.Model, tr.Served)) {
 			tr.Swapped = false
 		}
 	}

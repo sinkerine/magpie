@@ -176,6 +176,9 @@ func agyFolder(uri, goos string) string {
 // agyTranscripts are each conversation's transcript_full.jsonl in an agy
 // data folder, keyed agy:<conversation id>.
 func agyTranscripts(dir string) []file {
+	if !Reads("agy") {
+		return nil
+	}
 	brain := filepath.Join(dir, "brain")
 	dirs, _ := os.ReadDir(brain)
 	var out []file
@@ -202,6 +205,9 @@ func agyFiles() []file { return agyFilesIn(AgyDir()) }
 // steps in conversations/<id>.db too, protobuf this doesn't read) is
 // listed from its row alone: its title, folder and time, and no tokens.
 func agyFilesIn(dir string) []file {
+	if !Reads("agy") {
+		return nil
+	}
 	out := agyTranscripts(dir)
 	rows := agySummariesOf(dir)
 	if len(out) == 0 && len(rows) == 0 {
@@ -212,8 +218,8 @@ func agyFilesIn(dir string) []file {
 		id := strings.TrimPrefix(out[i].key, "agy:")
 		has[id] = true
 		if r, ok := rows[id]; ok {
-			out[i].agy = &r
-			out[i].rev = agyRev(r)
+			out[i].w().agy = &r
+			out[i].w().rev = agyRev(r)
 		}
 	}
 	for id, r := range rows {
@@ -222,7 +228,8 @@ func agyFilesIn(dir string) []file {
 		}
 		f := file{agent: "agy", key: "agy:" + id, path: filepath.Join(dir, "conversations", id+".db"), main: true}
 		if stat(&f) {
-			f.agy, f.rev = &r, agyRev(r)
+			m := f.w()
+			m.agy, m.rev = &r, agyRev(r)
 			out = append(out, f)
 		}
 	}
@@ -276,11 +283,11 @@ const agyModel = "agy"
 // the file has only grown (agy appends a step at a time).
 func parseAgy(f file, old *state) *state {
 	if agyRowOnly(f.path) {
-		s := &state{Size: f.size, Mod: f.mod.UnixNano(), DBRevision: f.rev}
-		if f.agy != nil {
-			s.Named, s.Cwd = title(f.agy.Title), f.agy.Cwd
-			if !f.agy.Last.IsZero() {
-				s.saw(f.agy.Last, true)
+		s := &state{Size: f.size, Mod: f.mod.UnixNano(), DBRevision: f.m().rev}
+		if f.m().agy != nil {
+			s.Named, s.Cwd = title(f.m().agy.Title), f.m().agy.Cwd
+			if !f.m().agy.Last.IsZero() {
+				s.saw(f.m().agy.Last, true)
 			}
 		}
 		return s
@@ -306,10 +313,10 @@ func parseAgy(f file, old *state) *state {
 	if err == nil {
 		c.Tail = markTail(f.path, end, 0, end)
 	}
-	s.Size, s.Mod, s.DBRevision = f.size, f.mod.UnixNano(), f.rev
+	s.Size, s.Mod, s.DBRevision = f.size, f.mod.UnixNano(), f.m().rev
 	s.Named, s.Cwd = "", ""
-	if f.agy != nil {
-		s.Named, s.Cwd = title(f.agy.Title), f.agy.Cwd
+	if f.m().agy != nil {
+		s.Named, s.Cwd = title(f.m().agy.Title), f.m().agy.Cwd
 	}
 	s.Agy = &c
 	return s

@@ -94,14 +94,27 @@ func kimiModelTables(path string, legacy bool, wrote map[string]map[string]strin
 			}
 		}
 		var caps []string
-		if len(m.Efforts) > 0 {
+		if len(m.Efforts) > 0 || !legacy && m.AlwaysThinks {
 			caps = append(caps, strconv.Quote("thinking"))
+		}
+		// what Kimi Code's own provider says of a Kimi Code plan model
+		// from the same list (packages/oauth managed-kimi-code.ts,
+		// capabilitiesForModel): one that always thinks has no thinking
+		// switch, and one that loads tools mid-conversation does with
+		// Kimi Code's tool select on. video_in is left out: Kimi Code
+		// uploads a video to its provider's /files and sends the ms://
+		// id, which magpie's gateway has no route for (#4485)
+		if !legacy && m.AlwaysThinks {
+			caps = append(caps, strconv.Quote("always_thinking"))
 		}
 		if m.Images {
 			caps = append(caps, strconv.Quote("image_in"))
 		}
 		if !legacy {
 			caps = append(caps, strconv.Quote("tool_use"))
+		}
+		if !legacy && m.DynamicTools {
+			caps = append(caps, strconv.Quote("dynamically_loaded_tools"))
 		}
 		if len(caps) > 0 {
 			kvs = append(kvs, edit.KV{Path: "capabilities", Value: edit.Raw("[" + strings.Join(caps, ", ") + "]")})
@@ -123,7 +136,11 @@ func kimiModelTables(path string, legacy bool, wrote map[string]map[string]strin
 				}
 			}
 			// a default effort set by hand stays while the model has it
-			kvs = append(kvs, kimiEfforts(m.Efforts, was["default_effort"])...)
+			effs, def := kimiEfforts(m.Efforts, m.DefaultEffort, was["default_effort"], wrote[name])
+			kvs = append(kvs, effs...)
+			if def != "" {
+				setWrote(now, name, "default_effort", def)
+			}
 		}
 		out = append(out, edit.Table{Name: name, KVs: kvs})
 	}
@@ -167,12 +184,17 @@ func kimiWrote(path string) map[string]map[string]string {
 }
 
 // kimiEfforts are a thinking model's levels for the new Kimi Code's
-// thinking picker (#333): support_efforts, and default_effort high where
-// the model has it, as Kimi Code takes for its own models (else it starts
-// on the middle one). Without them it offers thinking on or off only and
-// asks for no level at all. none is left out: Kimi Code's own off turns
-// thinking off. kimi-cli has neither key.
-func kimiEfforts(efforts []string, was string) []edit.KV {
+// thinking picker (#333): support_efforts, and default_effort, as Kimi
+// Code takes for its own models (else it starts on the middle one): the
+// one the model's list says it thinks at (vendor, Kimi Code's
+// think_efforts default_effort, max on K2.8), else high where the model
+// has it. Without them it offers thinking on or off only and asks for no
+// level at all. none is left out: Kimi Code's own off turns thinking off.
+// kimi-cli has neither key. was is the table's default_effort now and
+// wrote what magpie wrote in the table last (kimiOwn): one set by hand
+// stays while the model has it. def is magpie's own default, "" when the
+// table keeps the user's.
+func kimiEfforts(efforts []string, vendor, was string, wrote map[string]string) (kvs []edit.KV, def string) {
 	var levels, quoted []string
 	for _, e := range efforts {
 		if e != "none" {
@@ -181,18 +203,32 @@ func kimiEfforts(efforts []string, was string) []edit.KV {
 		}
 	}
 	if len(levels) == 0 {
-		return nil
+		return nil, ""
 	}
-	kvs := []edit.KV{{Path: "support_efforts", Value: edit.Raw("[" + strings.Join(quoted, ", ") + "]")}}
-	def := ""
-	if slices.Contains(levels, "high") {
-		def = "high"
+	kvs = []edit.KV{{Path: "support_efforts", Value: edit.Raw("[" + strings.Join(quoted, ", ") + "]")}}
+	mine := ""
+	if slices.Contains(levels, vendor) {
+		mine = vendor
+	} else if slices.Contains(levels, "high") {
+		mine = "high"
 	}
-	// one set by hand (was) stays while the model has it
-	if def = keptEffort(was, levels, def); def != "" {
-		kvs = append(kvs, edit.KV{Path: "default_effort", Value: def})
+	// high in a table magpie kept no record of is the one it wrote before
+	// it kept one (it wrote high on every model that had it)
+	if _, ok := wrote["default_effort"]; !ok && was == "high" {
+		was = ""
 	}
-	return kvs
+	v, by := kimiOwn(map[string]string{"default_effort": was}, wrote, "default_effort", mine)
+	if !by && !slices.Contains(levels, v) {
+		v, by = mine, mine != ""
+	}
+	if v == "" {
+		return kvs, ""
+	}
+	kvs = append(kvs, edit.KV{Path: "default_effort", Value: v})
+	if by {
+		def = v
+	}
+	return kvs, def
 }
 
 func kimi(home string) *Agent { return kimiIn(here(home)) }
@@ -261,6 +297,7 @@ func kimiIn(at place) *Agent {
 		ID: "kimi", Name: "Kimi Code", Icon: "kimi", Aliases: []string{"kimi-code", "kimi-cli"}, Spelled: prefixed,
 		UA:  []string{"kimicli"},
 		Bin: "kimi", Dir: dir, Path: path,
+		ListOnly: true,
 		Sync: func() error {
 			t, err := edit.GetTOMLTable(path, providerTable)
 			if err != nil || t == nil {

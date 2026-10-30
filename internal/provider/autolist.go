@@ -18,8 +18,8 @@ package provider
 //
 // Both are the user's own settings, kept by every save that doesn't set
 // them (the window's editor among them), and only a provider of the user's
-// own has them: an account's list is fetched for it (FetchNew), and a
-// plugin's by the plugin (KeepPluginsListed).
+// own has them: an account's list is fetched for it (FetchNew, then
+// KeepAccountsListed), and a plugin's by the plugin (KeepPluginsListed).
 
 import (
 	"context"
@@ -237,7 +237,7 @@ func takeMatching(id string, isNew func(string) bool) ([]string, error) {
 	q := &f.Providers[i]
 	// new ones first, as the vendor's list and withNewlyListed have them
 	q.Models = append(slices.Clone(taken), served...)
-	q.NoModels = false
+	q.NoModels, q.BestInFamily = false, false
 	// picked from the list as it is now: one it lists later and no rule
 	// matches stays out, unless the picks hold every model
 	q.PickedFrom = nil

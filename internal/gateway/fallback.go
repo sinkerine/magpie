@@ -43,6 +43,10 @@ type candidate struct {
 	// effort is the reasoning the group's member it is of is fixed at
 	// ("provider/model:low"); "" for one that follows the agent or the group
 	effort string
+	// levels are the reasoning levels the member follows the agent among
+	// (Member.Levels, "provider/model:low+high"): what the agent asks is
+	// sent at the nearest of them. nil for one fixed or following the group.
+	levels []string
 	// fast is set on a member the group sends in its vendor's fast mode
 	// (Group.Fast); ultra on an agent's fast pick sent Ultrafast (#1954)
 	fast, ultra bool
@@ -79,6 +83,9 @@ type capHold struct {
 	used      float64
 	back      time.Time
 	noCredits bool
+	// unread: held by a careful provider as its usage can't be told, why
+	// (carefulDoubt), cap then the account's own
+	unread string
 }
 
 // label names a candidate in a call's record: the provider, and the key
@@ -109,7 +116,7 @@ func (c candidate) restKey() string {
 // seat is the candidate as one of a group's members has it: its key or
 // account, the model, and the effort the member is fixed at.
 func (c candidate) seat() string {
-	return provider.WithMemberEffort(c.rest+"/"+c.model, c.effort)
+	return provider.WithMemberEffort(c.rest+"/"+c.model, cmp.Or(c.effort, strings.Join(c.levels, "+")))
 }
 
 func (c candidate) isOpenRouterFree() bool {
@@ -145,6 +152,49 @@ func (c candidate) who() string {
 		return c.p.ID + "#" + provider.KeyID(c.p.Key)
 	}
 	return c.restKey()
+}
+
+// remoteUpstream is, for a remote magpie's model, the provider there that
+// serves it, its id's first part (anthropic of anthropic/claude-…), or a
+// group of the remote's, its whole id; "" for any other provider's model,
+// and for a remote's model named without one. The remote magpie is one
+// key here, but each of its providers is a vendor of its own, with its
+// own cache and its own seals (fremontdango on Discord: a group of one
+// model from two of the remote's providers kept a conversation on the
+// second when the first was resting, as one account, where the same
+// group on the remote moved it as gone).
+func remoteUpstream(p provider.Provider, model string) string {
+	if !p.IsRemoteMagpie() {
+		return ""
+	}
+	if strings.HasPrefix(model, provider.GroupPrefix) {
+		return model
+	}
+	up, _, _ := strings.Cut(model, "/")
+	if up == model {
+		return ""
+	}
+	return up
+}
+
+// vendor is who as the vendor a conversation is with knows it: the key or
+// account, and behind a remote magpie the provider there (remoteUpstream).
+// What a vendor keeps of a conversation — its cache, the reasoning and
+// compactions it sealed — goes by it; what the user limits on the key
+// here — its lanes, requests a minute — still goes by who.
+func (c candidate) vendor() string {
+	if up := remoteUpstream(c.p, c.model); up != "" {
+		return c.who() + ">" + up
+	}
+	return c.who()
+}
+
+// sameVendor says whether c is with the vendor that who, asked for model,
+// was: the same key or account, and behind a remote magpie the same
+// provider there. With no model known (an answer the usage log has) it
+// is the key or account alone.
+func (c candidate) sameVendor(who, model string) bool {
+	return c.who() == who && (model == "" || remoteUpstream(c.p, c.model) == remoteUpstream(c.p, model))
 }
 
 // perKey is a provider once per key it has on, in order — or, for a
@@ -239,7 +289,12 @@ func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (ou
 	}
 	keys := p.KeysOn()
 	serves := p.Serving(model) // the lists read once, not once a key (@NetRozee on X)
-	var unlisted []candidate
+	// a key on a plan of its own whose models leave this one out
+	// (KeyAccount.Plan): the Agent Plan's key is never sent the pay as
+	// you go's deepseek-v4-1-flash-261017, while a key whose plan has it
+	// can take it (yckonnnn on X)
+	planHas := p.PlanServing(model)
+	var unlisted, planless []candidate
 	var noURL provider.Protocol
 	for i, k := range keys {
 		q := p.WithKey(k)
@@ -257,6 +312,10 @@ func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (ou
 			barred = append(barred, candidate{p: q, model: model, rest: rest, rank: i})
 			continue
 		}
+		if !planHas(k) {
+			planless = append(planless, candidate{p: q, model: model, rest: rest, rank: i})
+			continue
+		}
 		if !serves(k) {
 			// the vendor lists the model to another key only
 			unlisted = append(unlisted, candidate{p: q, model: model, rest: rest, rank: i})
@@ -266,6 +325,13 @@ func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (ou
 	}
 	if len(out) == 0 {
 		out, unlisted = unlisted, nil // no key lists it: try them all the same
+	}
+	if len(out) == 0 {
+		// no key's plan has it as magpie knows the plans: a model the
+		// vendor added since, tried on them all the same. Else a key
+		// whose plan lacks it is never asked, not even after the others
+		// refused it: its endpoint has no such model either
+		out = planless
 	}
 	if len(out) == 0 && len(barred) > 0 {
 		return nil, nil, nil, barred
@@ -339,6 +405,13 @@ func (s *Server) candidates(p provider.Provider, model string, from provider.Pro
 // plan is candidates, and for the routing trace what each stood where it
 // did by, and those left out.
 func (s *Server) plan(p provider.Provider, model string, from provider.Protocol) ([]candidate, planned) {
+	return s.planPaused(p, model, from, nil)
+}
+
+// planPaused is plan, a routing group among the fallbacks (01huadalang on
+// Discord) less the models paused leaves out of it: its pause rules, as
+// a request to the group would have them; nil pauses none.
+func (s *Server) planPaused(p provider.Provider, model string, from provider.Protocol, paused func(provider.Group, []provider.Member) []provider.Member) ([]candidate, planned) {
 	var pl planned
 	add := func(q provider.Provider, m string, fallback bool) []candidate {
 		cs, aside, left, barred := perKeyBarred(q, m, from)
@@ -363,9 +436,33 @@ func (s *Server) plan(p provider.Provider, model string, from provider.Protocol)
 		return cs
 	}
 	out := add(p, model, false)
+	if p.CapStop && len(out) == 0 && len(pl.capped)+len(pl.held) > 0 {
+		// every account held at its cap: the user set the provider to end
+		// there (plugins#349), answered 429 rather than sent on
+		return restLast(out, pl)
+	}
 	seen := map[string]bool{p.ID + "/" + model: true}
 	for _, id := range p.Fallback {
-		fp, fm, ok := provider.Resolve(id)
+		if g, ms, ok := provider.FallbackGroup(id); ok {
+			// a routing group: its members as a request to it has them,
+			// in its order, routing and sink, less any model tried
+			// already (this provider's own, another fallback's); a
+			// member's fallbacks are not followed, so nothing leads back
+			if paused != nil {
+				ms = paused(g, ms)
+			}
+			ms = slices.DeleteFunc(ms, func(m provider.Member) bool {
+				k := m.Provider.ID + "/" + m.Model
+				if seen[k] {
+					return true
+				}
+				seen[k] = true
+				return false
+			})
+			out = append(out, planFallbackGroup(g, ms, from, &pl)...)
+			continue
+		}
+		fp, fm, ok := provider.ResolveRoute(id)
 		if !ok || seen[fp.ID+"/"+fm] {
 			continue
 		}
@@ -373,6 +470,36 @@ func (s *Server) plan(p provider.Provider, model string, from provider.Protocol)
 		out = append(out, add(fp, fm, true)...)
 	}
 	return restLast(out, pl)
+}
+
+// planFallbackGroup is planGroup for a routing group a provider falls back
+// to, its rows added to pl as fallbacks reached through g: the group's
+// keys and accounts in its own order, sunk by its own Sink, those set
+// aside after them.
+func planFallbackGroup(g provider.Group, ms []provider.Member, from provider.Protocol, pl *planned) []candidate {
+	if len(ms) == 0 {
+		return nil
+	}
+	at, leftAt, unlistedAt := len(pl.order), len(pl.left), len(pl.unlistedW)
+	var asides []candidate
+	var wAsides []Weighed
+	out := planLevel(g, ms, 0, from, pl, &asides, &wAsides)
+	if sinks(g.Sink, g.Routing) {
+		var order []Weighed
+		out, order = sinkPlanned(out, pl.order[at:])
+		pl.order = append(pl.order[:at], order...)
+	}
+	out, pl.order = append(out, asides...), append(pl.order, wAsides...)
+	via := func(ws []Weighed) {
+		for i := range ws {
+			ws[i].Fallback = true
+			ws[i].Via = append([]string{g.ID}, ws[i].Via...)
+		}
+	}
+	via(pl.order[at:])
+	via(pl.left[leftAt:])
+	via(pl.unlistedW[unlistedAt:])
+	return out
 }
 
 // planGroup is plan for a routing group: every member's keys or accounts
@@ -435,7 +562,7 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 		// the same model at another effort is another member's
 		for _, l := range [][]candidate{cs, aside, left, barred} {
 			for i := range l {
-				l[i].effort, l[i].fast = m.Effort, m.Fast
+				l[i].effort, l[i].levels, l[i].fast = m.Effort, m.Levels, m.Fast
 				l[i].firstToken = innerFirstToken(m)
 				l[i].patience = innerPatience(m)
 			}
@@ -645,7 +772,7 @@ func capHeld(p, acct provider.Provider, model string, now time.Time) *capHold {
 	}
 	a := acct.Account
 	caps := provider.HoldCaps(p, a.Agent, a.User)
-	if a.Agent == "codex" && freeOnChatGPT(model) {
+	if a.Agent == "codex" && freeOnChatGPT(model, a.Plan) {
 		// a call ChatGPT counts in no window spends nothing a usage cap
 		// keeps (#1593); credits set not to be spent still hold it at
 		// 100%, as nothing says the backend answers it there
@@ -654,8 +781,16 @@ func capHeld(p, acct provider.Provider, model string, now time.Time) *capHold {
 	if !caps.Holds() {
 		return nil
 	}
-	h := allowances(a.UsageAgent())[a.User].CapHeld(model, caps, now)
+	al, known := allowances(a.UsageAgent())[a.User]
+	h := al.CapHeld(model, caps, now)
 	if h == nil {
+		if p.CapCareful {
+			// what can't be told is not spent (plugins#349)
+			if why := carefulDoubt(a, al, known, model, caps, now); why != "" {
+				used, _ := al.For(model, now)
+				return &capHold{cap: capShare(caps), used: used, unread: why}
+			}
+		}
 		return nil
 	}
 	return &capHold{cap: h.Cap, used: h.Used, back: h.Back, noCredits: h.Credits}
@@ -667,6 +802,9 @@ func capHeld(p, acct provider.Provider, model string, now time.Time) *capHold {
 func cappedError(model string, ws []Weighed, now time.Time) (string, time.Time) {
 	held, soonest := heldReasons(ws, now)
 	capped, noCredits := heldBy(ws)
+	if unread(ws) {
+		return fmt.Sprintf("usage cap reached: every account that serves %q is held at the usage cap set on it in magpie, or held as its usage can't be told right now — %s. magpie reads it again at the next request and uses it once it is under its cap; %s, or turn off Check usage near the cap (Providers → the provider's accounts, or magpie provider pool <id> --careful off)", model, strings.Join(held, "; "), heldAdvice(capped, noCredits)), soonest
+	}
 	switch {
 	case !noCredits:
 		return fmt.Sprintf("usage cap reached: every account that serves %q is held at the usage cap set on it in magpie — %s. magpie uses it again once that window renews; %s", model, strings.Join(held, "; "), heldAdvice(capped, noCredits)), soonest
@@ -698,6 +836,9 @@ func heldReasons(ws []Weighed, now time.Time) ([]string, time.Time) {
 		s := fmt.Sprintf("%s (%s) is at %.0f%% of a usage window, past its %d%% cap", w.Name, w.Who, w.Used, w.Capped)
 		if w.NoCredits {
 			s = fmt.Sprintf("%s (%s) has used up a usage window and is set not to spend its credits", w.Name, w.Who)
+		}
+		if w.Unread != "" {
+			s = fmt.Sprintf("%s (%s) is held, as %s and its provider is set to check usage near the cap", w.Name, w.Who, w.Unread)
 		}
 		if w.CapBack != nil {
 			s += ", until " + heldClock(*w.CapBack, now)
@@ -747,6 +888,9 @@ func checkpointCappedRecord(ws []Weighed) string {
 // cappedRecord is the call's record of the same refusal as cappedError,
 // told apart the same way.
 func cappedRecord(ws []Weighed) string {
+	if unread(ws) {
+		return "every account at its usage cap or its usage unread"
+	}
 	switch capped, noCredits := heldBy(ws); {
 	case !noCredits:
 		return "every account at its usage cap"
@@ -754,6 +898,17 @@ func cappedRecord(ws []Weighed) string {
 		return "every account held: set not to spend its credits"
 	}
 	return "every account held: at its usage cap or set not to spend its credits"
+}
+
+// unread says whether one of ws is held as its usage can't be told
+// (carefulDoubt).
+func unread(ws []Weighed) bool {
+	for _, w := range ws {
+		if w.Capped > 0 && w.Unread != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // creditsHeld are those of cs held only as they won't spend their
@@ -791,7 +946,7 @@ func barredOf(cs []candidate, q provider.Provider, fallback bool, from provider.
 		w := weighed(c, q, weighing{}, fallback, from)
 		w.Unlisted, w.Via = true, via
 		if h := c.capped; h != nil {
-			w.Capped, w.Used, w.NoCredits = h.cap, h.used, h.noCredits
+			w.Capped, w.Used, w.NoCredits, w.Unread = h.cap, h.used, h.noCredits, h.unread
 			if !h.back.IsZero() {
 				w.CapBack = &h.back
 			}
@@ -921,14 +1076,18 @@ func restingOf(c candidate) (Rest, bool) {
 // exhausted" for the moment it switched upstreams, and every request,
 // the agent's retry first, was answered from its 15-minute rest. A
 // subscription account isn't held so: its resets may be spent for it
-// (autoReset), and its windows are read again as it is planned.
+// (autoReset), and its windows are read again as it is planned. Nor is a
+// model of another computer's magpie (Rest.there): that magpie holds its
+// own rests, and the user may have changed what it serves since
+// (zaidu259434 on X: a group there moved off a spent vendor, and its
+// refusal was still given here until the time it named).
 func quotaHeld(cs []candidate) (Rest, time.Time, bool) {
 	var first Rest
 	var back time.Time
 	now := time.Now()
 	for i, c := range cs {
 		r, ok := restingOf(c)
-		if !ok || c.p.Account != nil || r.Why != failQuota && r.Why != failCredit || !quotaStatus(r.Status) || r.said == "" {
+		if !ok || c.p.Account != nil || r.there || r.Why != failQuota && r.Why != failCredit || !quotaStatus(r.Status) || r.said == "" {
 			return Rest{}, time.Time{}, false
 		}
 		at := r.asksAt(now)
@@ -1077,7 +1236,7 @@ func restOf(id string) (Rest, bool) {
 
 // quotaWords are how vendors say "out of quota" or "slow down" when their
 // status code doesn't: some answer 400 or 403 with it.
-var quotaWords = regexp.MustCompile(`(?i)quota|insufficient|balance|credit|billing|out of budget|budget (exceeded|exhausted)|exceeded|rate.?limit|usage.?limit|limit.?reached|hit your .*limit|limit.{0,24}resets|too many requests|overloaded|余额|额度|欠费|限流|频率|套餐|用量|上限`)
+var quotaWords = regexp.MustCompile(`(?i)quota|insufficient|balance|credit|billing|out of budget|budget (exceeded|exhausted)|exceeded|rate.?limit|usage.?limit|limit.?reached|hit your .*limit|limit.{0,24}resets|too many requests|overloaded|余额|额度|欠费|限流|频率|频繁|速率|套餐|用量|上限`)
 
 // quotaSaid is whether an error's words, with no status to go by, say
 // out of quota or slow down: quotaWords, unless they say the conversation
@@ -1089,7 +1248,9 @@ func quotaSaid(msg string) bool {
 
 // unservedWords are how a vendor says the model isn't one it serves this
 // key, or this way — words another provider, or key, may not answer with.
-var unservedWords = regexp.MustCompile(`(?i)model.{0,80}(not (supported|accessible|available|found|enabled|allowed)|unsupported|does ?n[o']t exist|unknown|invalid)|(no such|unknown|invalid|unsupported) model|model_not_found|模型.{0,12}(不存在|不支持|无权|未开通)`)
+// provider.ModelUnserved owns them: a plugin's 401 that says them doesn't
+// mark the account's sign-in either.
+var unservedWords = provider.ModelUnserved
 
 // modelRefused says the vendor turned the request away over its model
 // alone — not one this key's plan, or this key, may use: SenseNova's 403
@@ -1224,11 +1385,13 @@ var unsaidWords = regexp.MustCompile(`(?i)(^|"|\\"|: )invalid request error trac
 // member has tried every API it has a URL for (forwardTranslated), and
 // another member, on another API or another vendor, may serve it (#2670:
 // a relay with a Chat URL alone, refusing tools with reasoning there).
+// One that also says the account is out of quota or credit (quotaWords,
+// creditWords: "请充值") is that, and rests it (#4095).
 func shapeRefused(status int, body []byte) bool {
 	// the words are matched decoded, too (#1669)
 	body = wordsOf(body)
 	return (status == 400 || status == 422) && (shapeWords.Match(body) || unsaidWords.Match(body) || customToolRefusal.Match(body) || wrongEndpoint(status, body)) &&
-		!quotaWords.Match(body) && !unservedWords.Match(body) && !refusedWords.Match(body)
+		!quotaWords.Match(body) && !creditWords.Match(body) && !unservedWords.Match(body) && !refusedWords.Match(body)
 }
 
 // regionWords are how a vendor says it doesn't serve where the request
@@ -1322,6 +1485,7 @@ func elsewhere(left []candidate, c candidate) []candidate {
 // that failed this way: the vendor was busy, out of quota or failing, or
 // this key or provider can't serve it — not the request itself at fault.
 func retryable(status int, body []byte) bool {
+	raw := body
 	// the words are matched decoded, too (#1669)
 	body = wordsOf(body)
 	switch {
@@ -1337,6 +1501,14 @@ func retryable(status int, body []byte) bool {
 	case status >= 400 && provider.EdgeBlocked(body):
 		// the vendor's firewall blocked this address (Alibaba Cloud's 405
 		// in front of zcode.z.ai): another provider goes another way
+		return true
+	case status >= 400 && status < 500 && failure(status, raw) == failCredit:
+		// out of credit, as failure reads it, whatever the status: another
+		// account may have a balance. SuperMagic's 400 "您的可用积分已不足…
+		// 通过「充值」通道补充积分" read as credit, but no word of
+		// quotaWords' is in it, so a group never asked the account with
+		// 6,467 points and the empty one was never rested (#4095,
+		// mycf_711)
 		return true
 	case status == 400, status == 422:
 		return quotaWords.Match(body) || unservedWords.Match(body) || refusedWords.Match(body) || shapeWords.Match(body) || unsaidWords.Match(body) || regionWords.Match(body) || wrongEndpoint(status, body)
@@ -1412,7 +1584,9 @@ func windowIn(served func() []provider.Entry, p provider.Provider, model string)
 	if n := p.Contexts[model]; n > 0 {
 		return n
 	}
-	for _, e := range served() {
+	cat := served()
+	for i := range cat {
+		e := &cat[i]
 		if e.Group == "" && e.Provider.ID == p.ID && (e.Model == model || e.ID == model) && e.Context > 0 {
 			return e.Context
 		}
@@ -1428,10 +1602,12 @@ const (
 	// clear than a busy moment: pauses of 1, 2 and 4s, or what Retry-After
 	// says, under half a minute in all
 	rateRetries = 3
-	// longestPause is the longest the vendor's Retry-After is waited for
-	// before that; longer, and the agent gets the error.
-	longestPause = 8 * time.Second
 )
+
+// longestPause is the longest the vendor's Retry-After is waited for by
+// the same-one retries; longer, and a plain provider or a group waits it
+// out within its patience (replan), else the agent gets the error.
+var longestPause = 8 * time.Second
 
 // retryPause is the first pause before the last one left is tried again;
 // each pause after is twice the one before.
@@ -1456,10 +1632,38 @@ func passing(status int, header http.Header, body []byte, again int) (time.Durat
 		return wait, again < lastRetries
 	case status == 429:
 		// a relay's 429 often says nothing of when (#503: "负载已饱和，请稍
-		// 后再试"); a plan used up or no money left won't clear in seconds
-		return wait, again < rateRetries && failure(status, body) == failRate && !creditWords.Match(wordsOf(body))
+		// 后再试"); a plan used up or no money left won't clear in seconds,
+		// nor an account's token wall (walled)
+		return wait, again < rateRetries && failure(status, body) == failRate && !creditWords.Match(wordsOf(body)) && !walled(body)
 	}
 	return 0, false
+}
+
+// wallCodes are the error codes a vendor gives a 429 for an account's
+// own token throughput used up, a bucket that refills slowly over minutes
+// (plugins#512, cycocyco): SenseTime Raccoon's user_model_rate_limited,
+// "您的模型请求频率超限，请稍后重试", with no Retry-After. It reads as a
+// rate limit and rests as one, a minute and longer each time it comes
+// back (rateRest), but no moment clears it: the same-one retries and a
+// patience's rounds sent the whole request again eight times in 38s, each
+// one drawing on the bucket it waited for. The next account is asked, or
+// the agent has the error at once.
+var wallCodes = map[string]bool{"user_model_rate_limited": true}
+
+// walled says whether body is a refusal whose error.code is one of
+// wallCodes: the code where the vendor puts it, not the words anywhere in
+// the body (a prompt or a message quoting it).
+func walled(body []byte) bool {
+	var e struct {
+		Error struct {
+			Code json.RawMessage `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &e) != nil {
+		return false
+	}
+	var code string
+	return json.Unmarshal(e.Error.Code, &code) == nil && wallCodes[code]
 }
 
 // withRoom is, of the candidates left, those another member than c's may
@@ -1503,7 +1707,9 @@ func holds(c candidate, tokens int) bool {
 // to compact.
 //
 // Those left out are handed back (small, their rows in smallW when the
-// order has one each), kept for the last resort: when every candidate
+// order has one each, with Window set to the window: the trace lists
+// them as left out, so the Routing page keeps their rows and says why,
+// #3749), kept for the last resort: when every candidate
 // with room is out of its allowance, a fallback too small is asked all
 // the same (Kai on Discord: both Claude accounts at their limit until
 // the next day, the Claude provider's Fallback a Codex model of 272K
@@ -1543,7 +1749,9 @@ func roomy(cs []candidate, pl planned, from provider.Protocol, body []byte) (out
 		if w := windows[key(c)]; w > 0 && tokens >= w {
 			small = append(small, c)
 			if parallel {
-				smallW = append(smallW, pl.order[i])
+				x := pl.order[i]
+				x.Window = w
+				smallW = append(smallW, x)
 			}
 			continue
 		}
@@ -1638,6 +1846,8 @@ type holdWriter struct {
 	// answers with a 429 whatever quota it has left — Claude Code's, its
 	// Agent SDK's — so the account isn't at fault and doesn't rest (#666)
 	turnedAway bool
+	// turnedAwayHint says why, for that system prompt (antigravityHint)
+	turnedAwayHint string
 
 	// refused: the vendor's safety filter ended the reply before any of it
 	// was said — Anthropic's stop_reason "refusal", OpenAI's content_filter
@@ -1740,6 +1950,10 @@ type holdWriter struct {
 	// before it was complete" and its 429 halfway went to the summary
 	// as the only answer, the next account never asked
 	wantWhole bool
+
+	// upstreamKeys are the headers of the vendor's reply heardUpstream put
+	// in header (#4145)
+	upstreamKeys []string
 }
 
 // onLoop sets what is told of a loop before it ends the reply (reask),
@@ -1817,7 +2031,7 @@ func (h *holdWriter) pass() {
 	}
 	dst := h.w.Header()
 	for k, v := range h.header {
-		if k != resetsHeader && k != refusedHeader && k != zdrHeader { // magpie's own notes, for restAfter and settle
+		if k != resetsHeader && k != refusedHeader && k != zdrHeader && k != answeredThereHeader && k != keyLimitThereHeader { // magpie's own notes, for restAfter and settle
 			dst[k] = v
 		}
 	}
@@ -1910,7 +2124,9 @@ func (h *holdWriter) cutLoop(b []byte, t loopTrip) (int, error) {
 	} else {
 		io.WriteString(h.w, "\n\n")
 	}
-	streamError(h.w, proto, http.StatusBadGateway, msg)
+	// no model: the reply went ahead under its own id and model, and an
+	// error that starts a message of its own after it is #3792
+	streamError(h.w, proto, "", http.StatusBadGateway, msg)
 	h.looped, h.ended = msg, true
 	h.flush()
 	if h.stop != nil {
@@ -2151,17 +2367,31 @@ func (h *holdWriter) scan() {
 	}
 }
 
-// keepHeldAfter is how long a stream held for its reasoning waits before
-// its agent is first kept alive, as long as a stream with nothing in it
-// is held where its agent can't be (holdLongest); a refusal after it still
-// goes to another account,
-// whose stream follows the comments in the same response.
-var keepHeldAfter = holdLongest
+// keepHeldAfter is how long a held stream waits before its agent is first
+// kept alive (keepAlive): the stream's 200, then a comment every
+// keepHeldEvery. A refusal after it still goes to another account, whose
+// stream follows the comments in the same response. It was holdLongest,
+// 15s, and a proxy between the agent and magpie that hangs up on a
+// request with nothing back for about 10s ended every turn whose vendor
+// took longer to its first event: Codex on Windows sends its requests for
+// 127.0.0.1 through the system proxy a Clash-style app sets, "127.*" in
+// its bypass list notwithstanding (codexProxyFor), and they ended 499
+// (mrten_95615 on Discord). A failure before it is still a status, its
+// Retry-After with it.
+var keepHeldAfter = 3 * time.Second
+
+// keepHeldEvery is the longest a held stream's agent goes without a
+// comment once it has its 200, under keepaliveEvery: the same proxy waits
+// for bytes, not for events.
+var keepHeldEvery = 5 * time.Second
 
 // keptAlive is what a request's held streams have sent its agent ahead of
 // a reply: the stream's headers and SSE comments, nothing of the reply.
 type keptAlive struct {
 	proto provider.Protocol
+	// model is the one the agent asked for, which an error sent in the
+	// stream names (streamError, #3728)
+	model string
 	sent  bool      // the stream's 200 and headers went out
 	at    time.Time // the last comment
 	// told is when the agent was last sent anything of a reply, else when
@@ -2191,7 +2421,7 @@ func (a *keptAlive) tooQuiet(d time.Duration) bool {
 }
 
 // keepAlive tells the agent of a stream held past keepHeldAfter for its
-// reasoning that it goes on, every keepaliveEvery: held for up to
+// reasoning that it goes on, every keepHeldEvery: held for up to
 // holdThinking (4 minutes), the agent heard nothing at all, and Alma's
 // idle timeout for a reasoning model, 240s, ended the turn first (#751). A
 // comment is no event in any protocol, so another account may still answer
@@ -2200,7 +2430,7 @@ func (h *holdWriter) keepAlive() {
 	a := h.alive
 	// a Gemini stream has none, as geminiEncoder.keepalive: agy fails on
 	// the comment ("invalid stream chunk: : keepalive", #934)
-	if a == nil || a.proto == provider.Gemini || time.Since(a.at) < keepaliveEvery {
+	if a == nil || a.proto == provider.Gemini || time.Since(a.at) < min(keepaliveEvery, keepHeldEvery) {
 		return
 	}
 	if !a.sent {
@@ -2222,7 +2452,7 @@ func (h *holdWriter) keepAlive() {
 		}
 		dst := h.w.Header()
 		for k, v := range src {
-			if k != resetsHeader && k != refusedHeader && k != zdrHeader && k != "Content-Length" {
+			if k != resetsHeader && k != refusedHeader && k != zdrHeader && k != answeredThereHeader && k != keyLimitThereHeader && k != "Content-Length" {
 				dst[k] = slices.Clone(v)
 			}
 		}
@@ -2374,6 +2604,15 @@ func (h *holdWriter) settle() {
 		h.failure, h.failMsg, h.refused = refusedStatus, msg, true
 		return
 	}
+	if h.status < 400 {
+		// a 200 that is only an error fails as that error's own status
+		// would (errorReply): asked again, or of the next, not handed on
+		// as an answer
+		if status, msg, ok := errorReply(h.held.Bytes()); ok {
+			h.failure, h.failMsg = status, msg
+			return
+		}
+	}
 	if h.alive != nil && h.alive.sent && h.status < 400 && wholeEvents(h.alive.proto, h.held.Bytes()) == nil {
 		// a 200 that is no reply of the protocol's, once the agent has a
 		// stream's headers: it can't go as that stream, so it failed, as
@@ -2439,10 +2678,10 @@ func (h *holdWriter) release() {
 		case h.failure != 0:
 			// a 200 that is no reply of the protocol's (settle)
 			who := cmp.Or(h.header.Get(providerHeader), "the provider")
-			streamError(h.w, h.alive.proto, h.failure, who+" "+h.failMsg)
+			streamError(h.w, h.alive.proto, h.alive.model, h.failure, who+" "+h.failMsg)
 		case h.status >= 400:
 			// an error status, once the agent has a stream: told as its error
-			streamError(h.w, h.alive.proto, h.status, provider.APIError(h.held.Bytes(), http.StatusText(h.status)))
+			streamError(h.w, h.alive.proto, h.alive.model, h.status, provider.APIError(h.held.Bytes(), http.StatusText(h.status)))
 		default:
 			// a reply given whole by a vendor that ignored stream:true,
 			// after the agent was kept alive: sent as the stream it asked
@@ -2463,7 +2702,7 @@ var watchEvery = time.Second
 // slot of its key's or account's (MaxConcurrency) or for room in its
 // minute (MaxRPM), before anything is sent to the vendor: past
 // keepHeldAfter it is sent the stream's 200 and SSE comments
-// (keepAlive), every keepaliveEvery for as long as the wait lasts, as a
+// (keepAlive), every keepHeldEvery for as long as the wait lasts, as a
 // try's held stream is. A wait of up to 2 minutes for the minute, or
 // QueueWait's for a slot, sent the agent nothing at all, which an agent's
 // or a proxy's timeout for its headers ended first (coeo91 on Discord:
@@ -2700,18 +2939,30 @@ const refusedStatus = http.StatusBadRequest
 
 // filterReasons are how a vendor says its safety filter stopped the reply:
 // Anthropic's stop_reason, OpenAI's finish_reason and incomplete reason,
-// an OpenAI or Azure error's code, and Gemini's finishReason and
-// blockReason.
+// an OpenAI or Azure error's code, Factory's error code, and Gemini's
+// finishReason and blockReason.
 var filterReasons = map[string]string{
 	"refusal":                  "refusal",
 	"content_filter":           "content_filter",
 	"content_policy_violation": "content_filter",
-	"SAFETY":                   "safety",
-	"PROHIBITED_CONTENT":       "safety",
-	"BLOCKLIST":                "safety",
-	"SPII":                     "safety",
-	"IMAGE_SAFETY":             "safety",
+	// Factory's usage policy check, a 403 whose code droid 0.245.0 tells
+	// apart from an account's 403 the same way (the Factory plugin keeps
+	// the code on the error it hands magpie): handed on as its 403, the
+	// agent took it for a failed sign-in (sweanng on Discord, ZCode:
+	// "Provider authentication failed", reason=auth_failed status=403)
+	"content_policy_rejected": "content_policy_rejected",
+	"SAFETY":                  "safety",
+	"PROHIBITED_CONTENT":      "safety",
+	"BLOCKLIST":               "safety",
+	"SPII":                    "safety",
+	"IMAGE_SAFETY":            "safety",
 }
+
+// finishFailed is what a 200 stream the vendor ends with finish_reason
+// "error" (#2471) says of itself, in the failure the hold keeps: the turn
+// failed, as the word says, and the group's next member answers it, while
+// taken for content it reached the agent and the try stood as a success.
+const finishFailed = `the reply ended with finish_reason "error"`
 
 // refusedNote is what a refusal is noted as: the vendor's own reason.
 func refusedNote(reason string) string {
@@ -3009,6 +3260,14 @@ func streamEvent(ev []byte) (kind, status int, msg string) {
 				if r, ok := filterReasons[*c.FinishReason]; ok {
 					return refusal(r)
 				}
+				if *c.FinishReason == "error" {
+					// WorkBuddy's and a DeepSeek harness's word for a turn
+					// it failed, not finished (#2471): the failure an error
+					// event is, held for the group's next candidate, where
+					// taken for content it went to the agent and the try
+					// stood as a success
+					return eventError, streamStatus(finishFailed), finishFailed
+				}
 				return eventContent, 0, ""
 			}
 		}
@@ -3138,8 +3397,11 @@ func policyRefusal(raw []byte) (string, bool) {
 	}
 	note := func(reason string) (string, bool) {
 		if msg = strings.TrimSpace(msg); msg != "" {
-			if len(msg) > 300 {
-				msg = msg[:300] + "…"
+			// long enough for the vendor's own advice after its words:
+			// Factory's "start a new session…" and OpenAI's Daybreak
+			// link were cut off at 300
+			if len(msg) > 1000 {
+				msg = msg[:1000] + "…"
 			}
 			return refusedNote(reason) + " — " + msg, true
 		}
@@ -3282,6 +3544,48 @@ func refusedReply(b []byte) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// errorReply says whether a reply that came whole under a success status
+// is only an error: OpenAI's or Gemini's {"error":{…}}, Anthropic's
+// {"type":"error","error":{…}}, a Responses object whose error is set —
+// with no reply beside it. msg is what it says (provider.APIError), and
+// status what it stands for (streamStatus), as the same error said in a
+// stream is read: a relay that answers OpenAI's TPM limit as a 200 fails
+// as its 429 would, asked again in a moment, not as a reply that went
+// through (monater on Discord).
+func errorReply(body []byte) (status int, msg string, ok bool) {
+	b := bytes.TrimSpace(body)
+	if len(b) == 0 || b[0] != '{' {
+		return 0, "", false
+	}
+	var v struct {
+		Error      json.RawMessage `json:"error"`
+		Choices    []any           `json:"choices"`
+		Content    []any           `json:"content"`
+		Candidates []any           `json:"candidates"`
+		Output     []any           `json:"output"`
+		Status     string          `json:"status"`
+	}
+	if json.Unmarshal(b, &v) != nil || !carries(v.Error) || len(v.Choices)+len(v.Content)+len(v.Candidates) > 0 ||
+		len(v.Output) > 0 && v.Status != "failed" {
+		return 0, "", false
+	}
+	var e struct {
+		Message any `json:"message"`
+		Type    any `json:"type"`
+		Code    any `json:"code"`
+		Status  any `json:"status"`
+	}
+	var said string
+	if json.Unmarshal(v.Error, &said) == nil {
+		if strings.TrimSpace(said) == "" {
+			return 0, "", false
+		}
+	} else if json.Unmarshal(v.Error, &e) != nil || e.Message == nil && e.Type == nil && e.Code == nil && e.Status == nil {
+		return 0, "", false
+	}
+	return streamStatus(string(wordsOf(b))), provider.APIError(b, "the upstream reported an error"), true
 }
 
 // streamStatus is the status an error in a stream stands for, as a vendor

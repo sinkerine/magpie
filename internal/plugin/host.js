@@ -256,9 +256,39 @@ function proxied(env) {
   }
   return env
 }
+// And a program started with no folder of its own runs in workDir, not
+// the host's: the host runs in magpie's config folder, beside
+// settings.json and providers.json, so whatever a program saved by a
+// relative name went there, and a tool told to write "providers.json"
+// would write over magpie's. The chat page plugin (magpie-chat) starts
+// the user's MCP servers this way and runs their tools for a model,
+// whose fetched pages and saved files (jiakun_zhao on 𝕏 asked whose
+// page_<hash>.html and magpie_*.md files they had found) belong in a
+// folder of their own. A folder the plugin gives is kept.
+const workDir = path.join(process.cwd(), "plugin-work")
+let workReady = false
+function workCwd() {
+  if (!workReady) {
+    try {
+      fs.mkdirSync(workDir, { recursive: true })
+      workReady = true
+    } catch {
+      return undefined
+    }
+  }
+  return workDir
+}
 const guard = (o) => {
   if (o != null && typeof o !== "object") return o
   o = { ...o }
+  if (o.cwd == null || o.cwd === "") {
+    const d = workCwd()
+    if (d) {
+      o.cwd = d
+      // and PWD with it, which a shell script reads for its folder
+      if (process.platform !== "win32") o.env = { ...(o.env ?? process.env), PWD: d }
+    }
+  }
   o.env = proxied(o.env)
   if (Array.isArray(o.stdio)) {
     o.stdio = [...o.stdio]
@@ -312,6 +342,28 @@ const inflight = new Map() // fetch id → its lifecycle and owned resources
 const renewing = new Map() // account → its sign-in's renewal under way
 const unrenewed = new Map() // account → its last renewal that failed: {at, secret, gone}
 let config = { provider: {} } // what the plugins' config hooks made of it
+
+// loadWait bounds one plugin's load (its import and its plugin function)
+// and one config hook; listWait bounds one provider's models hook in a
+// listing. A plugin stuck on its vendor (a sign-in answered 401 and tried
+// again, a vendor that never answers) is then given up on alone: the
+// plugins load side by side and every other one is listed meanwhile,
+// rather than all waiting behind it until magpie's own deadline fails the
+// whole host or the whole list. magpie sets both at init.
+let loadWait = 20 * 1000
+let listWait = 20 * 1000
+
+// late is what a step that took longer than ms gives instead of its own
+// result: an error saying so. The step goes on by itself; what it gives
+// later is dropped.
+class Late extends Error {}
+function inTime(step, ms, what) {
+  let timer
+  const late = new Promise((_, no) => {
+    timer = setTimeout(() => no(Object.assign(new Late(`${what} didn't finish in ${Math.round(ms / 1000)}s`), { plain: true })), ms)
+  })
+  return Promise.race([Promise.resolve().then(step), late]).finally(() => clearTimeout(timer))
+}
 
 // ---- a provider's own proxy ---------------------------------------------------
 
@@ -529,10 +581,11 @@ function asked(input, init) {
 }
 
 // MAGPIE_ONLY are the headers magpie tells a plugin's fetch where the agent
-// that asked works with (WorkDirHeader and WorkGitHeader in
-// internal/provider): for the plugin to read, never for its vendor, so a
-// plugin that sends on the headers it was given sends them nowhere.
-const MAGPIE_ONLY = ["x-magpie-work-dir", "x-magpie-work-git"]
+// that asked works (WorkDirHeader and WorkGitHeader in internal/provider)
+// and that a queue needn't be waited out (FallbackHeader): for the plugin
+// to read, never for its vendor, so a plugin that sends on the headers it
+// was given sends them nowhere.
+const MAGPIE_ONLY = ["x-magpie-work-dir", "x-magpie-work-git", "x-magpie-fallback"]
 
 function unsaid(input, init) {
   if (input instanceof Request && MAGPIE_ONLY.some((k) => input.headers.has(k))) {
@@ -1015,10 +1068,23 @@ function uidOf(a) {
   return typeof a?.uid === "string" ? a.uid : ""
 }
 
+// renamedBy tells a sign-in to an account a plugin once named another way:
+// the same uid, and one of the two named by that uid, so the uid is the
+// account's own id (#4473: officeace-auth 0.1.14 named an account by its
+// masked phone, uid its Huawei domain id; the CodeArts plugin names it by
+// the domain id). A uid alone is not enough: Kiro keeps how an account was
+// signed in to as its uid, "google" for every Google sign-in.
+function renamedBy(now, was) {
+  const uid = uidOf(now)
+  return !!uid && uidOf(was) === uid && whoOf(now) !== whoOf(was) && (whoOf(now) === uid || whoOf(was) === uid)
+}
+
 // settle keeps a sign-in just saved at key once: one to an account already
-// signed in (the same account id and, where both have one, the same uid,
-// else the same secret) replaces that one's and goes. It gives where it is
-// kept.
+// signed in (the same account id and, where both have one, the same uid;
+// the same uid that one of them is named by; else the same secret)
+// replaces that one's and goes. It gives where it is kept. An account
+// named another way before keeps its account id, which the user's name
+// for it, its proxy and gateway keys are kept by.
 function settle(provider, key) {
   const k = changeAuth((all) => {
     const now = all[key]
@@ -1029,8 +1095,9 @@ function settle(provider, key) {
       if (k === key) continue
       const was = all[k]
       const other = uidOf(now) && uidOf(was) && uidOf(now) !== uidOf(was)
-      if ((who && whoOf(was) === who && !other) || (!who && !whoOf(was) && secret && secretOf(was) === secret)) {
-        all[k] = now
+      const renamed = renamedBy(now, was)
+      if ((who && whoOf(was) === who && !other) || renamed || (!who && !whoOf(was) && secret && secretOf(was) === secret)) {
+        all[k] = renamed && typeof was.accountId === "string" && was.accountId ? { ...now, accountId: was.accountId } : now
         delete all[key]
         return k
       }
@@ -1217,41 +1284,56 @@ async function loadPlugins(list) {
       loaded.push(r.error ? { spec: r.spec, error: r.error } : { spec: r.spec })
     }
   }
-  for (const p of list) {
-    const isPi = pis.includes(p)
-    if (isPi && !p.gateway) continue
-    try {
-      let gateway
-      if (p.gateway) {
-        gateway = await import(pathToFileURL(p.gateway).href)
-        if (typeof gateway.onRequest !== "function") throw new Error("magpie.hooks exports no onRequest")
-      }
-      let fns = []
-      // A gateway-only package needs no OpenCode entry. Mixed packages
-      // still load their provider hooks through the usual entry rules.
-      const pkg = readJSON(path.join(p.target, "package.json"))
-      const onlyGateway = isPi || (p.gateway && (p.gateway === p.target || (!pkg?.main && !pkg?.exports && !INDEX_FILES.some((f) => fs.existsSync(path.join(p.target, f))))))
-      for (const file of onlyGateway ? [] : entries(p.target)) {
-        fns = servers(await import(pathToFileURL(file).href))
-        if (fns.length) break
-      }
-      if (fns.length === 0 && !gateway) throw new Error("exports no OpenCode plugin function")
-      for (const fn of fns) hooks.push({ spec: p.spec, target: p.target, hooks: (await fn(input, p.options)) ?? {} })
-      if (gateway) gatewayHooks.push({ spec: p.spec, options: p.options ?? {}, onRequest: gateway.onRequest,
-        onResponse: gateway.onResponse,
-        state: { calls: 0, failures: 0, totalMillis: 0, lastOutcome: "idle", lastBytes: 0 } })
-      if (!isPi) loaded.push({ spec: p.spec })
-    } catch (e) {
-      const error = e?.plain ? e.message : String(e?.stack ?? e)
-      if (isPi) loaded.find((r) => r.spec === p.spec).error = error
-      else loaded.push({ spec: p.spec, error })
+  // each plugin loads by itself, side by side, so one that is slow or
+  // stuck holds up none of the others; what they add is kept in the
+  // list's order all the same, as a later plugin's hooks win
+  const one = async (p, isPi) => {
+    let gateway
+    if (p.gateway) {
+      gateway = await import(pathToFileURL(p.gateway).href)
+      if (typeof gateway.onRequest !== "function") throw new Error("magpie.hooks exports no onRequest")
     }
+    let fns = []
+    // A gateway-only package needs no OpenCode entry. Mixed packages
+    // still load their provider hooks through the usual entry rules.
+    const pkg = readJSON(path.join(p.target, "package.json"))
+    const onlyGateway = isPi || (p.gateway && (p.gateway === p.target || (!pkg?.main && !pkg?.exports && !INDEX_FILES.some((f) => fs.existsSync(path.join(p.target, f))))))
+    for (const file of onlyGateway ? [] : entries(p.target)) {
+      fns = servers(await import(pathToFileURL(file).href))
+      if (fns.length) break
+    }
+    if (fns.length === 0 && !gateway) throw new Error("exports no OpenCode plugin function")
+    const got = []
+    for (const fn of fns) got.push({ spec: p.spec, target: p.target, hooks: (await fn(input, p.options)) ?? {} })
+    return { got, gateway }
+  }
+  const results = await Promise.all(list.map((p) => {
+    const isPi = pis.includes(p)
+    if (isPi && !p.gateway) return null
+    return inTime(() => one(p, isPi), loadWait, "the plugin's load").then((r) => ({ p, isPi, ...r }), (e) => ({ p, isPi, e }))
+  }))
+  for (const r of results) {
+    if (!r) continue
+    const { p, isPi } = r
+    if (r.e) {
+      const e = r.e
+      const error = e?.plain ? e.message : String(e?.stack ?? e)
+      if (isPi) loaded.find((x) => x.spec === p.spec).error = error
+      else loaded.push({ spec: p.spec, error })
+      continue
+    }
+    for (const x of r.got) hooks.push(x)
+    if (r.gateway) gatewayHooks.push({ spec: p.spec, options: p.options ?? {}, onRequest: r.gateway.onRequest,
+      onResponse: r.gateway.onResponse,
+      state: { calls: 0, failures: 0, totalMillis: 0, lastOutcome: "idle", lastBytes: 0 } })
+    if (!isPi) loaded.push({ spec: p.spec })
   }
   config = { provider: {}, ...structuredClone(userConfig) }
   for (const h of hooks) {
     if (typeof h.hooks.config !== "function") continue
     try {
-      await h.hooks.config(config)
+      // one at a time, as each may build on the last, but none for long
+      await inTime(() => h.hooks.config(config), loadWait, "config hook")
     } catch (e) {
       send({ event: "log", level: "error", message: `${h.spec}: config hook: ${e?.message ?? e}` })
     }
@@ -1637,6 +1719,11 @@ function kinds(c) {
   return out.length ? out : undefined
 }
 
+// kindsSaid is whether a capabilities.input or .output says yes or no to a kind
+// at all: one that says no to each (an embedding's {"text": false}, #3279)
+// gives no kinds, and is not one that said nothing.
+const kindsSaid = (c) => !!c && typeof c === "object" && MODALITIES.some((k) => typeof c[k] === "boolean")
+
 // fromModelsDev is a models.dev model as OpenCode's provider list has it.
 function fromModelsDev(p, m) {
   return {
@@ -1670,7 +1757,7 @@ function fromModelsDev(p, m) {
 // info is what OpenCode knows of provider id, its models as the plugin
 // lists them for account key (the first when none); strict fails where the
 // plugin's list does, rather than keeping the list it was given.
-async function info(id, key, strict) {
+async function info(id, key, strict, limit) {
   const md = mdev()[id]
   const cfg = config.provider?.[id]
   const out = {
@@ -1727,12 +1814,18 @@ async function info(id, key, strict) {
     // would be asked with the serving plugin's account
     if (server && h.spec !== server && signsIn(h.spec).includes(id)) continue
     const k = key ?? accountsOf(readAuth(), id)[0] ?? id
+    // the wait for a due renewal spends the hook's own budget: one
+    // provider then costs one listWait in a listing, not listWait plus
+    // the renewal wait — the sum (15s + 20s) took a single provider past
+    // refreshDeadline, and the whole listing with it (#4065)
+    const began = Date.now()
     await fresh(id, k)
     const all = readAuth()
     try {
       const given = JSON.parse(JSON.stringify(out))
       const l = { tried: false, lastOk: false }
-      const next = await listing.run(l, () => inScope(id, k, () => ph.models(given, { auth: authCopy(k) })))
+      const ask = () => listing.run(l, () => inScope(id, k, () => ph.models(given, { auth: authCopy(k) })))
+      const next = limit > 0 ? await inTime(ask, Math.max(limit - (Date.now() - began), 0), "the plugin's model list") : await ask()
       // a hook that asked its vendor, got no list and gave back the one it
       // was given fell back: magpie keeps the list it had, as a built-in
       // whose fetch failed keeps the one it fetched last; so does one that
@@ -1744,6 +1837,9 @@ async function info(id, key, strict) {
       if (out.fellBack) out.listError = l.said || "the plugin couldn't get its vendor's list"
       out.models = Object.fromEntries(Object.entries(next ?? {}).map(([k, m]) => [k, { ...m, id: k, providerID: id }]))
     } catch (e) {
+      // a listing that gave up waiting: what the hook gives later is no
+      // list a request should be built from
+      if (e instanceof Late) out.late = true
       // an error the models hook throws may say what it means for the
       // sign-in, as an answer's X-Magpie-Sign-In does: a built-in whose
       // model list the vendor refused marked the account
@@ -1782,7 +1878,7 @@ async function infoOf(id, key) {
 // keepInfo keeps p, info(id, key) just built by a listing, for the
 // account's requests.
 function keepInfo(key, p, gen) {
-  if (gen === infoGen && !p.failed) infos.set(key, { gen, md: mdev(), info: p })
+  if (gen === infoGen && !p.failed && !p.late) infos.set(key, { gen, md: mdev(), info: p })
 }
 
 // shown is a plugin's string as magpie shows it: trimmed and at most n
@@ -1793,8 +1889,8 @@ const shown = (v, n) => (typeof v === "string" ? v.trim().slice(0, n) : "")
 // own field (#2038, Vocllum): auth.options, each {key, label, description?,
 // default?, confirm?}. magpie shows each as an Off/On switch in the
 // provider's editor and keeps what the user sets; the plugin reads it with
-// input.magpie.option(provider, key). A switch is only kept and handed
-// over, nothing is run when it changes. Keys are [a-z0-9_-], 1–40 long,
+// input.magpie.option(provider, key). A switch is kept and handed over,
+// and the models listed again (one may go by it); nothing else is run. Keys are [a-z0-9_-], 1–40 long,
 // the first of a key kept; at most MAX_OPTIONS; one without a key or a
 // label is left out.
 const MAX_OPTIONS = 16
@@ -1900,23 +1996,29 @@ function tiersOf(v) {
 // built-in fetches each account's list through the account's.
 async function providers({ proxies } = {}) {
   const stored = readAuth()
-  const out = []
-  for (const [id, a] of auths()) {
+  // every provider is listed side by side, each models hook given
+  // listWait: one whose vendor is stuck holds up no other's row
+  const row = async ([id, a]) => {
     const keys = accountsOf(stored, id)
     const through = (k) => proxies?.[id]?.[k ?? keys[0] ?? ""] ?? proxies?.[id]?.[""] ?? ""
     const gen = infoGen
-    const p = await via.run(through(), () => info(id))
-    keepInfo(keys[0] ?? id, p, gen)
-    // each account's own models, as the built-ins read each account's: a
-    // plan may serve fewer, or others, than the first account's. One that
-    // can't be read is taken to have them all, or the ones it was last
-    // told to have, as a built-in account whose fetch failed keeps its own.
-    const own = await Promise.all(keys.slice(1).map((k) => via.run(through(k), () => info(id, k, true)).then((q) => (keepInfo(k, q, gen), q)).catch((e) => ({ failed: true, listError: e?.message ?? String(e) }))))
+    // every account is listed side by side, each hook given listWait: a
+    // second account no longer waits behind the first, where two
+    // listWaits back to back took one provider past refreshDeadline twice
+    // over (#4065)
+    const [p, own] = await Promise.all([
+      via.run(through(), () => info(id, undefined, false, listWait)).then((q) => (keepInfo(keys[0] ?? id, q, gen), q)),
+      // each account's own models, as the built-ins read each account's: a
+      // plan may serve fewer, or others, than the first account's. One that
+      // can't be read is taken to have them all, or the ones it was last
+      // told to have, as a built-in account whose fetch failed keeps its own.
+      Promise.all(keys.slice(1).map((k) => via.run(through(k), () => info(id, k, true, listWait)).then((q) => (keepInfo(k, q, gen), q)).catch((e) => ({ failed: true, listError: e?.message ?? String(e) })))),
+    ])
     const models = { ...p.models }
     for (const q of own) for (const [k, m] of Object.entries(q?.models ?? {})) models[k] ??= m
     const ids = (q) => Object.values(q.models).filter((m) => m.status !== "deprecated").map((m) => m.id)
     const first = stored[keys[0]]
-    out.push({
+    return {
       id,
       spec: a.spec,
       name: p.name,
@@ -1962,6 +2064,7 @@ async function providers({ proxies } = {}) {
           // every kind it takes and gives, not image alone (#1595)
           inputs: kinds(m.capabilities?.input),
           outputs: kinds(m.capabilities?.output),
+          outputsSaid: kindsSaid(m.capabilities?.output),
           released: m.release_date ?? "",
           cost: m.cost,
           variants: Object.keys(m.variants ?? {}),
@@ -1982,9 +2085,9 @@ async function providers({ proxies } = {}) {
           // words, which magpie may search with for other models
           searches: m.searches === true,
         })),
-    })
+    }
   }
-  return out
+  return Promise.all([...auths()].map(row))
 }
 
 // ---- signing in --------------------------------------------------------------
@@ -2329,7 +2432,8 @@ async function load({ provider, account, proxy }) {
 //       ms; none: it never runs out), window? ("fiveHour", "weekly") }]
 //       (every reset still to be used) } (the rate-limit resets the
 //       account may spend),
-//     windows?: [{ name, used (percent, 0–100), resetsAt? (ISO or ms),
+//     windows?: [{ name, used (percent, 0–100; left out: the plugin didn't
+//       say, which is no share and not 0%), resetsAt? (ISO or ms),
 //       resetSecs?, display?, amount? / limit? / unit? (the window's own
 //       count, when it counts in amounts: amount of limit used, in unit,
 //       "credits"), span? (seconds the window runs), model? (a
@@ -2338,7 +2442,11 @@ async function load({ provider, account, proxy }) {
 //       count as one), aside? (using it up doesn't
 //       stop the account), runsOutAt? (ISO or ms: when the soonest
 //       credits left in it are lost, apart from its reset, as WorkBuddy's
-//       packages end) / runsOut? (how many are lost then) }],
+//       packages end) / runsOut? (how many are lost then), balance?
+//       (how much is left, in unit, of a prepaid wallet with no total:
+//       sent without used, it is no share, yet routing knows the account
+//       and puts the one with the most left first among the provider's
+//       accounts in the same unit, #3950) }],
 //     signIn?: "expired" | "kept" | "renewed" (what the read means for the
 //       account's sign-in, as a model request's X-Magpie-Sign-In says;
 //       without it an error saying to sign in again marks the account and
@@ -2385,7 +2493,7 @@ async function usageOf(provider, account) {
         : null,
     windows: (Array.isArray(u.windows) ? u.windows : []).map((w) => ({
       name: text(w?.name),
-      used: Math.max(0, num(w?.used)), // past 100 when overspent
+      used: w?.used == null ? null : Math.max(0, num(w?.used)), // past 100 when overspent; null: not said
       resetsAt: when(w?.resetsAt),
       resetSecs: Math.max(0, Math.round(num(w?.resetSecs))),
       display: text(w?.display),
@@ -2399,6 +2507,7 @@ async function usageOf(provider, account) {
       aside: !!w?.aside,
       runsOutAt: when(w?.runsOutAt),
       runsOut: Math.max(0, num(w?.runsOut)),
+      balance: typeof w?.balance === "number" && isFinite(w.balance) ? Math.max(0, w.balance) : null, // null: not said
     })),
   }
 }
@@ -2413,10 +2522,13 @@ async function usageOf(provider, account) {
 //       "ineligible" (the account can't take part) | "inactive" (no
 //       check-in running) | "captcha" (the vendor asks for a captcha: the
 //       user checks in in its own app; never solved) | "failed",
-//     credit? (what it gave), streak? (days in a row), message?
+//     credit? (what it gave), streak? (days in a row), message?,
+//     until? (when the vendor's own day turns: an RFC 3339 time or epoch
+//       milliseconds; Qoder's daily credits open at 10:00 UTC+8)
 //   }
 // magpie asks once a Beijing day per account while the user has it on, and
-// again later that day after a failure; a hook that throws is a failure.
+// again later that day after a failure, or at until; a hook that throws is
+// a failure.
 // Run in the account's scope, a token it renews is saved to that account.
 async function checkin({ provider, account, proxy }) {
   return via.run(proxy ?? "", () => checkinOf(provider, account))
@@ -2434,10 +2546,14 @@ async function checkinOf(provider, account) {
   const r = (await inScope(provider, key, () => a.checkin(async () => authCopy(key), JSON.parse(JSON.stringify(p))))) ?? {}
   const num = (v) => (typeof v === "number" && isFinite(v) ? Math.max(0, v) : 0)
   const message = typeof r.message === "string" ? r.message : ""
+  // a time that doesn't read is not told
+  const t = typeof r.until === "number" ? r.until : typeof r.until === "string" ? Date.parse(r.until) : NaN
+  const until = Number.isFinite(t) && t > 0 ? new Date(t).toISOString() : ""
   if (!checkinOutcomes.includes(r.outcome)) {
-    return { outcome: "failed", credit: 0, streak: 0, message: message || `the plugin answered no outcome (${JSON.stringify(r.outcome ?? null)})` }
+    const said = r.outcome === undefined || r.outcome === null ? "no outcome" : JSON.stringify(r.outcome)
+    return { outcome: "failed", credit: 0, streak: 0, message: message ? `the plugin answered ${said}: ${message}` : `the plugin answered ${said}`, until }
   }
-  return { outcome: r.outcome, credit: num(r.credit), streak: Math.round(num(r.streak)), message }
+  return { outcome: r.outcome, credit: num(r.credit), streak: Math.round(num(r.streak)), message, until }
 }
 
 // sdkHeaders are what the AI SDK package the model is on sends of the key.
@@ -2584,6 +2700,8 @@ const handlers = {
     userConfig = p.config ?? {}
     prefer = p.prefer ?? {}
     chosen = p.options ?? {}
+    if (p.loadMillis > 0) loadWait = p.loadMillis
+    if (p.listMillis > 0) listWait = p.listMillis
     await loadPlugins(p.plugins ?? [])
     return { plugins: loaded.map(withProviders) }
   },

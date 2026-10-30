@@ -34,34 +34,44 @@ func TestUnderTightGC(t *testing.T) {
 	}
 }
 
-// Under it the memory Go holds is limited to what it held when the read
-// began, and the limit set before is put back; a lower limit the user set
-// is kept, and GOGC off gets none.
-func TestUnderTightGCLimitsMemory(t *testing.T) {
+// Under it no memory limit is set: the warm-up's read held at what Go
+// held when it began collected every ~160 ms for 13 s of a cold start.
+func TestUnderTightGCSetsNoMemoryLimit(t *testing.T) {
+	defer debug.SetMemoryLimit(debug.SetMemoryLimit(math.MaxInt64))
+	var during int64
+	underTightGC(func() { during = debug.SetMemoryLimit(-1) })
+	if during != math.MaxInt64 {
+		t.Errorf("read under limit %d, want none", during)
+	}
+}
+
+// Two reads under it at once put back what was set before the first, in
+// either order they end: each putting back what it found left the second's
+// 25 when the first ended before it.
+func TestTightGCOverlappingReads(t *testing.T) {
 	defer debug.SetGCPercent(debug.SetGCPercent(100))
 	defer debug.SetMemoryLimit(debug.SetMemoryLimit(math.MaxInt64))
-	for _, c := range []struct {
-		name   string
-		gogc   int
-		before int64
-		low    bool
-	}{
-		{"default", 100, math.MaxInt64, true},
-		{"user limit lower", 100, 1 << 20, false},
-		{"GOGC off", -1, math.MaxInt64, false},
-	} {
-		debug.SetGCPercent(c.gogc)
-		debug.SetMemoryLimit(c.before)
-		var during int64
-		underTightGC(func() { during = debug.SetMemoryLimit(-1) })
-		if c.low && during >= c.before {
-			t.Errorf("%s: read under limit %d, want what Go held", c.name, during)
+	for _, firstEndsFirst := range []bool{true, false} {
+		first := tightenGC()
+		second := tightenGC()
+		if p := gcPercent(); p != tightGCPercent {
+			t.Fatalf("two reads under GOGC=%d, want %d", p, tightGCPercent)
 		}
-		if !c.low && during != c.before {
-			t.Errorf("%s: read under limit %d, want %d kept", c.name, during, c.before)
+		if firstEndsFirst {
+			first()
+		} else {
+			second()
 		}
-		if after := debug.SetMemoryLimit(-1); after != c.before {
-			t.Errorf("%s: after the read the limit is %d, want %d", c.name, after, c.before)
+		if p := gcPercent(); p != tightGCPercent {
+			t.Errorf("one read still in flight under GOGC=%d, want %d", p, tightGCPercent)
+		}
+		first()
+		second()
+		if p := gcPercent(); p != 100 {
+			t.Errorf("first ends first %v: after both GOGC=%d, want 100", firstEndsFirst, p)
+		}
+		if l := debug.SetMemoryLimit(-1); l != math.MaxInt64 {
+			t.Errorf("first ends first %v: after both the limit is %d", firstEndsFirst, l)
 		}
 	}
 }

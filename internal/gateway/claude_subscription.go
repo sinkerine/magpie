@@ -61,6 +61,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/claudecode"
+	"github.com/yetone/magpie/internal/claudetui"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
@@ -174,6 +175,7 @@ type subscriptionRun struct {
 	safeguardBeta string
 	clientMarks   bool
 	lean          bool // started with leanSystem as its system prompt
+	tui           bool // Claude Code's interactive mode (claudeTUI)
 	cacheTail     string
 	cachePrefix   cachePrefix
 	timer         *time.Timer
@@ -277,6 +279,13 @@ type subscriptionRun struct {
 	// began waiting on them
 	asked    []string
 	parkedAt time.Time
+
+	// started is when it was started, and active when its turn under way
+	// began (r.mu), for `magpie claude-code runs` (claudeRunList)
+	started time.Time
+	active  time.Time
+	// ends is when its timer lets it go (endIn), under r.mu
+	ends time.Time
 
 	// shown is the client's tool calls its last reply made, in the order
 	// the client was told them: a client that names them by ids of its own
@@ -422,28 +431,37 @@ func clientWorkDir(req *Request) string {
 // clientNamedWorkDir is the working directory the caller's instructions
 // name, as they write it, wherever it is; "" when they name none.
 func clientNamedWorkDir(req *Request) string {
-	texts := []string{req.System}
+	dir, _ := clientNamedWorkPlace(req)
+	return dir
+}
+
+// clientNamedWorkPlace is clientNamedWorkDir, and whether the caller
+// named it in a message rather than in its instructions: Claude Code
+// 2.1.296 and later give their environment as a {role: "system"} message
+// after the user's first, so the run is told it in the conversation,
+// after the caller's instructions (envTurnsNote).
+func clientNamedWorkPlace(req *Request) (dir string, inTurns bool) {
+	look := func(t string, turn bool) {
+		for _, m := range clientCwdPattern.FindAllStringSubmatch(t, -1) {
+			for _, g := range m[1:] {
+				if g = strings.Trim(strings.TrimSpace(g), "`'\""); g != "" {
+					dir, inTurns = g, turn
+				}
+			}
+		}
+	}
+	look(req.System, false)
 	for _, m := range req.Messages {
 		if m.Role == "assistant" {
 			continue
 		}
 		for _, p := range m.Parts {
 			if p.Kind == Text {
-				texts = append(texts, p.Text)
+				look(p.Text, true)
 			}
 		}
 	}
-	dir := ""
-	for _, t := range texts {
-		for _, m := range clientCwdPattern.FindAllStringSubmatch(t, -1) {
-			for _, g := range m[1:] {
-				if g = strings.Trim(strings.TrimSpace(g), "`'\""); g != "" {
-					dir = g
-				}
-			}
-		}
-	}
-	return dir
+	return dir, inTurns
 }
 
 var clientCwdPattern = regexp.MustCompile(`(?m)(?:Primary working directory|^\s*(?:-\s*)?Working directory|Current working directory): *([^\r\n]+)$|<cwd>([^<\r\n]+)</cwd>`)
@@ -586,6 +604,9 @@ func (c claudeCLI) env(env []string, configDir string) []string {
 	if configDir != "" {
 		names = append(slices.Clone(names), "CLAUDE_CONFIG_DIR/p")
 	}
+	if slices.ContainsFunc(env, func(e string) bool { return strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN=") }) {
+		names = append(slices.Clone(names), "CLAUDE_CODE_OAUTH_TOKEN")
+	}
 	if c.wsl.Root {
 		// asRoot's, for a distro whose user is root
 		names = append(slices.Clone(names), "IS_SANDBOX")
@@ -708,16 +729,6 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 		"magpie": map[string]any{"command": exe, "args": []string{"claude-mcp-helper", callbackPath, toolsPath}},
 	}})
 	args := claudeCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch)
-	if req.leanPrompt {
-		// in a file of the run's own: instructions can be longer than
-		// Windows lets a command line be
-		systemPath := filepath.Join(tmp, "system.md")
-		if err := os.WriteFile(systemPath, []byte(leanSystem(req)), 0o600); err != nil {
-			cleanup()
-			return nil, nil, err
-		}
-		args = append(args, "--system-prompt-file", binary.file(systemPath))
-	}
 	if req.ThinkOff {
 		// the client turned thinking off, as Claude Code's auto mode
 		// classifier and its small asks do: a run at Claude Code's own
@@ -739,7 +750,24 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 	client := work != ""
 	if !client {
 		work, err = claudeWorkDir()
-		req.envElsewhere = clientNamedWorkDir(req) != ""
+		named, inTurns := clientNamedWorkPlace(req)
+		req.envElsewhere = named != ""
+		req.envInTurns = inTurns
+		// a caller on another computer that names no folder: Claude Code's
+		// environment is this computer's, and the tools run on the
+		// caller's (packinggoods on Discord: a Mac client of a Windows
+		// gateway had its commands wrapped in PowerShell)
+		req.envUnknown = !req.envElsewhere && req.remoteCaller
+	}
+	if req.leanPrompt {
+		// in a file of the run's own: instructions can be longer than
+		// Windows lets a command line be
+		systemPath := filepath.Join(tmp, "system.md")
+		if err := os.WriteFile(systemPath, []byte(leanSystem(req)), 0o600); err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		args = append(args, "--system-prompt-file", binary.file(systemPath))
 	}
 	var sessions []string
 	switch {
@@ -788,7 +816,16 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 			prefix = promptCachePrefix(prompt)
 		}
 	}
-	cmd := binary.command(context.Background(), args...)
+	// Claude Code's interactive mode, where a run allows it (claudeTUI):
+	// the shim (claudetui) is handed the -p arguments, and becomes that -p
+	// run when the interactive one doesn't start
+	tui := claudeTUI(req, binary, prompt)
+	var cmd *exec.Cmd
+	if tui {
+		cmd = proc.CommandContext(context.Background(), exe, append([]string{claudetui.Command, binary.path}, args...)...)
+	} else {
+		cmd = binary.command(context.Background(), args...)
+	}
 	cmd.Dir = work
 	env, err := binary.proxied(ctx, cleanClaudeEnv(os.Environ()))
 	if err != nil {
@@ -800,6 +837,13 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 	}
 	if len(req.Safeguards) > 0 {
 		env = append(env, "ANTHROPIC_BETAS="+req.SafeguardBeta)
+	}
+	if tui && (!client || configDir != "") {
+		// a folder of magpie's, or an account folder of magpie's whose
+		// Claude Code no one else runs: asked whether to trust it, the
+		// shim says yes; in the user's own account a caller's folder is
+		// theirs to answer for, and the run is -p
+		env = append(env, claudetui.TrustEnv+"=1")
 	}
 	cmd.Env = binary.env(binary.asRoot(env), configDir)
 	stdin, err := cmd.StdinPipe()
@@ -824,19 +868,21 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 	}
 	cmd.Stdout, cmd.Stderr = stdoutW, stderrW
 
-	run := &subscriptionRun{bridge: b, token: token, model: model, cmd: cmd, tmp: tmp, schema: len(req.Format.schema()) > 0, pending: map[string]chan mcpToolResult{}, stdin: stdin, effort: req.Effort, sessions: sessions}
+	run := &subscriptionRun{bridge: b, token: token, model: model, cmd: cmd, tmp: tmp, schema: len(req.Format.schema()) > 0, pending: map[string]chan mcpToolResult{}, stdin: stdin, effort: req.Effort, sessions: sessions, started: time.Now()}
 	run.owner.Store(&owner)
 	run.names = bridgeNames(req.Tools)
 	run.safeguardBeta = req.SafeguardBeta
 	run.clientMarks = req.clientCache != nil
 	run.lean = req.leanPrompt
+	run.tui = tui
 	run.cachePrefix = prefix
 	if user, _ := ownerAccount(owner); user != "" {
 		run.loginVersion = provider.ClaudeLoginVersion(user)
 	}
 	// A caller may abandon a turn after receiving tool_use. Do not leave the
 	// parked Claude process and MCP request alive forever.
-	run.timer = time.AfterFunc(30*time.Minute, func() { run.abortFor("it waited as long as it may") })
+	run.timer = time.AfterFunc(runTimeout, func() { run.abortFor("it waited as long as it may") })
+	run.ends = time.Now().Add(runTimeout)
 	segment := run.attach()
 	b.mu.Lock()
 	b.runs[token] = run
@@ -864,7 +910,7 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 		run.readOutput(stdout)
 	}()
 
-	if len(req.Safeguards) > 0 || from != nil || run.clientMarks {
+	if len(req.Safeguards) > 0 || from != nil || run.clientMarks || tui {
 		// Initialize the SDK before applying settings. Send the potentially
 		// large context over stdin rather than an environment entry. A
 		// Claude Code resumed from a saved session answers it only once
@@ -894,6 +940,32 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 		return nil, nil, err
 	}
 	return run, segment, nil
+}
+
+// claudeTUIRuns is false where magpie's executable has no shim to run:
+// the gateway's tests, whose fake Claude Codes are -p ones.
+var claudeTUIRuns = true
+
+// tuiPromptMost is the longest first message a run in Claude Code's
+// interactive mode is pasted; a longer one is a -p run's.
+const tuiPromptMost = 400 << 10
+
+// claudeTUI says whether a run is Claude Code's interactive mode, as a
+// person runs it (claudetui), rather than -p: the plan counts a -p
+// request, its entrypoint sdk-cli, at about twice the interactive mode's
+// (anthropics/claude-code#97074). On unless the user turned it off
+// (ClaudePrintMode), on macOS and Linux, for a run whose Claude Code is
+// this machine's; not for what only -p takes: safeguards and a client's
+// cache marks (control requests and an extra body), a JSON schema, and
+// images. prompt is the run's first message.
+func claudeTUI(req *Request, binary claudeCLI, prompt []map[string]any) bool {
+	if !claudeTUIRuns || runtime.GOOS != "darwin" && runtime.GOOS != "linux" || binary.wsl != nil || binary.path == "" ||
+		len(req.Safeguards) > 0 || req.clientCache != nil || len(req.Format.schema()) > 0 ||
+		countImages(req.Messages) > 0 || settings.Load().ClaudePrintMode {
+		return false
+	}
+	b, _ := json.Marshal(prompt)
+	return len(b) <= tuiPromptMost
 }
 
 // safeguardBody is the safety-only form of the run's extra body.
@@ -1036,6 +1108,11 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 		return nil, nil
 	}
 	req.clientCache.selected(false)
+	if run.tui && (back != "" || countImages(since) > 0) {
+		// the interactive mode can't be taken back, nor pasted an image
+		run.abortFor("the interactive Claude Code can't go on with this turn")
+		return nil, nil
+	}
 	if back != "" {
 		if err := run.rewind(back); err != nil {
 			log.Printf("claude: a run that went on with a side question could not be taken back to the conversation's turn, let go: %v", err)
@@ -1077,15 +1154,22 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 	}
 	ch := make(chan Event, 64)
 	run.segment = ch
+	run.active = time.Now()
 	run.turnUUID, run.backKey = turn, key
 	run.mu.Unlock()
-	run.timer.Reset(30 * time.Minute)
+	run.endIn(runTimeout)
 	// a turn the router picked another effort for (#502) goes on in the
 	// same Claude Code, told the level first: it asks the next turn at it
 	// in output_config alone, the conversation it wrote to the cache
 	// untouched, where a run started anew is told it in one message, a
 	// prefix the cache has never seen
 	if req.Effort != run.effort {
+		if run.tui {
+			// the interactive mode takes its effort at its start only:
+			// the run is let go, and one at the new effort started
+			run.abortFor("its effort is set at its start, and the next turn asks another")
+			return nil, nil
+		}
 		if err := run.setEffort(req.Effort); err != nil {
 			run.abortFor("it could not be told the next turn's effort: " + err.Error())
 			return nil, nil
@@ -1404,7 +1488,7 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 	if !r.bridge.keepIdle(r, key, conv) {
 		return // it ended during its reply (#1667)
 	}
-	r.timer.Reset(idleLongest)
+	r.endIn(idleLongest)
 }
 
 // keepIdle leaves run waiting for the turn after the conversation key
@@ -1746,7 +1830,8 @@ type controlReply struct {
 func (r *subscriptionRun) letGo() {
 	r.mu.Lock()
 	turn, back := r.turnUUID, r.backKey
-	can := !r.closed && r.stdin != nil && r.bridge != nil && r.timer != nil &&
+	// the interactive mode (claudeTUI) can't be taken back
+	can := !r.closed && !r.tui && r.stdin != nil && r.bridge != nil && r.timer != nil &&
 		turn != "" && back != "" && len(r.pending) == 0 && r.rewinding == nil
 	done := make(chan struct{})
 	if can {
@@ -1781,7 +1866,7 @@ func (r *subscriptionRun) letGo() {
 	r.asked, r.shown, r.parkedAt = nil, nil, time.Time{}
 	clear(r.early)
 	r.mu.Unlock()
-	r.timer.Reset(idleLongest)
+	r.endIn(idleLongest)
 	log.Printf("claude: the turn the client gave up on was taken back; its run waits for the conversation's next turn")
 }
 
@@ -1860,10 +1945,10 @@ func (r *subscriptionRun) park() {
 	case r.timer == nil:
 		return
 	case final:
-		r.timer.Reset(finalGrace)
+		r.endIn(finalGrace)
 		return
 	case r.stdin == nil:
-		r.timer.Reset(parkLongest)
+		r.endIn(parkLongest)
 		return
 	}
 	if why, over := r.oversized(3); over {
@@ -2046,15 +2131,22 @@ func inClaudeDir(env []string, configDir string) []string {
 	if configDir == "" {
 		return env
 	}
-	out := make([]string, 0, len(env)+1)
+	out := make([]string, 0, len(env)+2)
 	for _, e := range env {
 		switch k, _, _ := strings.Cut(e, "="); k {
-		case "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR":
+		case "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN":
 			continue
 		}
 		out = append(out, e)
 	}
-	return append(out, "CLAUDE_CONFIG_DIR="+configDir)
+	out = append(out, "CLAUDE_CONFIG_DIR="+configDir)
+	// an account added by a setup-token: Claude Code takes the token as
+	// `claude setup-token` says to, in its environment, for this account's
+	// directory alone; never on the command line, nor logged
+	if tok := provider.ClaudeDirToken(configDir); tok != "" {
+		out = append(out, "CLAUDE_CODE_OAUTH_TOKEN="+tok)
+	}
+	return out
 }
 
 func cleanClaudeEnv(env []string) []string {
@@ -2098,11 +2190,20 @@ func (w *lockedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// endIn has the run let go in d unless something comes for it first.
+func (r *subscriptionRun) endIn(d time.Duration) {
+	r.mu.Lock()
+	r.ends = time.Now().Add(d)
+	r.mu.Unlock()
+	r.timer.Reset(d)
+}
+
 func (r *subscriptionRun) attach() chan Event {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ch := make(chan Event, 64)
 	r.segment = ch
+	r.active = time.Now()
 	return ch
 }
 
@@ -2506,7 +2607,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 						r.emit(Event{Kind: KThink, Text: c.Thinking})
 					}
 					if c.Signature != "" {
-						r.emit(Event{Kind: KSig, Text: c.Signature})
+						r.emit(Event{Kind: KSig, Name: sealAnthropic, Text: c.Signature})
 					}
 				case "text":
 					said(c.Text)
@@ -2585,7 +2686,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			case "thinking_delta":
 				r.emit(Event{Kind: KThink, Text: e.Delta.Thinking})
 			case "signature_delta":
-				r.emit(Event{Kind: KSig, Text: e.Delta.Signature})
+				r.emit(Event{Kind: KSig, Name: sealAnthropic, Text: e.Delta.Signature})
 			case "input_json_delta":
 				if !own[e.Index] {
 					r.emit(Event{Kind: KToolArgs, Text: e.Delta.PartialJSON})
@@ -2724,7 +2825,7 @@ func renderClaudePrompt(req *Request) ([]map[string]any, error) {
 	var blocks []map[string]any
 	var text strings.Builder
 	// a lean run has them as its system prompt (leanSystem)
-	if !req.leanPrompt && (req.System != "" || req.ToolChoice == "required" || strings.HasPrefix(req.ToolChoice, "name:")) {
+	if !req.leanPrompt && (req.System != "" || req.ToolChoice == "required" || strings.HasPrefix(req.ToolChoice, "name:") || envNote(req) != "") {
 		text.WriteString("<external_system_instructions>\n")
 		system := withoutBillingHeader(req.System)
 		pos := 0
@@ -2743,9 +2844,7 @@ func renderClaudePrompt(req *Request) ([]map[string]any, error) {
 			}
 		}
 		text.WriteString(system[pos:])
-		if req.envElsewhere {
-			text.WriteString(envElsewhereNote)
-		}
+		text.WriteString(envNote(req))
 		text.WriteString(toolChoiceAsk(req))
 		text.WriteString("\n</external_system_instructions>\n\n")
 		// The caller's instructions are a block of their own, marked for the
@@ -2847,6 +2946,47 @@ func renderClaudePrompt(req *Request) ([]map[string]any, error) {
 // app and no vendor: it goes to the vendor with the prompt.
 const envElsewhereNote = "\n\nThe environment these instructions describe (working directory, platform, OS, shell, git status) is the one every tool runs in. Where an environment given before them differs, go by these instructions; nothing has changed and there is no need to check."
 
+// envElsewhereLeanNote is envElsewhereNote for a lean run, whose
+// instructions are its system prompt: Claude Code gives its environment
+// after them, in the run's first message, not before.
+const envElsewhereLeanNote = "\n\nThe environment these instructions describe (working directory, platform, OS, shell, git status) is the one every tool runs in. Where an environment given elsewhere in this conversation differs, go by these instructions; nothing has changed and there is no need to check."
+
+// envUnknownNote follows the caller's instructions when the caller is on
+// another computer and names no folder: Claude Code's environment (its
+// platform, OS, shell and folder) is the gateway's, which no tool runs
+// on, and a model told only that one wrapped the caller's commands in the
+// gateway's shell. It names no app and no vendor.
+const envUnknownNote = "\n\nThe environment given elsewhere in this conversation (its working directory, platform, OS and shell) is not the one the tools run on: don't take a platform, shell or path for a tool call from it."
+
+// envTurnsNote is envElsewhereNote, in either mode, for a caller whose
+// environment is in its messages, not its instructions (Claude Code
+// 2.1.296 and later, req.envInTurns). envElsewhereNote pointed the model
+// at instructions that describe no environment, while the caller's own
+// came after them as a message, and the gateway's Claude Code gave its
+// own before them all (packinggoods on Discord: a Mac client of a
+// Windows gateway still had commands wrapped in PowerShell). The run's
+// own environment is always the first one given, at the start of its
+// first message, and the caller's comes after it, so the last one given
+// is the caller's. It names no app and no vendor.
+const envTurnsNote = "\n\nOf the environments given in this conversation (working directory, platform, OS, shell, git status), the last one given is the one every tool runs in. Where an earlier one differs, go by the last; nothing has changed and there is no need to check."
+
+// envNote is what a run is told after the caller's instructions of where
+// its tools run: "" for a run in the caller's own folder, or for a caller
+// on this computer that names none.
+func envNote(req *Request) string {
+	switch {
+	case req.envElsewhere && req.envInTurns:
+		return envTurnsNote
+	case req.envElsewhere && req.leanPrompt:
+		return envElsewhereLeanNote
+	case req.envElsewhere:
+		return envElsewhereNote
+	case req.envUnknown:
+		return envUnknownNote
+	}
+	return ""
+}
+
 func toolChoiceAsk(req *Request) string {
 	switch {
 	case req.ToolChoice == "required":
@@ -2860,10 +3000,11 @@ func toolChoiceAsk(req *Request) string {
 // leanSystem is a lean run's system prompt (ClaudeLeanPrompt): the
 // caller's instructions without the client Claude Code's billing line, as
 // renderClaudePrompt tells them to a run that keeps Claude Code's own,
-// with its tool choice. Claude Code still puts its billing line and its
+// with where its tools run (envNote) and its tool choice. Claude Code
+// still puts its billing line and its
 // identity line before it, and marks it for the cache itself.
 func leanSystem(req *Request) string {
-	return strings.TrimSpace(withoutBillingHeader(req.System) + toolChoiceAsk(req))
+	return strings.TrimSpace(withoutBillingHeader(req.System) + envNote(req) + toolChoiceAsk(req))
 }
 
 // historyChunk is how many messages of the history renderClaudePrompt puts
@@ -3097,10 +3238,18 @@ func renderCachedParts(blocks []map[string]any, text *strings.Builder, parts []P
 		case Image:
 			blocks = imageBlocks(blocks, text, p)
 		}
-		if cached && p.cache != "" {
+		// A client block ends its rendered block even without a mark of its
+		// own: the mark a client put on this position last round has moved
+		// on with the conversation's growth, and with the boundary merged
+		// into the next marked block Anthropic's prefix check — which looks
+		// back over block boundaries, not into them — finds the old write
+		// no more and the whole history is written again (#3835)
+		if cached && (p.cache != "" || p.block) {
 			blocks = closeBlocks(blocks, text)
 			text.Reset()
-			blocks[len(blocks)-1]["cache_control"] = cacheMark(p.cache)
+			if p.cache != "" {
+				blocks[len(blocks)-1]["cache_control"] = cacheMark(p.cache)
+			}
 		}
 	}
 	return blocks
@@ -3565,7 +3714,7 @@ var queuedWait = 2 * time.Second
 // doing what they asked (#1878).
 func (r *subscriptionRun) continueWith(results []Part, said string, tools []bridgeTool) (<-chan Event, error) {
 	if r.timer != nil {
-		r.timer.Reset(30 * time.Minute)
+		r.endIn(runTimeout)
 	}
 	if said != "" {
 		if err := r.queue(said); err != nil {
@@ -4410,6 +4559,13 @@ func (s *Server) serveSubscription(w http.ResponseWriter, r *http.Request, from 
 	var err error
 	if name == "Claude Code" && wantsClientCache(r, from) {
 		req, err = parseAnthropicRequest(body, true)
+	} else if name == "Claude Code" && classifierClientCache(from, body) {
+		// the classifier never asked for its marks through magpie's
+		// header: a set the bridge can't keep (a TTL order Anthropic
+		// would refuse) goes the default way, as before, not refused
+		if req, err = parseAnthropicRequest(body, true); err != nil {
+			req, err = parse(from, body)
+		}
 	} else {
 		req, err = parse(from, body)
 	}
@@ -4423,6 +4579,9 @@ func (s *Server) serveSubscription(w http.ResponseWriter, r *http.Request, from 
 	// a client that places its own cache marks keeps Claude Code's prompt:
 	// its system marks are placed in the run's first message (#1717)
 	req.leanPrompt = name == "Claude Code" && req.clientCache == nil && settings.Load().ClaudeLeanPrompt
+	// the tools of a caller on another computer run there, not where
+	// Claude Code runs (envUnknownNote)
+	req.remoteCaller = !local(r)
 	if req.Format != nil && req.Format.schema() == nil {
 		// --json-schema takes a schema only: any JSON object is asked for
 		// in words

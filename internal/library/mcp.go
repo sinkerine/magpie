@@ -51,6 +51,21 @@ type Server struct {
 	// and list its tools: Codex's startup_timeout_sec (#3168), the only
 	// agent given it. 0 leaves it to the agent (Codex's own is 30s).
 	StartupTimeout int `json:"startupTimeout,omitempty"`
+	// Local keeps the server to this computer (huhuy72219405 on X: a
+	// server of a program or folder only this computer has). A backup or
+	// a sync never carries it, and one coming in neither takes it away nor
+	// puts another computer's of that name in its place (carry.go).
+	Local bool `json:"local,omitempty"`
+	// Plugin is the plugin (plugin.Name) whose tools the server is: the
+	// gateway serves them at its URL, and the hub calls the plugin itself
+	// (plugin_tools.go)
+	Plugin string `json:"plugin,omitempty"`
+	// Hub is how the MCP hub (Library.MCPHub) gives the server: "" shares
+	// it through the hub's one entry, as every server was before;
+	// HubDirect keeps it the agents' own entry, written as with the hub
+	// off, for a server that reads its project from the folder it is
+	// started in, or keeps a session's state (#4382, cuipengcx90).
+	Hub string `json:"hub,omitempty"`
 
 	// startupWrote is the startup_timeout_sec magpie last wrote in the
 	// entry being written, 0 for none: one the entry has otherwise is the
@@ -108,6 +123,13 @@ func (s *Server) check() error {
 		s.Command, s.Args, s.Env = "", nil, nil
 	default:
 		return fmt.Errorf("%s: unknown transport %q", s.Name, s.Transport)
+	}
+	switch s.Hub {
+	case "", "shared":
+		s.Hub = ""
+	case HubDirect:
+	default:
+		return fmt.Errorf("%s: unknown hub policy %q: shared or direct", s.Name, s.Hub)
 	}
 	// magpie signs in only to a streamable HTTP server
 	if s.Transport != "http" {
@@ -977,12 +999,91 @@ func (f *mcpFile) parseEntries(raw []byte) (map[string]map[string]any, error) {
 	for _, k := range strings.Split(f.key(), ".") {
 		all, _ = all[k].(map[string]any)
 	}
+	v2 := openCodeServers(f.Format, all)
 	for name, v := range all {
+		if m, ok := v.(map[string]any); ok && (v2 == nil || name != "servers") {
+			out[name] = m
+		}
+	}
+	// OpenCode 2's own entries win a name over a V1 one, as OpenCode
+	// reads them
+	for name, v := range v2 {
 		if m, ok := v.(map[string]any); ok {
 			out[name] = m
 		}
 	}
 	return out, nil
+}
+
+// openCodeServers is OpenCode 2's mcp.servers, where its native config and
+// its own `opencode mcp add` keep the servers ("Configure MCP servers under
+// `mcp.servers`", opencode 2.0.25), or nil. OpenCode 2 reads the V1 shape,
+// mcp.<name>, beside it, so one file can hold both, and "servers" there is
+// that object, not a server called servers: one with a type, command or
+// url of its own is a V1 server by that name.
+func openCodeServers(format mcpFormat, mcp map[string]any) map[string]any {
+	if format != fmtOpenCode {
+		return nil
+	}
+	m, ok := mcp["servers"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, k := range []string{"type", "command", "url"} {
+		if _, own := m[k]; own {
+			return nil
+		}
+	}
+	return m
+}
+
+// openCodeLayout is what the OpenCode file at path holds under mcp: the
+// names of its V1 entries (mcp.<name>), those of OpenCode 2's own
+// (mcp.servers.<name>), and whether it has mcp.servers at all.
+func openCodeLayout(path string) (v1, v2 map[string]bool, native bool, err error) {
+	raw, err := edit.Read(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, false, nil
+	}
+	if err != nil {
+		return nil, nil, false, err
+	}
+	raw = edit.TrimBOM(raw)
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil, false, nil
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(jsonc.ToJSON(raw), &doc); err != nil {
+		return nil, nil, false, fmt.Errorf("%s: %w", path, err)
+	}
+	all, _ := doc["mcp"].(map[string]any)
+	servers := openCodeServers(fmtOpenCode, all)
+	v1, v2 = map[string]bool{}, map[string]bool{}
+	for name, v := range all {
+		if _, ok := v.(map[string]any); ok && (servers == nil || name != "servers") {
+			v1[name] = true
+		}
+	}
+	for name, v := range servers {
+		if _, ok := v.(map[string]any); ok {
+			v2[name] = true
+		}
+	}
+	return v1, v2, servers != nil, nil
+}
+
+// openCodePath is the key path of the server's entry in the OpenCode file:
+// OpenCode 2's mcp.servers.<name> once the file keeps its servers there
+// (the entry there already, or a new one), else mcp.<name>.
+func (f *mcpFile) openCodePath(name string) (string, bool, error) {
+	v1, v2, native, err := openCodeLayout(f.Path)
+	if err != nil {
+		return "", false, err
+	}
+	if native && (v2[name] || !v1[name]) {
+		return "mcp.servers." + name, true, nil
+	}
+	return "mcp." + name, false, nil
 }
 
 // cloneAny is a deep copy of a parsed value, so a caller can change what
@@ -1235,7 +1336,19 @@ func (f *mcpFile) putEntry(s *Server, o ordered) error {
 				return err
 			}
 		}
-		return edit.SetJSON(f.Path, edit.KV{Path: f.key() + "." + s.Name, Value: o})
+		key := f.key() + "." + s.Name
+		if f.Format == fmtOpenCode {
+			p, native, err := f.openCodePath(s.Name)
+			if err != nil {
+				return err
+			}
+			// OpenCode 2's servers have no enabled: on unless disabled,
+			// which is the user's to set
+			if key = p; native {
+				o = slices.DeleteFunc(slices.Clone(o), func(e kv) bool { return e.k == "enabled" })
+			}
+		}
+		return edit.SetJSON(f.Path, edit.KV{Path: key, Value: o})
 	}, f.files()...)
 }
 
@@ -1261,6 +1374,22 @@ func (f *mcpFile) del(name string) error {
 			if err := a.del(name); err != nil {
 				return err
 			}
+		}
+		if f.Format == fmtOpenCode {
+			// from wherever OpenCode reads it: mcp.<name>, OpenCode 2's
+			// mcp.servers.<name>, or both, and never mcp.servers itself
+			v1, v2, _, err := openCodeLayout(f.Path)
+			if err != nil {
+				return err
+			}
+			var paths []string
+			if v1[name] {
+				paths = append(paths, "mcp."+name)
+			}
+			if v2[name] {
+				paths = append(paths, "mcp.servers."+name)
+			}
+			return edit.DelJSON(f.Path, paths...)
 		}
 		return edit.DelJSON(f.Path, f.key()+"."+name)
 	}, f.files()...)

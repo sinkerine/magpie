@@ -725,6 +725,7 @@ var (
 	injected = []string{
 		"<system-reminder", "<environment_context>", "<user_instructions>", "<turn_aborted>",
 		"<user_shell_command>", "<subagent_notification>", "<in-app-browser-context",
+		"<external_codex_apps_open_page>",
 		"<task-notification>", "<subagent-notification>", "<plugin_reference>",
 		"Available agent types for the Agent tool:", "Available agent types and the tools they have access to:",
 		"New agent types are now available for the Agent tool:",
@@ -738,9 +739,18 @@ var (
 // without the reminders in it, and after the Codex app's context. Routing
 // (turnIn, userText, firstWords) and the prompt's turns go by it alike.
 func userWords(text string) string {
-	t := strings.TrimSpace(reminders.ReplaceAllString(text, ""))
-	if at := myRequest.FindAllStringIndex(t, -1); len(at) > 0 {
-		t = strings.TrimSpace(t[at[len(at)-1][1]:])
+	// each pattern is looked for only where its words are: run over every
+	// user text of a long conversation on each request, the line-anchored
+	// myRequest alone took a seventh of a Codex request's CPU (#3394)
+	t := text
+	if strings.Contains(t, "<system-reminder") {
+		t = reminders.ReplaceAllString(t, "")
+	}
+	t = strings.TrimSpace(t)
+	if strings.Contains(t, "## My request") {
+		if at := myRequest.FindAllStringIndex(t, -1); len(at) > 0 {
+			t = strings.TrimSpace(t[at[len(at)-1][1]:])
+		}
 	}
 	if t == "" || agentsFor.MatchString(t) {
 		return ""
@@ -1216,13 +1226,14 @@ func windowFor(id, model string) int {
 // inspectPrompt reads the request's prompt beside it, putting the estimate
 // in the trace as soon as it is read; wait returns it, for the route's
 // end to scale to what was counted. masked is the body as the vendor would
-// get it with masking on, kept a while for the card's text (PromptText).
-func (s *Server) inspectPrompt(tr *Route, from provider.Protocol, body, masked []byte) (wait func() *Prompt) {
+// get it with masking on, kept a while for the card's text (PromptText);
+// plain when it went unmasked, so is masked only when the card asks.
+func (s *Server) inspectPrompt(tr *Route, from provider.Protocol, body, masked []byte, plain bool) (wait func() *Prompt) {
 	ch := make(chan *Prompt, 1)
 	go func() {
 		p := promptOf(from, body)
 		if p != nil {
-			s.trace.keepBody(tr.ID, from, masked)
+			s.trace.keepBody(tr.ID, from, masked, plain)
 			s.trace.update(tr, func(t *Route) {
 				if t.Prompt == nil {
 					t.Prompt = p

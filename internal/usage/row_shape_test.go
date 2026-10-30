@@ -2,6 +2,7 @@ package usage
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -13,15 +14,15 @@ import (
 // and 140 of a row's 328 bytes were string ids most rows of a chunk repeat.
 // Packed and read back, every row is the row it was.
 func TestRowsOfOneSessionShareAShape(t *testing.T) {
-	if n := unsafe.Sizeof(packedRow{}); n > 216 {
-		t.Fatalf("a packed row is %d bytes, want 216 at most", n)
+	if n := unsafe.Sizeof(packedRow{}); n > 184 {
+		t.Fatalf("a packed row is %d bytes, want 184 at most", n)
 	}
 	at := time.Date(2026, 10, 21, 12, 0, 0, 0, time.Local)
 	c := &rowChunk{}
 	var want []Row
 	for i := range 200 {
 		r := Row{Record: Record{Time: at.Add(time.Duration(i) * time.Second), Agent: "claude", Provider: "anthropic", Model: "claude-opus-5-5",
-			Session: "s1", Endpoint: "/v1/messages", Input: i, Output: 2 * i, Status: 200,
+			Session: "s1", Endpoint: "/v1/messages", Input: i, Output: 2 * i, Own: int64(3 * i), Masking: int64(i), Status: 200,
 			RequestID: fmt.Sprint("req", i), ResponseID: fmt.Sprint("resp", i), Archive: fmt.Sprint("a", i)}, Source: "log"}
 		if i%7 == 0 {
 			r.Error, r.Status = fmt.Sprint("overloaded ", i), 529
@@ -51,5 +52,17 @@ func TestRowsOfOneSessionShareAShape(t *testing.T) {
 		if msg := back.Strings[back.text(&back.Rows[i], rowMsg)]; msg != fmt.Sprint("msg", i) {
 			t.Fatalf("row %d's message id read back as %q", i, msg)
 		}
+	}
+}
+
+// A row keeps its times in ms in 32 bits: one longer than that, which no
+// call takes, reads back as the longest it can keep, not wrapped around.
+func TestRowTimesPastWhatARowKeeps(t *testing.T) {
+	long := int64(30 * 24 * time.Hour / time.Millisecond)
+	c := &rowChunk{}
+	c.add(Row{Record: Record{Time: time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC), Millis: long, Queued: -long, TTFT: 1500}}, "", 0, false)
+	got := c.row(0)
+	if got.Millis != math.MaxInt32 || got.Queued != math.MinInt32 || got.TTFT != 1500 {
+		t.Fatalf("read back Millis %d, Queued %d, TTFT %d; want %d, %d, 1500", got.Millis, got.Queued, got.TTFT, int64(math.MaxInt32), int64(math.MinInt32))
 	}
 }

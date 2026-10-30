@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -113,6 +114,10 @@ type pluginEntryJSON struct {
 	// Moved are the built-in subscriptions moved onto it, which stop
 	// with it when it is removed or turned off (no built-in to go back to)
 	Moved []string `json:"moved"`
+	// Serves are the names of the other providers it registers, which
+	// the row's "Serves" chip names after Moved's (#3902): only when the
+	// two come to two or more, as one provider alone is the row's title
+	Serves []string `json:"serves,omitempty"`
 	// AutoUpdated is the update magpie made to it by itself lately
 	AutoUpdated *plugin.Updated `json:"autoUpdated,omitempty"`
 	// Middleware is the gateway middleware it has, run in the gateway
@@ -259,8 +264,10 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 	// which is the whole of the providers RPC; the page here uses none of
 	// those models, only the names, so waiting on them held the Installed
 	// list for one vendor after another every time it was opened.
+	provs := map[string][]plugin.Provider{}
 	for _, p := range plugin.Cached() {
 		names[p.Spec] = append(names[p.Spec], p.Name)
+		provs[p.Spec] = append(provs[p.Spec], p)
 		idName[p.ID] = p.Name
 	}
 	// whether that is the plugins' own answer or what was kept from before
@@ -357,6 +364,7 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 		if j.Moved == nil {
 			j.Moved = []string{}
 		}
+		j.Serves = servesBeside(j.Moved, provs[e.Spec])
 		s.Plugins = append(s.Plugins, j)
 	}
 	// each plugin's own picture, kept and checked as a listed one's; at
@@ -369,6 +377,30 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 		s.Plugins[i].Icon = ic
 	}
 	return s
+}
+
+// servesBeside is what a plugin's "Serves" chip names besides the
+// built-ins moved onto it: the providers it registers, each once, but for
+// the moved ones (a moved built-in's id is the plugin's provider id, and
+// the page names it as the built-in). Nothing when none is moved and it
+// registers fewer than two: a lone provider is what the row's title
+// already says (#3902).
+func servesBeside(moved []string, ps []plugin.Provider) []string {
+	var out []string
+	for _, p := range ps {
+		n := strings.TrimSpace(p.Name)
+		if n == "" {
+			n = p.ID
+		}
+		if slices.Contains(moved, p.ID) || slices.ContainsFunc(out, func(o string) bool { return strings.EqualFold(o, n) }) {
+			continue
+		}
+		out = append(out, n)
+	}
+	if len(moved) == 0 && len(out) < 2 {
+		return nil
+	}
+	return out
 }
 
 // npmPlugin is whether npm has the plugin spec's versions: a plugin from a
@@ -404,13 +436,53 @@ func pluginListings(ctx context.Context) []pluginListingJSON {
 		}
 		out = append(out, j)
 	}
-	ns := make([]*plugin.NPM, len(out))
-	for i := range out {
-		ns[i] = out[i].NPM
-	}
 	// at once: a picture still being fetched shows on the next ask
-	npmIcons(ns, 0)
+	listingIcons(out, 0)
 	return out
+}
+
+// pluginAgents are the suggested agent plugins not installed, by name.
+// One installed and turned off is installed: Plugins turns it on.
+func pluginAgents(ctx context.Context) []string {
+	have := map[string]bool{}
+	for _, e := range plugin.Load().Plugins {
+		have[plugin.Name(e.Spec)] = true
+	}
+	out := []string{}
+	for _, l := range plugin.Market(ctx) {
+		if l.Kind == "agent" && !have[l.Package] {
+			out = append(out, l.Name)
+		}
+	}
+	return out
+}
+
+// listingIcons puts each listing's pictures as the page can show them:
+// the one registry.json gives (Kilo Code's https://github.com/Kilo-Org.png)
+// and the one its package.json gives, both kept as a GitHub-tagged
+// plugin's is, in one wait. A bundled icon's name is left as it is; a
+// picture not kept by wait is left out, so the card shows npm's picture
+// or its kind's glyph until the next ask.
+func listingIcons(ls []pluginListingJSON, wait time.Duration) {
+	n := len(ls)
+	said := make([]string, 2*n)
+	for i, l := range ls {
+		if provider.MarketPicture(l.Icon) {
+			said[i] = l.Icon
+		}
+		if l.NPM != nil {
+			said[n+i] = l.NPM.Icon
+		}
+	}
+	got := provider.RepoIcons(said, wait)
+	for i := range ls {
+		if said[i] != "" {
+			ls[i].Icon = got[i]
+		}
+		if ls[i].NPM != nil {
+			ls[i].NPM.Icon = got[n+i]
+		}
+	}
 }
 
 // npmIcons puts the picture each package gives (magpie.icon) as the page
@@ -464,11 +536,7 @@ func pluginMarketState(ctx context.Context, w Windows) pluginMarketJSON {
 		n := info[l.Package]
 		m.Listings = append(m.Listings, pluginListingJSON{Listing: l, NPM: &n})
 	}
-	ns := make([]*plugin.NPM, len(m.Listings))
-	for i := range m.Listings {
-		ns[i] = m.Listings[i].NPM
-	}
-	npmIcons(ns, 3*time.Second)
+	listingIcons(m.Listings, 3*time.Second)
 	for i, e := range m.State.Plugins {
 		if !plugin.IsGit(e.Spec) {
 			m.State.Plugins[i].Latest = info[plugin.Name(e.Spec)].Version
@@ -495,6 +563,11 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 	// suggested, at once, then what npm says of the packages named
 	mux.HandleFunc("GET /api/plugins/listings", func(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, map[string]any{"listings": pluginListings(r.Context())})
+	})
+	// the agents a suggested plugin adds that aren't installed here: the
+	// Agents page's Install another agent says Plugins has them
+	mux.HandleFunc("GET /api/plugins/agents", func(rw http.ResponseWriter, r *http.Request) {
+		writeJSON(rw, pluginAgents(r.Context()))
 	})
 	// repositories on GitHub tagged magpie-plugin: nobody's list, shown
 	// apart as not reviewed, installed from the repository
@@ -733,7 +806,11 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 				fail(rw, err)
 				return
 			}
-			writeJSON(rw, provider.SignInState{Agent: id, State: "done", User: pp.Name})
+			// no account named: the provider's name as its user was taken
+			// for an account's by Hide accounts, and blurred wherever it
+			// showed (lileo0668 on Discord); the page names the sign-in
+			// by its subscription
+			writeJSON(rw, provider.SignInState{Agent: id, State: "done"})
 			return
 		}
 		st, err := provider.StartPluginSignInWith(in.Provider, in.Method, in.Inputs, provider.SignInOptions{Proxy: in.Proxy, User: in.User})
@@ -741,11 +818,7 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, err)
 			return
 		}
-		var failed string
-		if w != nil && !st.Opened {
-			failed = openError(w, st.URL)
-		}
-		writeJSON(rw, signInOpened{st, failed})
+		writeJSON(rw, openSignIn(w, st))
 	})
 }
 

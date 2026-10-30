@@ -117,6 +117,9 @@ type turnRule struct {
 	// hour is what the vendor said it keeps of the conversation for an
 	// hour (Anthropic's 1-hour cache writes), warm past cacheCold (#2302)
 	hour hourCache
+	// cold is how long the vendor that answered last keeps the
+	// conversation cached unread (coldAfter); 0 is cacheCold
+	cold time.Duration
 }
 
 var turnRules = struct {
@@ -303,12 +306,13 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		case g.Classifier == "":
 			c.Error = "the group has no classifier"
 		case ask == nil:
-			c.Error = "nothing to ask the classifier with: this is a classifier's own call"
+			c.Error = "nothing to ask the classifier with: this is a classifier's own call, or Claude Desktop's connection check"
 		case text == "":
 			c.Error = "the message has no words to classify"
 		default:
 			t0 := time.Now()
 			v, cached, err := classify(ask, g.Classifier, intents, prev, effort, text)
+			classifiedFor(g.ID, g.Classifier, err)
 			c.Intent, c.Cached, c.Ms = v.Intent, cached, int(time.Since(t0).Milliseconds())
 			if effort {
 				c.Effort, c.Score = v.Effort, v.Score
@@ -419,7 +423,7 @@ func alsoIDs(m provider.Member) []string {
 
 // ruleAnswered keeps what the vendor counted a conversation's request as,
 // for its next turn's rules to go by.
-func ruleAnswered(key string, u Usage) {
+func ruleAnswered(key string, u Usage, cold time.Duration) {
 	n := u.Input + u.CacheRead + u.CacheWrite
 	if n <= 0 {
 		return
@@ -428,7 +432,7 @@ func ruleAnswered(key string, u Usage) {
 	defer turnRules.Unlock()
 	if tr, ok := turnRules.m[key]; ok {
 		now := ruleClock()
-		tr.input, tr.answered, tr.hour = n, now, tr.hour.after(u, now)
+		tr.input, tr.answered, tr.hour, tr.cold = n, now, tr.hour.after(u, now), cold
 		turnRules.m[key] = tr
 	}
 }
@@ -442,7 +446,8 @@ func ruleAnswered(key string, u Usage) {
 // while the cache is warm the effort only goes up — a hard turn still gets
 // the reasoning it needs, and a conversation pays for at most one miss per
 // level — and a lower pick waits for a turn the cache is lost to anyway:
-// one after cacheCold without an answer (an hour, where the vendor said it
+// one after cacheCold without an answer (tr.cold at the ChatGPT backend,
+// which keeps it longer; an hour, where the vendor said it
 // keeps the conversation that long: tr.hour, #2302), or after the agent
 // compacted the conversation (it is now under half as long as its last
 // request).
@@ -457,7 +462,11 @@ func keepsEffort(tr turnRule, pick string, tokens int, now time.Time) bool {
 	if tr.answered.After(last) {
 		last = tr.answered
 	}
-	if now.Sub(last) > cacheCold && !tr.hour.warm(now) {
+	cold := tr.cold
+	if cold <= 0 {
+		cold = cacheCold
+	}
+	if now.Sub(last) > cold && !tr.hour.warm(now) {
 		return false
 	}
 	if tr.size > 0 && tokens < tr.size/2 {
@@ -747,28 +756,49 @@ func ruleOver(hit *RuleHit, ms []provider.Member, cs []candidate, pl planned, af
 	return cs, pl
 }
 
-// ruleEffort is the reasoning a rule asks its member for (#2633), when c
-// is one of that member's keys or accounts — the outermost group's rule
-// that names one, as the turn's pick is the outermost group's — fitted to
-// the levels c's model has. A model whose levels aren't known is asked as
-// it would be without the rule: magpie can't tell it thinks. "" for none.
-// A rule after it that only fails over (Then) asks nothing of its member.
-func ruleEffort(c candidate, hit *RuleHit, nested []NestedRule) string {
+// ruleEffort is the reasoning a rule asks its request for (#2633), fitted
+// to the levels c's model has: that of the outermost group's rule naming
+// one of c's members, as the turn's pick is the outermost group's. A
+// member the group fails over to is asked it too (#3664): the effort is
+// the turn's decision, so a provider that turns the request away doesn't
+// leave the member it went to instead at the agent's own level — and a
+// rule that names c wins over one it only fails over from. A nested
+// group's rule decides for that group's members only, so a member of the
+// outer group outside it isn't asked its effort (ms are the outer
+// group's, each with the groups it is reached through). A model whose
+// levels aren't known is asked as it would be without the rule: magpie
+// can't tell it thinks. "" for none.
+// A rule after it that only fails over (Then) asks nothing of its own:
+// its member is asked the first rule's, as every other member is.
+func ruleEffort(c candidate, hit *RuleHit, nested []NestedRule, ms []provider.Member) string {
 	hits := []*RuleHit{hit}
 	for _, n := range nested {
 		hits = append(hits, n.Rule)
 	}
-	for _, h := range hits {
-		if h == nil || h.UseEffort == "" || !slices.ContainsFunc(h.members, func(m provider.Member) bool { return ofMember(c, m) }) {
+	within := func(group string) bool {
+		return slices.ContainsFunc(ms, func(m provider.Member) bool { return ofMember(c, m) && slices.Contains(m.Groups(), group) })
+	}
+	asked := "" // the effort of the first rule with one, unless one names c
+	for i, h := range hits {
+		if h == nil || h.UseEffort == "" || i > 0 && !within(nested[i-1].Group) {
 			continue
 		}
-		levels := c.p.Efforts(c.model)
-		if len(levels) == 0 {
-			return ""
+		if asked == "" {
+			asked = h.UseEffort
 		}
-		return fitLevel(h.UseEffort, levels)
+		if slices.ContainsFunc(h.members, func(m provider.Member) bool { return ofMember(c, m) }) {
+			asked = h.UseEffort
+			break
+		}
 	}
-	return ""
+	if asked == "" {
+		return ""
+	}
+	levels := c.p.Efforts(c.model)
+	if len(levels) == 0 {
+		return ""
+	}
+	return fitLevel(asked, levels)
 }
 
 // homeCands sends the keys or accounts of the rule's members as the
@@ -811,7 +841,7 @@ func applyRule(hit *RuleHit, ms []provider.Member, cs []candidate, pl planned) (
 // effort.
 func ofMember(c candidate, m provider.Member) bool {
 	id := m.Provider.ID
-	return c.model == m.Model && c.effort == m.Effort && (c.rest == id || strings.HasPrefix(c.rest, id+"#") || strings.HasPrefix(c.rest, id+"@"))
+	return c.model == m.Model && c.effort == m.Effort && slices.Equal(c.levels, m.Levels) && (c.rest == id || strings.HasPrefix(c.rest, id+"#") || strings.HasPrefix(c.rest, id+"@"))
 }
 
 // membersImageInput is whether a group request may carry images: when a
