@@ -60,12 +60,12 @@ func TestRTKUpgradeAsksForAdmin(t *testing.T) {
 	latestServer(t, "v0.51.0")
 	dir := filepath.Join(h, "Program Files", "WinGet", "Links")
 	ver := filepath.Join(dir, "VERSION")
-	testenv.Program(t, filepath.Join(dir, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", ver))
+	testenv.Program(t, filepath.Join(dir, "rtk"), testenv.Tools(t, strings.ReplaceAll(versionedRTK, "VERSION", ver)))
 	plain := filepath.Join(h, "winget-ran")
 	tools := filepath.Join(h, "tools")
-	testenv.Program(t, filepath.Join(tools, "winget"), `#!/bin/sh
+	testenv.Program(t, filepath.Join(tools, "winget"), testenv.Tools(t, `#!/bin/sh
 : > "`+plain+`"; echo 0.51.0 > "`+ver+`"; echo "Successfully installed"
-`)
+`))
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+tools)
 	up := upgraderOf
 	upgraderOf = func(string) []string {

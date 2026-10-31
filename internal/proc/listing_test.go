@@ -94,6 +94,28 @@ func TestUnreadableFolderMayHoldIt(t *testing.T) {
 	}
 }
 
+// A filesystem can keep the same directory timestamp across a quick
+// install. Tests disable caching so newly written fixtures are visible.
+func TestCommandInstalledWithUnchangedDirectoryTime(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	lookWindowFor(t, 0)
+	before, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Look("magpie-fake-agent"); err == nil {
+		t.Fatal("found a command before it was installed")
+	}
+	want := installTool(t, dir, "magpie-fake-agent")
+	if err := os.Chtimes(dir, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Look("magpie-fake-agent"); err != nil || got != want {
+		t.Fatalf("installed command = %q, %v; want %q", got, err, want)
+	}
+}
+
 func joinList(dirs []string) string {
 	s := ""
 	for i, d := range dirs {

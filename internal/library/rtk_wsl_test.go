@@ -35,10 +35,10 @@ func fakeDistroRTK(t *testing.T, home string) *sync.Map {
 			if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
 				return nil, err
 			}
-			return []byte("installed\n"), os.WriteFile(bin, []byte(fakeRTK), 0o755)
+			return []byte("installed\n"), os.WriteFile(bin, []byte(testenv.Tools(t, fakeRTK)), 0o755)
 		}
 		cmd := exec.Command("/bin/sh", "-c", args[5])
-		cmd.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+		cmd.Env = []string{"HOME=" + home, "PATH=" + testenv.ToolDir(t, "sh", "head", "sed", "grep", "dirname")}
 		return cmd.Output()
 	}
 	forget := func() {
@@ -143,7 +143,7 @@ func TestRTKWSLAsleep(t *testing.T) {
 	h := wslSandbox(t)
 	ran := fakeDistroRTK(t, h)
 	const distro = "Ubuntu-24.04"
-	testenv.Program(t, filepath.Join(h, ".local", "bin", "rtk"), fakeRTK)
+	testenv.Program(t, filepath.Join(h, ".local", "bin", "rtk"), testenv.Tools(t, fakeRTK))
 	// seen while it ran, then stopped
 	if a := rtkRow(t, ReadRTK(), wslClaude); a.Asleep {
 		t.Fatalf("running, yet asleep: %+v", a)

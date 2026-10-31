@@ -97,7 +97,7 @@ func listed(dir string) (map[string]bool, bool) {
 	if err != nil || !st.IsDir() {
 		return nil, false
 	}
-	if l != nil && l.names != nil && l.mod.Equal(st.ModTime()) {
+	if l != nil && lookWindow() > 0 && l.names != nil && l.mod.Equal(st.ModTime()) {
 		listings.Lock()
 		l.checked = now
 		listings.Unlock()

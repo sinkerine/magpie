@@ -34,7 +34,7 @@ func TestCheckLatestNeverAsksThePackageManager(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		write(t, filepath.Join(bin, "rtk.exe"), "")
 	} else {
-		testenv.Program(t, filepath.Join(bin, "rtk"), "#!/bin/sh\ncase \"$1\" in\n--version) echo 'rtk 0.50.0' ;;\nesac\nexit 0\n")
+		testenv.Program(t, filepath.Join(bin, "rtk"), testenv.Tools(t, "#!/bin/sh\ncase \"$1\" in\n--version) echo 'rtk 0.50.0' ;;\nesac\nexit 0\n"))
 	}
 	t.Setenv("PATH", bin)
 	up := upgraderOf

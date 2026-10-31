@@ -139,7 +139,7 @@ func TestRTKWindowsStandaloneAsksWinget(t *testing.T) {
 	}
 
 	// winget runs out of time: no answer either
-	testenv.Program(t, filepath.Join(h, "tools", "winget"), "#!/bin/sh\nexec sleep 5\n")
+	testenv.Program(t, filepath.Join(h, "tools", "winget"), testenv.Tools(t, "#!/bin/sh\nexec sleep 5\n"))
 	old := wingetListTimeout
 	wingetListTimeout = 200 * time.Millisecond
 	t.Cleanup(func() { wingetListTimeout = old })
@@ -180,7 +180,7 @@ func TestRTKWindowsReleaseReplacesBinary(t *testing.T) {
 	dir := filepath.Join(h, ".local", "bin")
 	bin := filepath.Join(dir, "rtk")
 	write(t, filepath.Join(dir, "VERSION"), "0.9.0")
-	testenv.Program(t, bin, strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION")))
+	testenv.Program(t, bin, testenv.Tools(t, strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION"))))
 	t.Setenv("PATH", dir)
 	// the action rtkUpgrader gives the standalone rtk.exe: this runnable rtk
 	// stands in for one, since a fake here is a shell script (rtkUpgrader's
@@ -257,7 +257,7 @@ func TestRTKWindowsReleaseUpgradeRunsTheInstall(t *testing.T) {
 	// rtk is found on the PATH first (rtkPath), which is how a hand-placed
 	// .local\bin\rtk.exe on it is found on the machine of the report
 	const script = "#!/bin/sh\nexit 2\n"
-	testenv.Program(t, filepath.Join(h, "bin", "rtk"), script)
+	testenv.Program(t, filepath.Join(h, "bin", "rtk"), testenv.Tools(t, script))
 	write(t, filepath.Join(h, "bin", "rtk.exe"), "rtk")
 	bin := rtkPath()
 	if bin == "" {

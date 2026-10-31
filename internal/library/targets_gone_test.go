@@ -84,7 +84,7 @@ func TestRTKLeavesGoneAgentsOut(t *testing.T) {
 	}
 	h := sandbox(t)
 	bin := filepath.Join(h, "bin")
-	testenv.Program(t, filepath.Join(bin, "rtk"), fakeRTK)
+	testenv.Program(t, filepath.Join(bin, "rtk"), testenv.Tools(t, fakeRTK))
 	for _, f := range []string{"codex", "codex.exe"} {
 		if err := os.Remove(filepath.Join(bin, f)); err != nil {
 			t.Fatal(err)

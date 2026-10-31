@@ -31,7 +31,7 @@ func TestNPMUpdateNeedsAdmin(t *testing.T) {
 	prefix := filepath.Join(tmp, "node")
 	verFile := filepath.Join(tmp, "version")
 	os.WriteFile(verFile, []byte("0.60.0\n"), 0o644)
-	file(t, filepath.Join(prefix, "lib/node_modules/@google/gemini-cli/bundle/gemini.js"), "#!/bin/sh\n/bin/cat "+verFile+"\n")
+	file(t, filepath.Join(prefix, "lib/node_modules/@google/gemini-cli/bundle/gemini.js"), "#!/bin/sh\n{{cat}} "+verFile+"\n")
 	file(t, filepath.Join(prefix, "bin/npm"), "#!/bin/sh\nexit 1\n")
 	link(t, "../lib/node_modules/@google/gemini-cli/bundle/gemini.js", filepath.Join(prefix, "bin/gemini"))
 	t.Setenv("PATH", filepath.Join(prefix, "bin"))

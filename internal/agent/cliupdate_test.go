@@ -55,7 +55,7 @@ func TestInstalledVersion(t *testing.T) {
 	}
 	p := filepath.Join(bin, "pi")
 	for _, c := range []struct{ out, want string }{{"0.98.2", "0.98.2"}, {"pi 0.99.0\n", "0.99.0"}} {
-		testenv.Program(t, p, "#!/bin/sh\necho '"+c.out+"'\n")
+		testenv.Program(t, p, testenv.Tools(t, "#!/bin/sh\necho '"+c.out+"'\n"))
 		if v := a.InstalledVersion(); v != c.want {
 			t.Errorf("%q: %q", c.out, v)
 		}
@@ -90,7 +90,7 @@ func file(t *testing.T, path, body string) string {
 		t.Fatal(err)
 	}
 	if strings.HasPrefix(body, "#!") {
-		testenv.Program(t, path, body)
+		testenv.Program(t, path, testenv.Tools(t, body))
 	} else if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestUpdateCLI(t *testing.T) {
 	prefix := filepath.Join(tmp, "node")
 	verFile := filepath.Join(tmp, "version")
 	os.WriteFile(verFile, []byte("0.60.0\n"), 0o644)
-	file(t, filepath.Join(prefix, "lib/node_modules/@google/gemini-cli/bundle/gemini.js"), "#!/bin/sh\n/bin/cat "+verFile+"\n")
+	file(t, filepath.Join(prefix, "lib/node_modules/@google/gemini-cli/bundle/gemini.js"), "#!/bin/sh\n{{cat}} "+verFile+"\n")
 	file(t, filepath.Join(prefix, "bin/npm"), "#!/bin/sh\nexit 1\n")
 	link(t, "../lib/node_modules/@google/gemini-cli/bundle/gemini.js", filepath.Join(prefix, "bin/gemini"))
 	t.Setenv("PATH", filepath.Join(prefix, "bin"))
@@ -377,7 +377,7 @@ func TestUpdateCLIOpenCodeTakesVersion(t *testing.T) {
 	tmp, _ := filepath.EvalSymlinks(t.TempDir())
 	verFile := filepath.Join(tmp, "version")
 	os.WriteFile(verFile, []byte("1.19.2\n"), 0o644)
-	oc := file(t, filepath.Join(tmp, "home/.opencode/bin/opencode"), "#!/bin/sh\n/bin/cat "+verFile+"\n")
+	oc := file(t, filepath.Join(tmp, "home/.opencode/bin/opencode"), "#!/bin/sh\n{{cat}} "+verFile+"\n")
 	bin := link(t, oc, filepath.Join(tmp, "bin/opencode"))
 	t.Setenv("PATH", filepath.Dir(bin))
 
@@ -423,7 +423,7 @@ func TestUpdateCLIOpenCodeByNpmTakesNoVersion(t *testing.T) {
 	prefix := filepath.Join(tmp, "node")
 	verFile := filepath.Join(tmp, "version")
 	os.WriteFile(verFile, []byte("1.19.2\n"), 0o644)
-	file(t, filepath.Join(prefix, "lib/node_modules/opencode-ai/bin/opencode"), "#!/bin/sh\n/bin/cat "+verFile+"\n")
+	file(t, filepath.Join(prefix, "lib/node_modules/opencode-ai/bin/opencode"), "#!/bin/sh\n{{cat}} "+verFile+"\n")
 	file(t, filepath.Join(prefix, "bin/npm"), "#!/bin/sh\nexit 1\n")
 	link(t, "../lib/node_modules/opencode-ai/bin/opencode", filepath.Join(prefix, "bin/opencode"))
 	t.Setenv("PATH", filepath.Join(prefix, "bin"))

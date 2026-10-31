@@ -24,6 +24,9 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               go_1_26
+              bun
+              bash
+              coreutils
               gnumake
               git
               pkg-config

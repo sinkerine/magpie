@@ -24,8 +24,8 @@ shift 2
 [ "$*" = "--agent droid" ] || { echo "unknown: $*" >&2; exit 2; }
 echo "$FACTORY_HOME_OVERRIDE" > "$HOME/given"
 d="${FACTORY_HOME_OVERRIDE:-$HOME}/.factory"
-/bin/mkdir -p "$d"
-/bin/cat > "$d/hooks.json" <<'J'
+{{mkdir}} -p "$d"
+{{cat}} > "$d/hooks.json" <<'J'
 {
   "PreToolUse": [
     {
@@ -65,7 +65,7 @@ func TestRTKDroid(t *testing.T) {
 	}
 	h := sandbox(t)
 	bin := filepath.Join(h, "bin")
-	testenv.Program(t, filepath.Join(bin, "rtk"), fakeRTKDroid)
+	testenv.Program(t, filepath.Join(bin, "rtk"), testenv.Tools(t, fakeRTKDroid))
 	holdCLI(t, h, "droid")
 	t.Setenv("PATH", bin)
 	for _, c := range []struct{ name, override string }{

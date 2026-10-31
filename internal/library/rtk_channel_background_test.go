@@ -125,13 +125,13 @@ func TestRTKCheckLatestDoesNotWaitForThePackageManager(t *testing.T) {
 	// an rtk out of date, installed through winget, and a winget as slow as
 	// the real one: `winget show` refreshes its sources
 	links := filepath.Join(h, "AppData", "Local", "Microsoft", "WinGet", "Links")
-	testenv.Program(t, filepath.Join(links, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(links, "VERSION")))
+	testenv.Program(t, filepath.Join(links, "rtk"), testenv.Tools(t, strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(links, "VERSION"))))
 	write(t, filepath.Join(links, "VERSION"), "0.50.0")
 	tools := filepath.Join(h, "tools")
-	testenv.Program(t, filepath.Join(tools, "winget"), `#!/bin/sh
-/bin/sleep 5
+	testenv.Program(t, filepath.Join(tools, "winget"), testenv.Tools(t, `#!/bin/sh
+{{sleep}} 5
 printf 'Found RTK [rtk-ai.rtk]\r\nVersion: 0.50.0\r\n'
-`)
+`))
 	t.Setenv("PATH", links+string(os.PathListSeparator)+tools)
 	up := upgraderOf
 	upgraderOf = func(string) []string { return []string{"winget", "show", "--id", "rtk-ai.rtk", "--exact"} }

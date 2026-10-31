@@ -34,6 +34,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yetone/magpie/internal/proc"
 	"golang.org/x/sys/unix"
 )
 
@@ -180,7 +181,7 @@ func (s *shim) start(path string, args []string) error {
 	}
 	// wide, so a line of Claude Code's screen is a line
 	_ = unix.IoctlSetWinsize(int(tty.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Row: 50, Col: 200})
-	cmd := exec.Command(path, args...)
+	cmd := proc.Command(path, args...)
 	cmd.Env = childEnv()
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = tty, tty, tty
 	// its own session, the terminal its controlling one: the shim ending

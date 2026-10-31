@@ -22,9 +22,9 @@ esac
 shift 2
 [ "$*" = "--agent antigravity" ] || { echo "unknown: $*" >&2; exit 2; }
 d="$HOME/.gemini/config/plugins/rtk"
-/bin/mkdir -p "$d/rules"
+{{mkdir}} -p "$d/rules"
 echo "rtk rules" > "$d/rules/AGENTS.md"
-/bin/cat > "$d/hooks.json" <<'J'
+{{cat}} > "$d/hooks.json" <<'J'
 {
   "rtk-rewrite": {
     "enabled": true,
@@ -56,7 +56,7 @@ func TestRTKAntigravity(t *testing.T) {
 	}
 	h := sandbox(t)
 	bin := filepath.Join(h, "bin")
-	testenv.Program(t, filepath.Join(bin, "rtk"), fakeRTKAgy)
+	testenv.Program(t, filepath.Join(bin, "rtk"), testenv.Tools(t, fakeRTKAgy))
 	t.Setenv("PATH", bin)
 	// Antigravity CLI is here by its folder
 	write(t, filepath.Join(h, ".gemini", "antigravity-cli", "settings.json"), "{}")

@@ -49,12 +49,12 @@ func TestRTKCargoBesideRTK(t *testing.T) {
 	h := sandbox(t)
 	latestServer(t, "v1.1.0")
 	dir := filepath.Join(h, ".cargo", "bin")
-	testenv.Program(t, filepath.Join(dir, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION")))
+	testenv.Program(t, filepath.Join(dir, "rtk"), testenv.Tools(t, strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION"))))
 	write(t, filepath.Join(dir, "VERSION"), "1.0.0")
-	testenv.Program(t, filepath.Join(dir, "cargo"), `#!/bin/sh
+	testenv.Program(t, filepath.Join(dir, "cargo"), testenv.Tools(t, `#!/bin/sh
 [ "$*" = "install --git https://github.com/rtk-ai/rtk --branch master rtk --force" ] || exit 2
 echo 1.1.0 > "`+filepath.Join(dir, "VERSION")+`"
-`)
+`))
 	t.Setenv("PATH", filepath.Join(h, "bin")) // no cargo, no rtk
 
 	v := ReadRTK()
@@ -78,7 +78,7 @@ func TestRTKCargoMissingSaysSo(t *testing.T) {
 	h := sandbox(t)
 	latestServer(t, "v1.1.0")
 	dir := filepath.Join(h, ".cargo", "bin")
-	testenv.Program(t, filepath.Join(dir, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION")))
+	testenv.Program(t, filepath.Join(dir, "rtk"), testenv.Tools(t, strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION"))))
 	write(t, filepath.Join(dir, "VERSION"), "1.0.0")
 	t.Setenv("PATH", filepath.Join(h, "bin"))
 
@@ -102,9 +102,9 @@ func TestRTKCargoHome(t *testing.T) {
 	ch := filepath.Join(h, "Rust", ".cargo")
 	t.Setenv("CARGO_HOME", ch)
 	dir := filepath.Join(ch, "bin")
-	testenv.Program(t, filepath.Join(dir, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION")))
+	testenv.Program(t, filepath.Join(dir, "rtk"), testenv.Tools(t, strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION"))))
 	write(t, filepath.Join(dir, "VERSION"), "1.0.0")
-	testenv.Program(t, filepath.Join(dir, "cargo"), "#!/bin/sh\n")
+	testenv.Program(t, filepath.Join(dir, "cargo"), testenv.Tools(t, "#!/bin/sh\n"))
 	t.Setenv("PATH", filepath.Join(h, "bin"))
 
 	if p := rtkPath(); p != filepath.Join(dir, "rtk") {

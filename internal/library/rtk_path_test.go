@@ -20,11 +20,11 @@ import (
 func TestRTKOffPath(t *testing.T) {
 	h := sandbox(t)
 	local := filepath.Join(h, ".local", "bin")
-	testenv.Program(t, filepath.Join(local, "rtk"), fakeRTK)
+	testenv.Program(t, filepath.Join(local, "rtk"), testenv.Tools(t, fakeRTK))
 	tools := filepath.Join(h, "tools")
-	testenv.Program(t, filepath.Join(tools, "curl"), "#!/bin/sh\n")
+	testenv.Program(t, filepath.Join(tools, "curl"), testenv.Tools(t, "#!/bin/sh\n"))
 	// Claude Code's CLI on this PATH too: its folder alone is gone (#2254)
-	testenv.Program(t, filepath.Join(tools, "claude"), "#!/bin/sh\n")
+	testenv.Program(t, filepath.Join(tools, "claude"), testenv.Tools(t, "#!/bin/sh\n"))
 	write(t, filepath.Join(tools, "claude.exe"), "")
 	t.Setenv("PATH", tools)
 

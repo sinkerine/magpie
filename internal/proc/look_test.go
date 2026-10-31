@@ -38,15 +38,19 @@ func lookWindowFor(t *testing.T, d time.Duration) {
 func TestLookPathAsksOnceWhileFoldersAreUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PATH", dir)
-	// within the app's window, and past it with the folders unchanged
+	// The app caches unchanged folders; tests can disable the cache.
 	for _, window := range []time.Duration{lookFresh, 0} {
 		lookWindowFor(t, window)
 		asks := 0
 		for i := 0; i < 300; i++ {
 			looked("look\x00omp", func() lookAnswer { asks++; return lookAnswer{} })
 		}
-		if asks != 1 {
-			t.Fatalf("window %v: 300 lookups of one command asked %d times, want 1", window, asks)
+		want := 1
+		if window == 0 {
+			want = 300
+		}
+		if asks != want {
+			t.Fatalf("window %v: 300 lookups of one command asked %d times, want %d", window, asks, want)
 		}
 	}
 }

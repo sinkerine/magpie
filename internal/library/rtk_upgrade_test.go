@@ -18,7 +18,7 @@ import (
 // two days of savings.
 const versionedRTK = `#!/bin/sh
 case "$1" in
---version) echo "rtk $(/bin/cat "VERSION")"; exit 0 ;;
+--version) echo "rtk $({{cat}} "VERSION")"; exit 0 ;;
 gain) echo '{"summary":{"total_commands":5,"total_input":1000,"total_saved":800,"avg_savings_pct":80},"daily":[
  {"date":"2026-09-02","commands":2,"input_tokens":600,"output_tokens":100,"saved_tokens":500,"savings_pct":83.3},
  {"date":"2026-09-01","commands":3,"input_tokens":400,"output_tokens":100,"saved_tokens":300,"savings_pct":75}]}'; exit 0 ;;
@@ -67,7 +67,7 @@ func TestRTKUpgradeBrew(t *testing.T) {
 	h := sandbox(t)
 	latestServer(t, "v0.50.0")
 	cellar := filepath.Join(h, "brew", "Cellar", "rtk", "0.28.2", "bin")
-	testenv.Program(t, filepath.Join(cellar, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(cellar, "VERSION")))
+	testenv.Program(t, filepath.Join(cellar, "rtk"), testenv.Tools(t, strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(cellar, "VERSION"))))
 	write(t, filepath.Join(cellar, "VERSION"), "0.28.2")
 	bin := filepath.Join(h, "brew", "bin")
 	os.MkdirAll(bin, 0o755)
@@ -75,10 +75,10 @@ func TestRTKUpgradeBrew(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Homebrew so far has 0.49.0
-	testenv.Program(t, filepath.Join(bin, "brew"), `#!/bin/sh
+	testenv.Program(t, filepath.Join(bin, "brew"), testenv.Tools(t, `#!/bin/sh
 [ "$*" = "upgrade rtk" ] || exit 2
 echo 0.49.0 > "`+filepath.Join(cellar, "VERSION")+`"
-`)
+`))
 	t.Setenv("PATH", bin)
 
 	v := ReadRTK()
@@ -118,13 +118,13 @@ func TestRTKUpgradeScript(t *testing.T) {
 	h := sandbox(t)
 	latestServer(t, "v0.50.0")
 	dir := filepath.Join(h, ".local", "bin")
-	testenv.Program(t, filepath.Join(dir, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION")))
+	testenv.Program(t, filepath.Join(dir, "rtk"), testenv.Tools(t, strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION"))))
 	write(t, filepath.Join(dir, "VERSION"), "0.40.1")
 	tools := filepath.Join(h, "tools")
 	// curl hands over an installer that puts 0.50.0 in RTK_INSTALL_DIR
-	testenv.Program(t, filepath.Join(tools, "curl"), `#!/bin/sh
+	testenv.Program(t, filepath.Join(tools, "curl"), testenv.Tools(t, `#!/bin/sh
 echo 'echo 0.50.0 > "$RTK_INSTALL_DIR/VERSION"'
-`)
+`))
 	t.Setenv("PATH", tools+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin")
 
 	v := ReadRTK()
@@ -204,24 +204,24 @@ func TestRTKWaitsForWinget(t *testing.T) {
 	h := sandbox(t)
 	latestServer(t, "v0.51.0")
 	links := filepath.Join(h, "AppData", "Local", "Microsoft", "WinGet", "Links")
-	testenv.Program(t, filepath.Join(links, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(links, "VERSION")))
+	testenv.Program(t, filepath.Join(links, "rtk"), testenv.Tools(t, strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(links, "VERSION"))))
 	write(t, filepath.Join(links, "VERSION"), "0.50.0")
 	has, broken := filepath.Join(h, "winget-has"), filepath.Join(h, "winget-broken")
 	write(t, has, "0.50.0")
 	tools := filepath.Join(h, "tools")
 	// winget show, as Windows in Chinese prints it; winget upgrade installs
 	// what it has, when that is newer, and says when it isn't
-	testenv.Program(t, filepath.Join(tools, "winget"), `#!/bin/sh
+	testenv.Program(t, filepath.Join(tools, "winget"), testenv.Tools(t, `#!/bin/sh
 [ -e "`+broken+`" ] && { echo "Failed when searching source: winget"; exit 1; }
-v=$(/bin/cat "`+has+`")
+v=$({{cat}} "`+has+`")
 case "$1" in
 show) printf '已找到 RTK [rtk-ai.rtk]\r\n版本: %s\r\n发布者: rtk-ai\r\n描述: RTK 0.99.0 compatible\r\n' "$v" ;;
 upgrade)
-  if [ "$v" = "$(/bin/cat "`+filepath.Join(links, "VERSION")+`")" ]; then echo "No available upgrade found."; exit 0; fi
+  if [ "$v" = "$({{cat}} "`+filepath.Join(links, "VERSION")+`")" ]; then echo "No available upgrade found."; exit 0; fi
   echo "$v" > "`+filepath.Join(links, "VERSION")+`"; echo "Successfully installed" ;;
 *) exit 2 ;;
 esac
-`)
+`))
 	t.Setenv("PATH", links+string(os.PathListSeparator)+tools)
 	up := upgraderOf
 	upgraderOf = func(string) []string {
@@ -319,15 +319,15 @@ func TestRTKUpgradeCargoNamesThePackage(t *testing.T) {
 	h := sandbox(t)
 	latestServer(t, "v0.50.0")
 	dir := filepath.Join(h, ".cargo", "bin")
-	testenv.Program(t, filepath.Join(dir, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION")))
+	testenv.Program(t, filepath.Join(dir, "rtk"), testenv.Tools(t, strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION"))))
 	write(t, filepath.Join(dir, "VERSION"), "0.40.1")
-	testenv.Program(t, filepath.Join(dir, "cargo"), `#!/bin/sh
+	testenv.Program(t, filepath.Join(dir, "cargo"), testenv.Tools(t, `#!/bin/sh
 [ "$*" = "install --git https://github.com/rtk-ai/rtk --branch master rtk --force" ] || exit 2
 case " $* " in
 *" rtk "*) echo 0.50.0 > "`+filepath.Join(dir, "VERSION")+`" ;;
 *) echo "error: multiple packages with binaries found: rtk, rtk-proxy." >&2; exit 101 ;;
 esac
-`)
+`))
 	t.Setenv("PATH", dir)
 
 	v := ReadRTK()

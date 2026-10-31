@@ -20,13 +20,13 @@ func wingetOn(t *testing.T, h, list string, code int, records func() ([]string, 
 	t.Helper()
 	tools := filepath.Join(h, "tools")
 	ran := filepath.Join(h, "winget-ran")
-	testenv.Program(t, filepath.Join(tools, "winget"), `#!/bin/sh
+	testenv.Program(t, filepath.Join(tools, "winget"), testenv.Tools(t, `#!/bin/sh
 echo "$*" >> "`+ran+`"
 case "$1" in
 list) printf '`+list+`'; exit `+strconv.Itoa(code)+` ;;
 esac
 exit 2
-`)
+`))
 	t.Setenv("PATH", os.Getenv("PATH")+string(os.PathListSeparator)+tools)
 	win, rec := rtkOnWindows, wingetRecords
 	rtkOnWindows, wingetRecords = true, records
@@ -73,7 +73,7 @@ func TestRTKWingetCustomLocation(t *testing.T) {
 	}
 	h := sandbox(t)
 	folder := filepath.Join(h, "codes", "tools", "rtk")
-	testenv.Program(t, filepath.Join(folder, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(folder, "VERSION")))
+	testenv.Program(t, filepath.Join(folder, "rtk"), testenv.Tools(t, strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(folder, "VERSION"))))
 	write(t, filepath.Join(folder, "VERSION"), "0.50.0")
 	t.Setenv("PATH", folder)
 	// the record, as Windows has it: InstallLocation D:\codes\tools\rtk,
@@ -99,7 +99,7 @@ func TestRTKWingetRecordElsewhere(t *testing.T) {
 	}
 	h := sandbox(t)
 	bin := filepath.Join(h, "codes", "rtk", "rtk")
-	testenv.Program(t, bin, "#!/bin/sh\n")
+	testenv.Program(t, bin, testenv.Tools(t, "#!/bin/sh\n"))
 	// a sibling folder whose name starts the same isn't inside it either
 	ran := wingetOn(t, h, wingetListed, 0, func() ([]string, bool) {
 		return []string{filepath.Join(h, "codes", "rt"), filepath.Join(h, "tools-rtk")}, true
@@ -120,7 +120,7 @@ func TestRTKWingetList(t *testing.T) {
 	}
 	h := sandbox(t)
 	bin := filepath.Join(h, "codes", "rtk", "rtk")
-	testenv.Program(t, bin, "#!/bin/sh\n")
+	testenv.Program(t, bin, testenv.Tools(t, "#!/bin/sh\n"))
 	none := func() ([]string, bool) { return nil, false }
 
 	ran := wingetOn(t, h, wingetListed, 0, none)
@@ -157,7 +157,7 @@ func TestRTKWingetList(t *testing.T) {
 
 	// a winget that doesn't answer in time isn't taken as yes
 	tools := filepath.Join(h, "tools")
-	testenv.Program(t, filepath.Join(tools, "winget"), "#!/bin/sh\nexec sleep 5\n")
+	testenv.Program(t, filepath.Join(tools, "winget"), testenv.Tools(t, "#!/bin/sh\nexec sleep 5\n"))
 	old := wingetListTimeout
 	wingetListTimeout = 200 * time.Millisecond
 	t.Cleanup(func() { wingetListTimeout = old })
@@ -179,7 +179,7 @@ func TestRTKWingetLink(t *testing.T) {
 	}
 	h := sandbox(t)
 	real := filepath.Join(h, "tools-1527", "rtk", "rtk")
-	testenv.Program(t, real, "#!/bin/sh\n")
+	testenv.Program(t, real, testenv.Tools(t, "#!/bin/sh\n"))
 	links := filepath.Join(h, "AppData", "Local", "Microsoft", "WinGet", "Links")
 	os.MkdirAll(links, 0o755)
 	if err := os.Symlink(real, filepath.Join(links, "rtk")); err != nil {

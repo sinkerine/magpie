@@ -45,14 +45,14 @@ func fakeBrew(t *testing.T, h, info string, code int, install string) (asked fun
 	write(t, filepath.Join(h, "info.txt"), info)
 	write(t, filepath.Join(h, "install.txt"), install)
 	count := filepath.Join(h, "asked")
-	testenv.Program(t, filepath.Join(bin, "brew"), `#!/bin/sh
+	testenv.Program(t, filepath.Join(bin, "brew"), testenv.Tools(t, `#!/bin/sh
 case "$*" in
-"info rtk") echo x >> "`+count+`"; /bin/cat "`+filepath.Join(h, "info.txt")+`"; exit `+itoa(code)+` ;;
-"install rtk") /bin/cat "`+filepath.Join(h, "install.txt")+`"; exit 1 ;;
+"info rtk") echo x >> "`+count+`"; {{cat}} "`+filepath.Join(h, "info.txt")+`"; exit `+itoa(code)+` ;;
+"install rtk") {{cat}} "`+filepath.Join(h, "install.txt")+`"; exit 1 ;;
 esac
 exit 2
-`)
-	testenv.Program(t, filepath.Join(bin, "curl"), "#!/bin/sh\nexit 1\n")
+`))
+	testenv.Program(t, filepath.Join(bin, "curl"), testenv.Tools(t, "#!/bin/sh\nexit 1\n"))
 	forgetBottled := func() {
 		bottled.Lock()
 		bottled.brew, bottled.ok, bottled.at = "", false, time.Time{}
@@ -117,7 +117,7 @@ func TestRTKBrewInfoThatHangs(t *testing.T) {
 	}
 	h := sandbox(t)
 	fakeBrew(t, h, "", 0, "")
-	testenv.Program(t, filepath.Join(h, "bin", "brew"), "#!/bin/sh\nexec /bin/sleep 60\n")
+	testenv.Program(t, filepath.Join(h, "bin", "brew"), testenv.Tools(t, "#!/bin/sh\nexec {{sleep}} 60\n"))
 	w := brewInfoWait
 	brewInfoWait = 300 * time.Millisecond
 	t.Cleanup(func() { brewInfoWait = w })

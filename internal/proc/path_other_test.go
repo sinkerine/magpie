@@ -336,7 +336,7 @@ func fakeShells(t *testing.T) (home string) {
 	os.MkdirAll(bin, 0o755)
 	out := filepath.Join(home, "fish.out")
 	os.WriteFile(out, []byte(fishProbeOutput()), 0o644)
-	testenv.Program(t, filepath.Join(bin, "fish"), "#!/bin/sh\ncat '"+out+"'\n")
+	testenv.Program(t, filepath.Join(bin, "fish"), testenv.Tools(t, "#!/bin/sh\n{{cat}} '"+out+"'\n"))
 	old := shellDirs
 	shellDirs = func() []string { return []string{bin} }
 	t.Cleanup(func() { shellDirs = old })

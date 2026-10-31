@@ -76,6 +76,9 @@ func Forget() {
 
 // looked is the answer kept for key, or ask's, kept.
 func looked(key string, ask func() lookAnswer) lookAnswer {
+	if lookWindow() == 0 {
+		return ask()
+	}
 	env := os.Getenv("PATH") + "\x00" + os.Getenv("PATHEXT")
 	looks.Lock()
 	if looks.env != env || looks.checked.IsZero() || time.Since(looks.checked) >= lookWindow() {

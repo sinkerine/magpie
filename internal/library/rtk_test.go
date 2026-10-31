@@ -26,7 +26,7 @@ esac
 shift 2
 case "$*" in
 "--auto-patch") claude ;;
-"--opencode --auto-patch") claude; /bin/mkdir -p "$XDG_CONFIG_HOME/opencode/plugins"; echo x > "$XDG_CONFIG_HOME/opencode/plugins/rtk.ts" ;;
+"--opencode --auto-patch") claude; {{mkdir}} -p "$XDG_CONFIG_HOME/opencode/plugins"; echo x > "$XDG_CONFIG_HOME/opencode/plugins/rtk.ts" ;;
 "--agent cursor --auto-patch") claude; echo '{"hooks":{"preToolUse":[{"command":"rtk hook cursor"}]}}' > "$HOME/.cursor/hooks.json" ;;
 *) echo "unknown: $*" >&2; exit 2 ;;
 esac
@@ -38,7 +38,7 @@ func TestRTK(t *testing.T) {
 	}
 	h := sandbox(t)
 	bin := filepath.Join(h, "bin")
-	testenv.Program(t, filepath.Join(bin, "rtk"), fakeRTK)
+	testenv.Program(t, filepath.Join(bin, "rtk"), testenv.Tools(t, fakeRTK))
 	t.Setenv("PATH", bin)
 	state := func() map[string]bool {
 		m := map[string]bool{}
@@ -317,7 +317,7 @@ case "$1" in
 esac
 shift 2
 case "$*" in
-"--opencode --auto-patch") /bin/mkdir -p "$XDG_CONFIG_HOME/opencode/plugins"; /bin/cat > "$XDG_CONFIG_HOME/opencode/plugins/rtk.ts" <<'PLUGIN'
+"--opencode --auto-patch") {{mkdir}} -p "$XDG_CONFIG_HOME/opencode/plugins"; {{cat}} > "$XDG_CONFIG_HOME/opencode/plugins/rtk.ts" <<'PLUGIN'
 ` + plugin + `
 PLUGIN
 ;;
@@ -342,11 +342,11 @@ func TestRTKOpenCode2(t *testing.T) {
 	bin := filepath.Join(h, "bin")
 	rtk := func(version string) {
 		t.Helper()
-		testenv.Program(t, filepath.Join(bin, "rtk"), openCodeRTK(version))
+		testenv.Program(t, filepath.Join(bin, "rtk"), testenv.Tools(t, openCodeRTK(version)))
 	}
 	opencode := func(version string) {
 		t.Helper()
-		testenv.Program(t, filepath.Join(bin, "opencode"), "#!/bin/sh\necho "+version+"\n")
+		testenv.Program(t, filepath.Join(bin, "opencode"), testenv.Tools(t, "#!/bin/sh\necho "+version+"\n"))
 	}
 	t.Setenv("PATH", bin)
 	plugin := filepath.Join(h, ".config", "opencode", "plugins", "rtk.ts")
@@ -471,7 +471,7 @@ func TestRTKCodexOld(t *testing.T) {
 	bin := filepath.Join(h, "bin")
 	rtk := func(version, init string) {
 		t.Helper()
-		testenv.Program(t, filepath.Join(bin, "rtk"), "#!/bin/sh\ncase \"$1\" in\n--version) echo \"rtk "+version+"\"; exit 0 ;;\ngain) exit 1 ;;\nesac\n"+init+"\n")
+		testenv.Program(t, filepath.Join(bin, "rtk"), testenv.Tools(t, "#!/bin/sh\ncase \"$1\" in\n--version) echo \"rtk "+version+"\"; exit 0 ;;\ngain) exit 1 ;;\nesac\n"+init+"\n"))
 	}
 	t.Setenv("PATH", bin)
 	write(t, filepath.Join(codex, "config.toml"), "")
@@ -525,7 +525,7 @@ func TestRTKGainRead(t *testing.T) {
 	bin := filepath.Join(h, "bin")
 	gain := func(body string) {
 		t.Helper()
-		testenv.Program(t, filepath.Join(bin, "rtk"), "#!/bin/sh\ncase \"$1\" in\n--version) echo 'rtk 0.51.0'; exit 0 ;;\ngain) "+body+" ;;\nesac\nexit 2\n")
+		testenv.Program(t, filepath.Join(bin, "rtk"), testenv.Tools(t, "#!/bin/sh\ncase \"$1\" in\n--version) echo 'rtk 0.51.0'; exit 0 ;;\ngain) "+body+" ;;\nesac\nexit 2\n"))
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin")
 	summary := `{"summary":{"total_commands":42,"total_input":9000,"total_output":1000,"total_saved":8000,"avg_savings_pct":88.9,"total_time_ms":10,"avg_time_ms":0},"daily":[{"date":"2026-10-03","commands":42,"input_tokens":9000,"output_tokens":1000,"saved_tokens":8000,"savings_pct":88.9,"total_time_ms":10,"avg_time_ms":0}]}`
@@ -582,7 +582,7 @@ func TestCodexSandbox(t *testing.T) {
 func TestRTKNoHookListed(t *testing.T) {
 	h := sandbox(t)
 	bin := filepath.Join(h, "bin")
-	testenv.Program(t, filepath.Join(bin, "dsh"), "#!/bin/sh\n")
+	testenv.Program(t, filepath.Join(bin, "dsh"), testenv.Tools(t, "#!/bin/sh\n"))
 	write(t, filepath.Join(bin, "dsh.exe"), "")
 	var dsh *RTKAgent
 	for _, a := range ReadRTK().Agents {
@@ -617,7 +617,7 @@ shift 2
 [ "$*" = "--agent hermes --auto-patch" ] || { echo "unknown: $*" >&2; exit 2; }
 h="${HERMES_HOME:-$HOME/.hermes}"
 echo "$HERMES_HOME" > "$HOME/given"
-/bin/mkdir -p "$h/plugins/rtk-rewrite"
+{{mkdir}} -p "$h/plugins/rtk-rewrite"
 echo "name: rtk-rewrite" > "$h/plugins/rtk-rewrite/plugin.yaml"
 echo "x" > "$h/plugins/rtk-rewrite/__init__.py"
 printf 'plugins:\n  enabled:\n    - rtk-rewrite\n' >> "$h/config.yaml"
@@ -638,7 +638,7 @@ func TestRTKHermesHome(t *testing.T) {
 	}
 	h := sandbox(t)
 	bin := filepath.Join(h, "bin")
-	testenv.Program(t, filepath.Join(bin, "rtk"), fakeRTKHermes)
+	testenv.Program(t, filepath.Join(bin, "rtk"), testenv.Tools(t, fakeRTKHermes))
 	holdCLI(t, h, "hermes") // the config alone is gone (#2254)
 	t.Setenv("PATH", bin)
 	for _, c := range []struct{ name, env string }{

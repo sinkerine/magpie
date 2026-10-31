@@ -48,7 +48,7 @@ done`)
 func told(t *testing.T, runs []leanRun, say string) leanRun {
 	t.Helper()
 	for _, r := range runs {
-		if i := strings.Index(r.log, "\ntold "); i >= 0 && strings.Contains(r.log[i:], say) {
+		if i := strings.Index(r.log, "\ntold "); i >= 0 && (strings.Contains(r.log[i:], "Human: "+say+`\n`) || strings.Contains(r.log[i:], `\n`+say+`\n`) || strings.Contains(r.log[i:], `"text":"`+say+`"`)) {
 			return r
 		}
 	}

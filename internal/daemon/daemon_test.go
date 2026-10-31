@@ -41,17 +41,17 @@ func fakes(t *testing.T, os_ string) (log, dir string) {
 	bin := filepath.Join(dir, "bin")
 	log = filepath.Join(dir, "calls")
 	for _, name := range []string{"systemctl", "launchctl", "loginctl"} {
-		testenv.Program(t, filepath.Join(bin, name), `#!/bin/sh
+		testenv.Program(t, filepath.Join(bin, name), testenv.Tools(t, `#!/bin/sh
 d='`+dir+`'
 echo "`+name+` $*" >> "$d/calls"
 for f in "$d/`+name+`.$1" "$d/`+name+`.$2"; do
-	if [ -f "$f.fail" ]; then /bin/cat "$f.fail"; exit 1; fi
-	if [ -f "$f.out" ]; then /bin/cat "$f.out"; exit 0; fi
+	if [ -f "$f.fail" ]; then {{cat}} "$f.fail"; exit 1; fi
+	if [ -f "$f.out" ]; then {{cat}} "$f.out"; exit 0; fi
 done
-if [ -f "$d/`+name+`.fail" ]; then /bin/cat "$d/`+name+`.fail"; exit 1; fi
-[ -f "$d/`+name+`.out" ] && /bin/cat "$d/`+name+`.out"
+if [ -f "$d/`+name+`.fail" ]; then {{cat}} "$d/`+name+`.fail"; exit 1; fi
+[ -f "$d/`+name+`.out" ] && {{cat}} "$d/`+name+`.out"
 exit 0
-`)
+`))
 	}
 	t.Setenv("PATH", bin)
 	return log, dir
@@ -392,7 +392,7 @@ func TestInstallFindsNvmNode(t *testing.T) {
 	t.Setenv("NVM_DIR", "")
 	t.Setenv("SHELL", filepath.Join(dir, "no-shell")) // no login shell to ask
 	for _, v := range []string{"v20.11.0", "v22.1.0"} {
-		testenv.Program(t, filepath.Join(home, ".nvm", "versions", "node", v, "bin", "node"), "#!/bin/sh\n")
+		testenv.Program(t, filepath.Join(home, ".nvm", "versions", "node", v, "bin", "node"), testenv.Tools(t, "#!/bin/sh\n"))
 	}
 	if err := os.MkdirAll(filepath.Join(home, ".nvm", "alias"), 0o755); err != nil {
 		t.Fatal(err)

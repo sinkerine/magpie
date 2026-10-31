@@ -11,6 +11,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // mimi001234 on Discord: magpie's Agents page didn't find Antigravity CLI
@@ -172,6 +173,7 @@ func TestWSLAgyFunctionRuns(t *testing.T) {
 	bin := t.TempDir()
 	writeFile(t, filepath.Join(bin, "agy"), "#!/bin/sh\necho \"key=$GEMINI_API_KEY url=$GOOGLE_GEMINI_BASE_URL args=$*\"\n")
 	os.Chmod(filepath.Join(bin, "agy"), 0o755)
+	fixturePath := bin + ":" + testenv.ToolDir(t, "head", "sed", "grep")
 	on := "key=" + agentKeyAt("agy", gw) + " url=" + gw
 	for _, c := range []struct{ sh, rc string }{{"bash", ".bashrc"}, {"zsh", ".zshrc"}} {
 		sh, err := exec.LookPath(c.sh)
@@ -180,8 +182,8 @@ func TestWSLAgyFunctionRuns(t *testing.T) {
 			continue
 		}
 		run := func(args string) string {
-			cmd := exec.Command(sh, "-c", `. "$HOME/`+c.rc+`"; agy `+args)
-			cmd.Env = []string{"HOME=" + dhome, "PATH=" + bin + ":/usr/bin:/bin"}
+			cmd := exec.Command(sh, "-c", `PATH="$MAGPIE_FIXTURE_PATH"; export PATH; . "$HOME/`+c.rc+`"; agy `+args)
+			cmd.Env = []string{"HOME=" + dhome, "PATH=" + fixturePath, "MAGPIE_FIXTURE_PATH=" + fixturePath}
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatalf("%s: %v\n%s", c.sh, err, out)
@@ -201,7 +203,7 @@ func TestWSLAgyFunctionRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("bash", "-c", `. "$HOME/.bashrc"; agy -p hi`)
-	cmd.Env = []string{"HOME=" + dhome, "PATH=" + bin + ":/usr/bin:/bin"}
+	cmd.Env = []string{"HOME=" + dhome, "PATH=" + fixturePath}
 	if out, err := cmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "key= url= args=-p hi" {
 		t.Fatalf("off magpie: %v %s", err, out)
 	}
