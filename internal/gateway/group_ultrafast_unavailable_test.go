@@ -34,7 +34,7 @@ func TestGroupUltrafastWithoutOffer(t *testing.T) {
 	if provider.UltraModels()["gpt-6-luna"] {
 		t.Fatal("fixture still advertises Ultrafast")
 	}
-	if err := provider.SaveGroup(provider.Group{ID: "luna-ultrafast", Members: []string{"codex/gpt-6-luna"}, Ultrafast: []string{"codex/gpt-6-luna"}}); err != nil {
+	if err := provider.SaveGroup(provider.Group{ID: "luna-ultrafast", Members: []string{"codex/gpt-6-luna"}, Ultra: []string{"codex/gpt-6-luna"}}); err != nil {
 		t.Fatal(err)
 	}
 	to, _ := url.Parse(provider.CodexBase)

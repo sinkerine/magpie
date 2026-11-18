@@ -77,7 +77,7 @@ func cleanDecisionGroup(g *Group, all []Group) error {
 		return fmt.Errorf("%s is of decision models: it takes them by name, not by a pattern", g.Name)
 	case len(g.Rules) > 0, g.Classifier != "", g.Effort != "":
 		return fmt.Errorf("%s is of decision models, asked at /v1/systemone: it has no conversation for rules, a classifier or an effort to pick for", g.Name)
-	case len(g.Levels) > 0, len(g.Fast) > 0, len(g.Ultrafast) > 0:
+	case len(g.Levels) > 0, len(g.Fast) > 0, len(g.Ultra) > 0:
 		return fmt.Errorf("%s is of decision models: they take no reasoning level or fast mode", g.Name)
 	}
 	for _, m := range g.Members {

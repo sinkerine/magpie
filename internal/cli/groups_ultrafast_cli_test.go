@@ -19,21 +19,21 @@ func TestGroupUltrafastPairs(t *testing.T) {
 		}
 	}
 	apply("ultrafast=" + member)
-	if !slices.Equal(g.Ultrafast, []string{member}) {
-		t.Fatalf("ultrafast=%v", g.Ultrafast)
+	if !slices.Equal(g.Ultra, []string{member}) {
+		t.Fatalf("ultrafast=%v", g.Ultra)
 	}
 	apply("ultrafast=")
-	if len(g.Ultrafast) != 0 {
+	if len(g.Ultra) != 0 {
 		t.Fatal("empty ultrafast did not clear tier")
 	}
 	apply("ultrafast=" + member)
 	apply("fast=" + member)
-	if len(g.Ultrafast) != 0 || !g.IsFast(member) {
+	if len(g.Ultra) != 0 || !g.IsFast(member) {
 		t.Fatal("ordinary Fast kept Ultrafast")
 	}
 	apply("ultrafast=" + member)
 	apply("fast=")
-	if len(g.Ultrafast) != 0 || len(g.Fast) != 0 {
+	if len(g.Ultra) != 0 || len(g.Fast) != 0 {
 		t.Fatal("standard speed kept a fast tier")
 	}
 	if err := applyGroupPairs(&g, []string{"ultrafast=missing/model"}, resolve, false); err == nil {

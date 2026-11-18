@@ -10,7 +10,7 @@ import (
 )
 
 func TestWebGuard(t *testing.T) {
-	h := webGuard("c", "key", 0, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) }))
+	h := webGuard("c", "key", 0, nil, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) }))
 	do := func(r *http.Request) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)
@@ -72,7 +72,7 @@ func TestWebKey(t *testing.T) {
 	}
 
 	// a fixed key's cookie outlives the browser
-	h := webGuard("c", "0123456789abcdef-kept", webCookieAge, http.NotFoundHandler())
+	h := webGuard("c", "0123456789abcdef-kept", webCookieAge, nil, http.NotFoundHandler())
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/?k=0123456789abcdef-kept", nil))
 	if ck := rec.Result().Cookies(); len(ck) != 1 || time.Duration(ck[0].MaxAge)*time.Second != webCookieAge {
@@ -92,7 +92,7 @@ func TestWebNoAuthGuardBypass(t *testing.T) {
 	}
 	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) })
 	rec := httptest.NewRecorder()
-	webHandler("3430", "", 0, next).ServeHTTP(rec, httptest.NewRequest("GET", "/api/state", nil))
+	webHandler("3430", "", 0, nil, next).ServeHTTP(rec, httptest.NewRequest("GET", "/api/state", nil))
 	if rec.Code != http.StatusTeapot {
 		t.Fatalf("no-auth request: %d", rec.Code)
 	}
@@ -100,7 +100,7 @@ func TestWebNoAuthGuardBypass(t *testing.T) {
 		r := httptest.NewRequest("POST", "/api/library/servers/save", nil)
 		r.Header.Set("Sec-Fetch-Site", site)
 		rec := httptest.NewRecorder()
-		webHandler("3430", "", 0, next).ServeHTTP(rec, r)
+		webHandler("3430", "", 0, nil, next).ServeHTTP(rec, r)
 		want := http.StatusForbidden
 		if site == "same-origin" {
 			want = http.StatusTeapot
@@ -113,7 +113,7 @@ func TestWebNoAuthGuardBypass(t *testing.T) {
 
 func TestWebGuardBookmark(t *testing.T) {
 	const key = "0123456789abcdef-2033"
-	h := webHandler("3430", key, webCookieAge, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) }))
+	h := webHandler("3430", key, webCookieAge, nil, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusTeapot) }))
 	do := func(r *http.Request) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)

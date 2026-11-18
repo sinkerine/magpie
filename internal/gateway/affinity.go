@@ -32,7 +32,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -40,6 +39,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/steady"
 )
@@ -75,10 +75,15 @@ const (
 	// cache_control's ttl "1h" (cache_creation's ephemeral_1h_input_tokens)
 	// without it being read, as Claude Code asks of a subscription (#2302)
 	cacheHour = time.Hour
-	// stickKeep is how long a conversation's last answerer is remembered.
-	stickKeep = 24 * time.Hour
+	// stickKeep is how long a conversation's last answerer is remembered,
+	// counted from its last answer: a binding in use is renewed by every
+	// answer. A long task is often picked up again after a weekend or a
+	// week, and a binding gone by then moves it to another provider, which
+	// refuses the reasoning the first sealed (invalid_encrypted_content;
+	// npikng161274 on X).
+	stickKeep = 30 * 24 * time.Hour
 	// sticksKept is how many conversations, the latest, are kept on disk.
-	sticksKept = 512
+	sticksKept = 4096
 )
 
 // coldAfter is how long p's vendor keeps a prompt cached without it being
@@ -88,7 +93,7 @@ func coldAfter(p provider.Provider) time.Duration {
 	if p.Account != nil && p.Account.Agent == "codex" {
 		return chatGPTCold
 	}
-	if p.Host() == deepseekHost {
+	if p.VendorHost() == deepseekHost {
 		return deepseekCold
 	}
 	return cacheCold
@@ -117,7 +122,9 @@ type Affinity struct {
 	// again at a new turn: backToFirst), "back" (a member of a group
 	// routed any other way stood in for one listed ahead of it that
 	// couldn't take the conversation, and a member ahead is ready first
-	// at a new turn: backFromStandIn), "credits" (a Codex account gone
+	// at a new turn: backFromStandIn), "hours" (a group's rule by hours
+	// sent its last turn there and they are over: RuleHit.Ended),
+	// "credits" (a Codex account gone
 	// onto its credits answered it, set to spend them only after
 	// everything else, and one not on its credits leads: lastBehind),
 	// "busy" (its plugin says the model is busier than settings.BusyLoad
@@ -394,11 +401,22 @@ func turnOf(from provider.Protocol, body []byte) (turn int, within bool) {
 // todo nudge, an agent list, Codex's context — begins none: after an
 // answer it carries the turn on, and right after the user's own message
 // it leaves that as it was.
+//
+// An image beside the turn's tool results is the result's, as the bridge
+// tells it (match): a client whose tool messages hold text only sends it
+// in a user message after (pi's "Attached image(s) from tool result:").
+// It carries the turn on, a turn of the user's own begun none (#5767):
+// counted one, the router re-decided the conversation's account at every
+// image result, and the bridge let the waiting run go under the other
+// owner ("tool results account changed"), a new Claude Code told the
+// whole conversation, the prompt cache rewritten each time.
 func turnIn(req *Request) (turn int, within bool) {
-	answered := false
+	answered, results := false, false
 	for _, m := range req.Messages {
 		if m.Role == "assistant" {
 			answered = true
+			results = false
+			continue
 		}
 		if m.Role != "user" {
 			continue
@@ -414,6 +432,12 @@ func turnIn(req *Request) (turn int, within bool) {
 		}
 		switch {
 		case result:
+			within = true
+			results = true
+		case results && withImages(m):
+			// the words beside the images are their caption, as match
+			// reads them; the user's words in a message of no images
+			// begin a turn (saidWithResults)
 			within = true
 		case said:
 			turn++
@@ -462,6 +486,7 @@ func strictKeep(scope, mode string, in http.Header, body []byte, cs []candidate,
 		}
 		w := pl.left[i]
 		w.Unlisted, w.Capped, w.CapBack = false, 0, nil
+		w.CapAmount, w.CapCount, w.CapUnit = 0, 0, ""
 		pl.left = slices.Delete(slices.Clone(pl.left), i, i+1)
 		back, order = append(back, c), append(order, w)
 	}
@@ -539,8 +564,9 @@ func stickKey(scope string, in http.Header, body []byte) string {
 // (dirOf): one parse of a held body serves both (factsOf), where counting
 // it in the masked body parsed the conversation a second time, ~27 MB
 // more for each 4 MB Codex request in flight. inOrder: the request is to
-// a routing group set to In order, whose order the user chose (backToFirst).
-func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, from provider.Protocol, body, written []byte, cs []candidate, pl planned) ([]candidate, planned, *Affinity, string) {
+// a routing group, or a provider's keys or accounts, set to In order,
+// whose order the user chose (backToFirst).
+func affine(scope, mode string, rotate, spread, inOrder, hoursOver bool, in http.Header, from provider.Protocol, body, written []byte, cs []candidate, pl planned) ([]candidate, planned, *Affinity, string) {
 	key := stickKey(scope, in, body)
 	a := &Affinity{Mode: mode}
 	a.Turn, a.Within = turnOf(from, written)
@@ -548,6 +574,15 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 	st, had := stickOf(key)
 	sticks.Unlock()
 	if had && time.Since(st.at) > stickKeep {
+		had = false
+	}
+	if had && mode == "" && !a.Within && (reorderedSince(st, cs) || reroutedSince(scope, st)) {
+		// the user put the accounts in another order after this
+		// conversation was last answered: the order they chose counts at
+		// its next turn, whatever the old answerer cached (Richyisaflower
+		// on X: B moved above A, the conversation went on to A); or
+		// changed the group's routing (#6708). Session and Strict, the
+		// user's own, and a turn under way keep it
 		had = false
 	}
 	if had {
@@ -618,7 +653,7 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 		// for it, which the provider can't read, and the whole prompt is
 		// sent afresh to the provider at the next turn all the same
 		a.Why = "main"
-	case !a.Within && inOrder && mode == "" && backToFirst(cs, pl.order, at):
+	case !a.Within && inOrder && mode == "" && backToFirst(cs, pl.order, at, !strings.HasPrefix(scope, provider.GroupPrefix)) && (strings.HasPrefix(scope, provider.GroupPrefix) || cacheHolds(st, cs[at].p)):
 		// a group set to In order tries its members in the order the user
 		// put them in: a conversation that went to a later member while
 		// the first couldn't take it (a 429, a 5xx, a rest) goes back to
@@ -629,7 +664,10 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 		// Discord: an API key first, a Claude subscription second, 8 of 10
 		// requests on the subscription). Within a turn it stays, on the
 		// reasoning the later member sealed; Stays: Session or Strict,
-		// the user's own, keep it where it is
+		// the user's own, keep it where it is. A provider's own keys or
+		// accounts routed In order do the same (CryptoSarom on X); only
+		// a cache that would keep it is overridden, so one gone cold or
+		// never written is still told as that
 		a.Why = "order"
 	case !a.Within && !inOrder && !rotate && mode == "" && st.stoodIn && backFromStandIn(cs, pl.order, at):
 		// a member listed after another, in a group routed Smart or any
@@ -645,6 +683,15 @@ func affine(scope, mode string, rotate, spread, inOrder bool, in http.Header, fr
 		// its cache as before; within a turn it stays, and Stays:
 		// Session or Strict, the user's own, keep it where it is
 		a.Why = "back"
+	case !a.Within && hoursOver && !rotate && mode == "" && at > 0:
+		// a rule's hours sent the conversation's last turn here, and they
+		// are over (RuleHit.Ended; MinglunZhu on X: a cheaper provider at
+		// night, the usual one by day): the new turn goes where the group
+		// routes it, whatever this one cached, or a conversation begun at
+		// night stayed on the night's provider all day by its cache.
+		// Within a turn it stays; Stays: Session and Strict, the user's
+		// own, keep it where it is
+		a.Why = "hours"
 	case at > 0 && pl.order[at].Known && pl.order[at].Used >= provider.SpentShareOf(cs[at].p.Routing) && !pl.order[at].CreditsFirst:
 		// all but used up, and put behind another: first still — the
 		// one key or account it has (#1016), or every one used up — it
@@ -721,11 +768,16 @@ func backToMain(order []Weighed, at int) bool {
 // first, order[0], is a member of the group ahead of the member that
 // answered last, cs[at]: another member, not another key or account of
 // the same one (a provider's keys, a group in the group, keep their own
-// affinity). restLast puts a resting one behind every ready one, so the
+// affinity). accounts: a provider's own keys or accounts routed In order,
+// where the first is another key or account of the provider's own, not a
+// fallback. restLast puts a resting one behind every ready one, so the
 // first is ready only when it isn't resting.
-func backToFirst(cs []candidate, order []Weighed, at int) bool {
+func backToFirst(cs []candidate, order []Weighed, at int, accounts bool) bool {
 	if at <= 0 || at >= len(order) || at >= len(cs) || order[0].Rest != nil || order[0].Aside {
 		return false
+	}
+	if accounts {
+		return !order[0].Fallback && !order[at].Fallback && cs[0].who() != cs[at].who()
 	}
 	member := func(i int) string {
 		if len(order[i].Via) > 0 {
@@ -1149,7 +1201,7 @@ func unanswered(key string, c candidate) {
 // blob", which names no item and says nothing of encrypted content,
 // where the #3392 shaping (xaiBody's) never runs because the relay's
 // host isn't api.x.ai.
-var foreignReasoning = regexp.MustCompile(`(?i)invalid_encrypted_content|invalid[ _]encrypted[ _](summary|content)|encrypted[ _]content.{0,80}could not be (verified|decrypted)|could not (decrypt|verify).{0,40}encrypted[ _]content|could not (decode|decrypt).{0,20}compaction[ _]blob`)
+var foreignReasoning = lazyre.New(`(?i)invalid_encrypted_content|invalid[ _]encrypted[ _](summary|content)|encrypted[ _]content.{0,80}could not be (verified|decrypted)|could not (decrypt|verify).{0,40}encrypted[ _]content|could not (decode|decrypt).{0,20}compaction[ _]blob`)
 
 // refusedSeals remembers, per conversation and the key or account that
 // refused it, what another one sealed: its reasoning, and the sealed copy
@@ -1510,4 +1562,32 @@ func keptAgain(aff *Affinity, c candidate, hw *holdWriter, asked bool) (time.Dur
 		return 0, false
 	}
 	return passing(hw.code(), hw.header, hw.errBody(), 0)
+}
+
+// cacheHolds says whether what the conversation has cached would keep it
+// where it is: enough written or read (cacheWorth), and not gone cold
+// (coldAfter, or kept for an hour: #2302). The "no-cache" and "cold"
+// cases of affine read the same.
+func cacheHolds(st stick, p provider.Provider) bool {
+	return st.cacheRead+st.cacheWrite >= cacheWorth && (time.Since(st.at) <= coldAfter(p) || st.hour.warm(time.Now()))
+}
+
+// reorderedSince: the user changed the order of the accounts of the
+// provider that last answered st after it did. Only that provider's
+// reorder counts: one of another provider's moves no conversation here.
+// reroutedSince says whether the user changed the routing of the group
+// scope is (Group.RoutedAt) after the conversation was last answered: the
+// new routing counts at its next turn, as a reorder does (#6708).
+func reroutedSince(scope string, st stick) bool {
+	gid, ok := strings.CutPrefix(scope, provider.GroupPrefix)
+	return ok && st.at.Before(provider.GroupRoutedAt(gid))
+}
+
+func reorderedSince(st stick, cs []candidate) bool {
+	for _, c := range cs {
+		if c.who() == st.who {
+			return st.at.Before(provider.ReorderedAt(c.p.ID))
+		}
+	}
+	return false
 }

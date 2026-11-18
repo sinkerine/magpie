@@ -6,7 +6,8 @@ package provider
 // Vibe, StepFun's Step Plan, Volcengine Ark's Coding and Agent Plans and
 // Tencent Cloud's Token Plan 企业版 — has windows of allowance like a
 // subscription's, which the vendor tells to the key (StepFun only to a
-// sign-in, stepfun_plan.go; Volcengine and Tencent Cloud only to the
+// sign-in, stepfun_plan.go, as is the Qwen AI platform's Token Plan,
+// qianwen_plan.go; Volcengine and Tencent Cloud only to the
 // account's access key, volcengine_usage.go and tencent_usage.go): the
 // Usage page shows them beside the subscriptions'.
 
@@ -432,13 +433,16 @@ func KimiCodeSearch(p Provider) string {
 // both ways is taken from usages, as kimi-code does. Each share is read
 // under its camelCase name too, a reset as text or epoch seconds or
 // milliseconds (EchoBird's fixture), and a limits[] window counted in
-// weeks or months by its length.
+// weeks or months by its length. A booster wallet (加油包) is its
+// balance, beside the windows (kimiBooster).
 func readKimiCode(b []byte) (string, []QuotaWindow, error) {
 	type row map[string]any
 	var r struct {
-		Usage  row            `json:"usage"`
-		Usages map[string]row `json:"usages"`
-		Limits []struct {
+		Usage   row            `json:"usage"`
+		Usages  map[string]row `json:"usages"`
+		Booster row            `json:"booster_wallet"`
+		Camel   row            `json:"boosterWallet"`
+		Limits  []struct {
 			Window row `json:"window"`
 			Detail row `json:"detail"`
 		} `json:"limits"`
@@ -577,7 +581,51 @@ func readKimiCode(b []byte) (string, []QuotaWindow, error) {
 	if len(out) == 0 {
 		return "", nil, fmt.Errorf("no usage in the reply")
 	}
+	wallet := r.Booster
+	if len(wallet) == 0 {
+		wallet = r.Camel
+	}
+	if left, unit, ok := kimiBooster(wallet, num); ok {
+		if left > 0 {
+			// Kimi goes on past the plan's windows on the booster (#5721):
+			// one used up doesn't stop the key while it holds money
+			for i := range out {
+				out[i].Credits = true
+			}
+		}
+		out = append(out, QuotaWindow{Name: "Extra usage", Balance: &left, Unit: unit, Aside: true})
+	}
 	return "", out, nil
+}
+
+// kimiBooster reads Kimi Code's booster wallet (加油包, "Extra usage"),
+// as kimi-code's parseBoosterWallet does (packages/oauth/src/
+// managed-usage.ts): a balance of type BOOSTER whose amount and
+// amountLeft are cents times 10^6, amountLeft missing meaning none is
+// left; the currency is the monthly limit's or used figure's, else USD.
+// left is in the currency's units (yuan); ok is false when there is no
+// booster.
+func kimiBooster(wallet map[string]any, num func(any) (float64, bool)) (left float64, unit string, ok bool) {
+	bal, _ := wallet["balance"].(map[string]any)
+	if bal == nil || bal["type"] != "BOOSTER" {
+		return 0, "", false
+	}
+	if amount, ok := num(bal["amount"]); !ok || amount <= 0 {
+		return 0, "", false
+	}
+	if l, ok := num(bal["amountLeft"]); ok && l > 0 {
+		left = math.Round(l/1e6) / 100
+	}
+	unit = "USD"
+	for _, k := range []string{"monthlyChargeLimit", "monthlyUsed"} {
+		if m, _ := wallet[k].(map[string]any); m != nil {
+			if c, _ := m["currency"].(string); c != "" {
+				unit = c
+				break
+			}
+		}
+	}
+	return left, unit, true
 }
 
 // planWindows asks the vendor for the plan key is on and its windows.
@@ -839,6 +887,12 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 	go func() { volc <- volcPlanQuotas(ctx) }()
 	tencent := make(chan []SubscriptionQuota, 1)
 	go func() { tencent <- tencentPlanQuotas(ctx) }()
+	ali := make(chan []SubscriptionQuota, 1)
+	go func() { ali <- aliPlanQuotas(ctx) }()
+	qianwen := make(chan []SubscriptionQuota, 1)
+	go func() { qianwen <- qianwenPlanQuotas(ctx) }()
+	qianfan := make(chan []SubscriptionQuota, 1)
+	go func() { qianfan <- qianfanPlanQuotas(ctx) }()
 	wg.Wait()
 	out := []SubscriptionQuota{}
 	for i, q := range got {
@@ -848,8 +902,9 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 			out = append(out, *q)
 		}
 	}
-	// StepFun's, Volcengine's and Tencent's, read just now too
-	for _, qs := range [][]SubscriptionQuota{<-stepfun, <-volc, <-tencent} {
+	// StepFun's, Volcengine's, Tencent's, Alibaba's, the Qwen AI
+	// platform's and Baidu Qianfan's, read just now too
+	for _, qs := range [][]SubscriptionQuota{<-stepfun, <-volc, <-tencent, <-ali, <-qianwen, <-qianfan} {
 		for _, q := range qs {
 			out = append(out, readNow(q))
 		}

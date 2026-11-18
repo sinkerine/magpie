@@ -23,7 +23,7 @@ func TestGroupUltrafast(t *testing.T) {
 		return http.DefaultTransport.RoundTrip(r)
 	})}
 	var group provider.Group
-	if err := json.Unmarshal([]byte(`{"id":"luna-ultrafast","members":["codex/gpt-6-luna"],"fast":["codex/gpt-6-luna"],"ultrafast":["codex/gpt-6-luna"]}`), &group); err != nil {
+	if err := json.Unmarshal([]byte(`{"id":"luna-ultrafast","members":["codex/gpt-6-luna"],"fast":["codex/gpt-6-luna"],"ultra":["codex/gpt-6-luna"]}`), &group); err != nil {
 		t.Fatal(err)
 	}
 	if err := provider.SaveGroup(group); err != nil {

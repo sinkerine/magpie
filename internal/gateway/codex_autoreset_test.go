@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +36,9 @@ type resetBackend struct {
 	credits map[string]bool
 	edge    map[string]int
 	fails   map[string]int
+	// sayCredits: replies say the account's credits as ChatGPT's do,
+	// x-codex-credits-has-credits and -unlimited
+	sayCredits bool
 }
 
 func newResetBackend(t *testing.T, accounts ...string) *resetBackend {
@@ -64,6 +68,10 @@ func newResetBackend(t *testing.T, accounts ...string) *resetBackend {
 			refused := b.out[acct] && (!b.credits[acct] || b.edge[acct] > 0)
 			if refused && b.credits[acct] {
 				b.edge[acct]--
+			}
+			if b.sayCredits {
+				w.Header().Set("x-codex-credits-has-credits", strconv.FormatBool(b.credits[acct]))
+				w.Header().Set("x-codex-credits-unlimited", "false")
 			}
 			if refused {
 				w.WriteHeader(429)

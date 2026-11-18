@@ -195,6 +195,14 @@ type Route struct {
 	// whose agent keeps it can be found again after the fact even when its
 	// conversation opening is one a fork copied (dshConvs)
 	ResponseID string `json:"responseId,omitempty"`
+	// LastConvs: the ids of the user messages the request's turn carries,
+	// newest first (dshLastConvs): a dsh fork copies its source's opening,
+	// so both answer the same Conv, and a request still answering has no
+	// reply id yet. The turn's messages are what say which branch it is
+	// of, as that branch's own file has them (sessions' TurnConvs, gui's
+	// ownerLast). Only a live route needs them: the history keeps none
+	// (saveRoute)
+	LastConvs []string `json:"lastConvs,omitempty"`
 	// Folder: the last two levels of the folder its agent says it works
 	// in (shortFolder), never the whole path; a request that says none
 	// takes its session's, as said last (#1068)
@@ -384,19 +392,36 @@ type Weighed struct {
 	// Barred: left out as the user set it not to serve the model, its
 	// own list of models leaving it out (#474)
 	Barred bool `json:"barred,omitempty"`
+	// StandIn: left out as its provider never takes another model's
+	// request (provider.NoStandIn), and a provider not so marked was
+	// planned before it (standInsOut)
+	StandIn bool `json:"standIn,omitempty"`
 	// Held: left out as the gateway key asking may not use its account or
 	// key (#905), or a routing group it was reached through is held to
 	// other accounts (Group.Accounts): HeldBy names that group
 	Held   bool   `json:"held,omitempty"`
 	HeldBy string `json:"heldBy,omitempty"`
+	// HeldOwn: HeldBy's group names this model on another account of
+	// its provider (Member.Account, EastonXvii on X), rather than holding
+	// the whole group to some
+	HeldOwn bool `json:"heldOwn,omitempty"`
 	// Capped: left out as held at the usage cap the user set on the
 	// account, this cap in percent; Used is then its fullest window's
 	// share, CapBack when the last window at or past it renews
 	Capped  int        `json:"capped,omitempty"`
 	CapBack *time.Time `json:"capBack,omitempty"`
+	// CapAmount: held (Capped) at a window's fixed amount of its own unit
+	// rather than a share: CapCount of it used, in CapUnit
+	CapAmount float64 `json:"capAmount,omitempty"`
+	CapCount  float64 `json:"capCount,omitempty"`
+	CapUnit   string  `json:"capUnit,omitempty"`
 	// NoCredits: held at 100% (Capped), a Codex account the user set not
 	// to spend its credits once its allowance is used up
 	NoCredits bool `json:"noCredits,omitempty"`
+	// ExtraUsage: beside NoCredits, a Claude account held so as it is set
+	// not to spend extra usage, or its extra usage is at the cap set on
+	// its Usage credits (provider.ClaudeExtraUsage)
+	ExtraUsage bool `json:"extraUsage,omitempty"`
 	// Unread: held (Capped) by a careful provider as its usage can't be
 	// told, why: not read yet, the read failed, or too old near its cap
 	// (provider.Provider.CapCareful)
@@ -445,6 +470,10 @@ type Weighed struct {
 	// from Renews' biggest first: a row says the two together, so of one
 	// window, a Factory account's week and not its month (#1778)
 	UsedRenews *time.Time `json:"usedRenews,omitempty"`
+	// UsedWindow: the name of the window Used is the share of, when more
+	// than one counts the model: the row says it with the share, so a
+	// week's 41% isn't read as the five hours' (Wing8Aqua on X)
+	UsedWindow string `json:"usedWindow,omitempty"`
 	// Sunk: when it was rate limited with quota left, sending it to the
 	// back of an order that sinks (sink.go); nil when it didn't, or the
 	// order doesn't sink
@@ -483,6 +512,12 @@ type Try struct {
 	// client didn't, so it has no Net and the Routing page says why
 	// (sentBy)
 	SentBy string `json:"sentBy,omitempty"`
+	// Entry: how Claude Code ran a Claude subscription's request, "tui" for
+	// its interactive mode or "print" for claude -p, whose cost to the
+	// plan differs; EntryWhy is claudePrint's code for why it was -p
+	// (claude_entry.go). "" for a try that ran no Claude Code.
+	Entry    string `json:"entry,omitempty"`
+	EntryWhy string `json:"entryWhy,omitempty"`
 	// FirstReasoning is the start of paced visible reasoning, absent for hidden reasoning.
 	FirstReasoning  int64 `json:"firstReasoning,omitempty"`
 	ReasoningHidden bool  `json:"reasoningHidden,omitempty"`
@@ -611,6 +646,7 @@ func weighed(c candidate, p provider.Provider, wg weighing, fallback bool, from 
 			ur := l.fullest
 			w.UsedRenews = &ur
 		}
+		w.UsedWindow = l.fullestName
 		if l.of > 0 {
 			w.Amount, w.Limit, w.Unit = l.amount, l.of, l.unit
 		}
@@ -1137,9 +1173,11 @@ func swapped(sent, served string) bool { return usage.Swapped(sent, served) }
 // request's metadata. Unknown token counts have no price, including failures.
 // What the reply counted of earlier requests (Deferred) is priced as a tier
 // of its own before the request's, which stays last: the prompt is read
-// from the last (promptCounted), and is the request's own.
+// from the last (promptCounted), and is the request's own. So are the
+// calls its advisor made at the vendor, under the advisor's model
+// (advisorRouteUsage, #6977).
 func routeUsage(id, model string, u Usage) []RouteUsage {
-	var out []RouteUsage
+	out := advisorRouteUsage(id, u)
 	if d := u.Deferred; d != nil && d.Input+d.Output+d.CacheRead+d.CacheWrite > 0 {
 		out = append(out, RouteUsage{Provider: id, Model: model, Input: d.Input, Output: d.Output,
 			CacheRead: d.CacheRead, CacheWrite: d.CacheWrite, Reasoning: d.Reasoning})

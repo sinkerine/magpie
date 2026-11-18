@@ -667,8 +667,41 @@ func Clashes(loaded []Loaded) map[string][]Clash {
 	return out
 }
 
+// hostLock is a lock a caller stops waiting for when its context ends: a
+// host starting holds it while its Bun downloads (bunReadyWait at most),
+// and a request is not held past its own deadline behind that (#6735).
+type hostLock chan struct{}
+
+func (l hostLock) Lock() { l <- struct{}{} }
+
+func (l hostLock) TryLock() bool {
+	select {
+	case l <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l hostLock) LockCtx(ctx context.Context) error {
+	select {
+	case l <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l hostLock) Unlock() {
+	select {
+	case <-l:
+	default:
+		panic("plugin: unlock of unlocked hostMu")
+	}
+}
+
 var (
-	hostMu  sync.Mutex
+	hostMu  = make(hostLock, 1)
 	current *host
 	// generation counts the hosts started, so a caller can tell a
 	// restart happened (the provider cache is then stale)
@@ -813,7 +846,7 @@ func Restart() {
 	// the next host loads the plugins as they are now: what this magpie
 	// installed is not another magpie's change (checkList)
 	listSeen.Lock()
-	listSeen.stamp, listSeen.set = listStamp(), true
+	listSeen.stamp, listSeen.set = seenStamp(), true
 	listSeen.Unlock()
 	hostMu.Lock()
 	h := current
@@ -970,7 +1003,12 @@ func hostScript(name string, js []byte) (string, error) {
 // when there is none.
 func get(ctx context.Context) (*host, error) {
 	checkList()
-	hostMu.Lock()
+	if err := hostMu.LockCtx(ctx); err != nil {
+		if e := bunNotReadyNow(err); e != nil {
+			return nil, e
+		}
+		return nil, fmt.Errorf("waiting for the plugin host: %w", err)
+	}
 	defer hostMu.Unlock()
 	return getLocked(ctx)
 }
@@ -998,7 +1036,7 @@ func getLocked(ctx context.Context) (*host, error) {
 }
 
 func start(ctx context.Context) (*host, error) {
-	bun, err := Bun(ctx)
+	bun, err := hostBun(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1062,6 +1100,7 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 	if err := os.MkdirAll(settings.Dir(), 0o700); err != nil {
 		return nil, false, err
 	}
+	catalog.Seed() // the shipped copy, read until models.dev answers
 	if catalog.Source() == "" {
 		// a plugin's provider has the models models.dev lists for it, as in
 		// OpenCode; sync in the background so starting the host never stalls
@@ -1183,6 +1222,11 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 		"plugins":       items,
 		"loadMillis":    pluginLoadWait.Milliseconds(),
 		"listMillis":    pluginListWait.Milliseconds(),
+		"heavy": map[string]any{
+			"mb":          heavyMB,
+			"afterMillis": heavyAfter.Milliseconds(),
+			"everyMillis": heavyEvery.Milliseconds(),
+		},
 	}, &res)
 	if err != nil {
 		crashed := !h.alive()
@@ -1253,6 +1297,41 @@ var (
 	pluginLoadWait = 20 * time.Second
 	pluginListWait = 20 * time.Second
 )
+
+// heavyMB is how much memory a host may hold before it is replaced:
+// past it, and still past it after a full collection, the host says so
+// ("heavy") and a new host takes the calls made from then on while the
+// old one finishes its own (recycle). A plugin that holds on to what
+// its requests leave behind grows the shared host until the system ends
+// it: 783 MiB after 2h25m on a small Linux server, where the kernel's
+// OOM killer took it, with four plugins and their requests going through
+// it. Measured with every plugin of that report loaded and 3000 600KB
+// requests, 4 at a time, a host holds 84 to 236 MiB, so the bound leaves
+// room for that twice over. The host checks every heavyEvery, once it
+// has been up heavyAfter; tests shorten all three.
+var (
+	heavyMB    = 512
+	heavyAfter = 10 * time.Minute
+	heavyEvery = time.Minute
+)
+
+// recycle replaces h, when it is still the host calls go to, as a plugin
+// update does (Restart): the calls h is answering finish on it, and the
+// next call starts a new host. recycles counts the hosts it replaced.
+func (h *host) recycle() {
+	hostMu.Lock()
+	if current != h {
+		hostMu.Unlock()
+		return
+	}
+	current = nil
+	hostMu.Unlock()
+	recycles.Add(1)
+	h.retire()
+	changed()
+}
+
+var recycles atomic.Int64
 
 // drainStderr logs the child's stderr a line at a time. A line over 4 MiB
 // stops the scanner; the rest is read and dropped, so the child is never left
@@ -1387,6 +1466,9 @@ func (h *host) dispatch(m message) {
 			log.Printf("plugin: %s %s", m.Title, m.Message)
 		case "log":
 			log.Printf("plugin [%s]: %s", m.Level, m.Message)
+		case "heavy":
+			log.Printf("plugin: the host holds %d MiB after a collection; a new one takes the next calls", m.Count)
+			go h.recycle()
 		}
 		return
 	}
@@ -1874,6 +1956,10 @@ func forHost(choice string) string {
 		if u, err := netproxy.Parse(c); err == nil {
 			return netproxy.ForBun(u.String())
 		}
+		if settings.IsProxyRef(c) {
+			// a saved proxy that is gone: the request goes nowhere, not direct
+			return netproxy.DeadProxy
+		}
 		return c
 	}
 }
@@ -2097,9 +2183,28 @@ var errBodyClosed = errors.New("the reply's body was closed")
 // is not cut; a dead connection's read ends at the same bound.
 var bodyIdleWait = 30 * time.Minute
 
+// ReplyWaitForTest sets bodyIdleWait, the head's and the body's wait, to d
+// until restore.
+func ReplyWaitForTest(d time.Duration) (restore func()) {
+	old := bodyIdleWait
+	bodyIdleWait = d
+	return func() { bodyIdleWait = old }
+}
+
 // headRead waits for the call's reply head, giving back the answer it read on
 // the way: the body has to end with that answer too, error and all.
+//
+// The head is waited on for bodyIdleWait at most, as the body's silence
+// is: a plugin may answer only once its vendor has sent the reply's first
+// words (the Devin plugin does), so a request its vendor took and never
+// answered left the head unsent, and the gateway kept the agent alive
+// with keepalives and nothing else, for as long as the agent waited
+// (wu_chong4136 on X: 10 to 20 minutes, until the effort or the
+// conversation changed). Given up, the fetch fails with an error that
+// names the wait, which the next account or the agent's retry takes up.
 func (c *call) headRead(ctx context.Context) (head message, answer *message, err error) {
+	idle := time.NewTimer(bodyIdleWait)
+	defer idle.Stop()
 	for {
 		if m, ok := c.pop(); ok {
 			return m, nil, nil
@@ -2130,6 +2235,8 @@ func (c *call) headRead(ctx context.Context) (head message, answer *message, err
 			// the host is gone: no head is coming, so the fetch gives up
 			// rather than waiting on a context that may never end
 			continue
+		case <-idle.C:
+			return message{}, nil, fmt.Errorf("the plugin sent no reply in %s; that fetch was given up on", bodyIdleWait)
 		}
 	}
 }
