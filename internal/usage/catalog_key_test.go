@@ -45,7 +45,22 @@ func TestRequestStateKeptAcrossACatalogFetchedAgain(t *testing.T) {
 	if got := usagePriceCacheKey(now); got != price {
 		t.Error("the same catalog fetched again changed the price key")
 	}
-	write(`{"openai":{"id":"openai","models":{"gpt-6.1-sol":{"id":"gpt-6.1-sol","cost":{"input":3,"output":10}}}}}`)
+	// A changed fetch replaces the file atomically. Its size and mtime
+	// can still match the old file when both writes land in one tick.
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := p + ".new"
+	if err := os.WriteFile(replacement, []byte(`{"openai":{"id":"openai","models":{"gpt-6.1-sol":{"id":"gpt-6.1-sol","cost":{"input":3,"output":10}}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(replacement, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, p); err != nil {
+		t.Fatal(err)
+	}
 	if usagePriceCacheKey(now) == price {
 		t.Error("a catalog that changed kept the price key")
 	}

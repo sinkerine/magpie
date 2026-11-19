@@ -19,16 +19,15 @@ import (
 // session file again, ~15 s of CPU over a long history.
 func CacheKey() string { return fileKey(CachePath()) + "|" + fileKey(LabsPath()) }
 
-// fileKeys holds each file's last key by the stat it was hashed at, so a
-// key costs a stat until the file changes.
+// fileKeys holds each file's last key and identity, so an unchanged file
+// costs a stat. A fetch can replace a file without changing size or mtime.
 var fileKeys = struct {
 	sync.Mutex
 	m map[string]keyedFile
 }{m: map[string]keyedFile{}}
 
 type keyedFile struct {
-	size int64
-	mod  time.Time
+	info os.FileInfo
 	key  string
 }
 
@@ -43,7 +42,7 @@ func fileKey(path string) string {
 	fileKeys.Lock()
 	k, ok := fileKeys.m[path]
 	fileKeys.Unlock()
-	if ok && k.size == st.Size() && k.mod.Equal(st.ModTime()) {
+	if ok && os.SameFile(k.info, st) && k.info.Size() == st.Size() && k.info.ModTime().Equal(st.ModTime()) {
 		return k.key
 	}
 	// hashed as it is read: the catalog is ~6 MB, and holding it whole
@@ -51,7 +50,12 @@ func fileKey(path string) string {
 	h := sha256.New()
 	f, err := os.Open(path)
 	if err == nil {
-		_, err = io.Copy(h, f)
+		var opened os.FileInfo
+		opened, err = f.Stat()
+		if err == nil {
+			st = opened
+			_, err = io.Copy(h, f)
+		}
 		f.Close()
 	}
 	if err != nil {
@@ -59,7 +63,7 @@ func fileKey(path string) string {
 	}
 	key := hex.EncodeToString(h.Sum(nil))
 	fileKeys.Lock()
-	fileKeys.m[path] = keyedFile{size: st.Size(), mod: st.ModTime(), key: key}
+	fileKeys.m[path] = keyedFile{info: st, key: key}
 	fileKeys.Unlock()
 	return key
 }
