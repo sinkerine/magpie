@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MCP ルーター · magpie ドキュメント</title>
+<title>MCP ルーター：1 つのアドレスで MCP サーバーを全エージェントに · magpie ドキュメント</title>
 <meta name="description" content="magpie の MCP ルーターの役割：ライブラリのサーバーの代わりにエージェントごとに magpie という MCP サーバーを一つ渡し、コマンドのサーバーは一度だけ動かし、ほかのアプリには一つのアドレスを。">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fafafa">
@@ -39,6 +39,54 @@
 <meta property="og:image" content="https://usemagpie.ai/img/og.png">
 <meta property="og:url" content="https://usemagpie.ai/docs/ja/mcp-router">
 <meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "TechArticle",
+   "headline": "MCP ルーター",
+   "description": "magpie の MCP ルーターの役割：ライブラリのサーバーの代わりにエージェントごとに magpie という MCP サーバーを一つ渡し、コマンドのサーバーは一度だけ動かし、ほかのアプリには一つのアドレスを。",
+   "inLanguage": "ja",
+   "url": "https://usemagpie.ai/docs/ja/mcp-router",
+   "about": {
+    "@type": "SoftwareApplication",
+    "name": "magpie",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Windows, Linux"
+   },
+   "publisher": {
+    "@type": "Organization",
+    "name": "magpie",
+    "url": "https://usemagpie.ai/"
+   }
+  },
+  {
+   "@type": "BreadcrumbList",
+   "itemListElement": [
+    {
+     "@type": "ListItem",
+     "position": 1,
+     "name": "magpie",
+     "item": "https://usemagpie.ai/ja/"
+    },
+    {
+     "@type": "ListItem",
+     "position": 2,
+     "name": "ドキュメント",
+     "item": "https://usemagpie.ai/docs/ja/start"
+    },
+    {
+     "@type": "ListItem",
+     "position": 3,
+     "name": "MCP ルーター",
+     "item": "https://usemagpie.ai/docs/ja/mcp-router"
+    }
+   ]
+  }
+ ]
+}
+</script>
 </head>
 <body>
 
@@ -55,6 +103,13 @@
     <a class="toc-only" href="/docs/ja/masking">プライバシーマスキング</a>
     <a class="toc-only" href="/docs/ja/mcp-router">MCP ルーター</a>
     <a class="toc-only" href="/docs/ja/library">ライブラリ</a>
+    <a class="toc-only" href="/docs/ja/claude-code-models">Claude Code で他のモデル</a>
+    <a class="toc-only" href="/docs/ja/codex-models">Codex で他のモデル</a>
+    <a class="toc-only" href="/docs/ja/gemini-cli-models">Gemini CLI で他のモデル</a>
+    <a class="toc-only" href="/docs/ja/subscriptions">サブスクを任意のエージェントで</a>
+    <a class="toc-only" href="/docs/ja/local-models">ローカルモデル</a>
+    <a class="toc-only" href="/docs/ja/opencode-models">OpenCode で他のモデル</a>
+    <a class="toc-only" href="/docs/ja/alternatives">CC Switch・CCR との比較</a>
     <a href="/docs/ja/import">magpie に追加</a>
     <a href="/docs/integrate">アプリ連携</a>
     <a href="https://github.com/yetone/magpie-releases/releases">リリース</a>
@@ -109,6 +164,15 @@ magpie library mcp router off</pre>
     </div>
     <p><code>magpie library</code> で、ルーターを渡されたエージェントと個別のエントリを残すエージェントが、理由とともに一覧できます。</p>
 
+    <h2 id="on-demand"><a class="anchor" href="#on-demand">ツールをオンデマンドで渡す</a></h2>
+    <p>エージェントに渡したツールは、パラメーターのスキーマ全体とともに毎回のリクエストで送られます。そのため、ルーター経由で 10 個を超えるツールを渡されるエージェントには、代わりに 2 つのツールを渡します。これは<b>既定でオン</b>です：</p>
+    <ul>
+      <li><b><code>find_tools</code></b>：タスクに必要な語で一致するツールを探します。上位 5 個は説明とパラメーター付きで、続けて最大 15 個を名前で返します。説明には各サーバーとそのツールが書かれているので、モデルは何が探せるかを知っています。</li>
+      <li><b><code>call_tool</code></b>：ツールを名前で、引数とともに実行します。</li>
+    </ul>
+    <p>MCP ツールを自分で検索するエージェントにはすべてのツールを渡し、そのエージェント自身の検索が毎回のリクエストからツールを外します：Claude Code、Claude Desktop、Codex、Pi、Droid、omp。ツールが 10 個以下のエージェントと、<a href="#apps">ほかのアプリ</a> のアドレスに接続するアプリ（どのアプリかは magpie にはわかりません）にもすべてのツールを渡します。</p>
+    <p>すべてのエージェントにすべてのツールを渡すには、<span class="ui">ライブラリ</span> → <span class="ui">MCP</span> の <span class="ui">MCP ルーター</span> の下にある <span class="ui">ツールをオンデマンドで渡す</span> をオフにして、エージェントを再起動してください。</p>
+
     <h2 id="apps"><a class="anchor" href="#apps">ほかのアプリ</a></h2>
     <p>ルーターがオンのとき、<span class="ui">ほかのアプリ</span> の行に <code>/mcp/magpie/hub</code> で終わるアドレスが出ます。ここではライブラリのすべてのサーバーを提供します。<span class="ui">接続…</span> を押すと、Cursor、VS Code、Windsurf、JSON の MCP 設定を受け付けるアプリ向けのエントリがコピーできるシートが開きます。アプリのウィンドウでは、Cursor と VS Code には <span class="ui">追加</span> もあり、そのアプリが開いて確認を求めます。別のコンピュータのアプリには、ネットワークからのほかのリクエストと同じくゲートウェイのキーが必要です（<a href="/docs/ja/remote">リモート magpie</a> を参照）。</p>
     <div class="callout"><b>コマンドのサーバーはこのコンピュータで動きます。</b>ネットワーク上でゲートウェイのキーを持つ人は、ルーターを通してあなたの権限でそれを呼び出せます。キーは信頼できる人にだけ渡してください。</div>
@@ -142,6 +206,13 @@ magpie library mcp router off</pre>
     <a href="/docs/ja/masking">プライバシーマスキング</a>
     <a href="/docs/ja/mcp-router">MCP ルーター</a>
     <a href="/docs/ja/library">ライブラリ</a>
+    <a href="/docs/ja/claude-code-models">Claude Code で他のモデル</a>
+    <a href="/docs/ja/codex-models">Codex で他のモデル</a>
+    <a href="/docs/ja/gemini-cli-models">Gemini CLI で他のモデル</a>
+    <a href="/docs/ja/subscriptions">サブスクを任意のエージェントで</a>
+    <a href="/docs/ja/local-models">ローカルモデル</a>
+    <a href="/docs/ja/opencode-models">OpenCode で他のモデル</a>
+    <a href="/docs/ja/alternatives">CC Switch・CCR との比較</a>
     <a href="/docs/ja/import">magpie に追加</a>
     <a href="/docs/integrate">アプリ連携</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

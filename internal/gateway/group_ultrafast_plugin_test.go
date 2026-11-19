@@ -11,7 +11,7 @@ func TestGroupUltrafastPlugin(t *testing.T) {
 	up := &tierUp{}
 	pid := besideFake(t, "tiered", up)
 	member := pid + "/fake-1"
-	if err := provider.SaveGroup(provider.Group{ID: "ultra", Members: []string{member}, Ultrafast: []string{member}}); err != nil {
+	if err := provider.SaveGroup(provider.Group{ID: "ultra", Members: []string{member}, Ultra: []string{member}}); err != nil {
 		t.Fatal(err)
 	}
 	s := New()
@@ -29,7 +29,7 @@ func TestGroupUltrafastPlugin(t *testing.T) {
 	}
 	for _, model := range []string{"fake-resp", "fake-claude"} {
 		member := pid + "/" + model
-		if err := provider.SaveGroup(provider.Group{ID: "bad", Members: []string{member}, Ultrafast: []string{member}}); err == nil {
+		if err := provider.SaveGroup(provider.Group{ID: "bad", Members: []string{member}, Ultra: []string{member}}); err == nil {
 			t.Errorf("accepted unsupported Ultrafast on %s", model)
 		}
 	}

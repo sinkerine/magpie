@@ -7,11 +7,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -32,7 +34,7 @@ import (
 // Discord). agy's conversation_summaries.db and jetbox_summaries_proto.pb,
 // which it keeps open, keep the row, and agy lists no conversation whose
 // files are gone, as a restore brings it back to its /resume list.
-// Hermes's and Alma's are rows in a database the agent keeps open and
+// Hermes's, Alma's and OpenMausBot's are rows in a database the agent keeps open and
 // writes, so they are only listed, and so are OpenCode's and ZCode's, and
 // Cline's, whose sessions.db lists a session whose files are gone. Grok
 // Build's are folders, but it copies each session's text into
@@ -54,6 +56,8 @@ type Managed struct {
 	Messages  int   `json:"messages"`
 	Files     int   `json:"files"`
 	Deletable bool  `json:"deletable"`
+	// Forget: Delete takes it off the list, its agent's files untouched
+	Forget bool `json:"forget,omitempty"`
 	// Undeletable: why a session of an agent whose sessions can be deleted
 	// can't be: "cursor-editor", a chat Cursor's editor keeps in its own
 	// database, or "read-only" (rowDeletable). The page says it on the
@@ -130,8 +134,32 @@ func agentCounts(all []file) []AgentCount {
 	// as listAgent lists them, from the parses kept: a copy of a
 	// conversation is not a session of its own (ccCopies)
 	copies := ccCopies(all)
+	// a Codex subagent thread whose parent is gone is no row
+	// (keptSubagents), from the parses kept
+	var codex []file
+	for _, f := range all {
+		if f.agent == "codex" {
+			codex = append(codex, f)
+		}
+	}
+	var orphans map[string]bool
+	if len(codex) > 0 {
+		identities := codexIdentitySnapshot(codex)
+		parents := map[string]string{}
+		for _, f := range codex {
+			id := strings.TrimPrefix(f.key, "codex:")
+			parents[id] = ""
+			if i, ok := identities[id]; ok && i.Role == codexRoleSubagent {
+				parents[id] = i.ParentSession
+			}
+		}
+		orphans = orphanSubagents(parents)
+	}
 	for _, f := range all {
 		if copies[f.key] != "" {
+			continue
+		}
+		if f.agent == "codex" && orphans[strings.TrimPrefix(f.key, "codex:")] {
 			continue
 		}
 		if n[f.agent] == nil {
@@ -141,7 +169,7 @@ func agentCounts(all []file) []AgentCount {
 	}
 	out := []AgentCount{}
 	for a, keys := range n {
-		out = append(out, AgentCount{Agent: a, Count: len(keys), Deletable: Deletable(a)})
+		out = append(out, AgentCount{Agent: a, Count: len(keys), Deletable: Removable(a)})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Count != out[j].Count {
@@ -155,13 +183,16 @@ func agentCounts(all []file) []AgentCount {
 // ListAgent is every session of one agent, the most recently active first,
 // with no limit; one nothing was said in is listed too, to be cleared away.
 func ListAgent(agent string) []Managed {
+	alias := provider.UsageAlias()
 	storeMu.RLock()
 	defer storeMu.RUnlock()
 	mu.Lock()
 	defer mu.Unlock()
 	loadCache()
 	defer useDBs()()
-	return listAgent(agent, allFiles())
+	out := listAgent(agent, allFiles())
+	aliasManaged(out, alias)
+	return out
 }
 
 // NativeIDs are the ids of every session the agents named keep themselves,
@@ -196,6 +227,7 @@ type ManageView struct {
 // Only native's agents and the one picked are read: a change to another
 // agent's sessions waits for a page that shows it (#2776).
 func Manage(native map[string]bool, pick func([]AgentCount, map[string]map[string]bool) string) ManageView {
+	alias := provider.UsageAlias()
 	storeMu.RLock()
 	defer storeMu.RUnlock()
 	mu.Lock()
@@ -207,6 +239,7 @@ func Manage(native map[string]bool, pick func([]AgentCount, map[string]map[strin
 	v.Agent = pick(v.Agents, v.Native)
 	if v.Agent != "" {
 		v.Sessions = listAgentWith(v.Agent, all, true)
+		aliasManaged(v.Sessions, alias)
 	}
 	return v
 }
@@ -222,10 +255,13 @@ func readFor(want, all []file, quick bool) (pending map[string]bool, done func()
 }
 
 // idInFile says which agents' session ids are read from inside the
-// session's file, not taken from its name (as assemble does).
+// session's file, not taken from its name (as assemble does). ZCode's are:
+// its database rows are the files, a fork's and a subagent's filed under
+// the session they ran in (ocRoots), which a request names by their own ids
+// (subIDs, zcodeBareID).
 func idInFile(agent string) bool {
 	switch agent {
-	case "codex", "pi", "raft", "cindy", "omp", "dsh", "grok", "droid":
+	case "codex", "pi", "raft", "cindy", "omp", "dsh", "grok", "droid", "zcode":
 		return true
 	}
 	return false
@@ -257,10 +293,13 @@ func nativeIDsWith(agents map[string]bool, all []file, quick bool) map[string]ma
 	for _, fs := range groups {
 		id := sessionID(fs)
 		if a := fs[0].agent; agents[a] {
-			out[a][id] = true
-			// its subagents' calls are counted in it (subIDs)
-			for _, sub := range subIDs(fs, id) {
-				out[a][sub] = true
+			// by every id a request can name it (requestIDs, as
+			// GatewayKeys), its subagents' too: their calls are counted in
+			// it (subIDs)
+			for _, sid := range append([]string{id}, subIDs(fs, id)...) {
+				for _, rid := range requestIDs(a, sid) {
+					out[a][rid] = true
+				}
 			}
 		}
 		if fs[0].agent == "raft" && agents["pi"] {
@@ -307,6 +346,8 @@ func listAgentWith(agent string, all []file, quick bool) []Managed {
 		// a WSL distro's too (TJHHHH): moved out over \\wsl.localhost
 		m := Managed{Session: s, Files: len(fs)}
 		m.Deletable, m.Undeletable = rowDeletable(agent, s, fs)
+		m.Forget = !Deletable(agent) && Forgettable(agent)
+		m.Deletable = m.Deletable || m.Forget
 		for _, f := range fs {
 			m.Size += f.size
 			m.Pending = m.Pending || pending[f.path]
@@ -320,6 +361,7 @@ func listAgentWith(agent string, all []file, quick bool) []Managed {
 	}
 	if agent == "codex" {
 		codexProviders(out, groups)
+		out = keptSubagents(out)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if !out[i].Last.Equal(out[j].Last) {
@@ -330,12 +372,57 @@ func listAgentWith(agent string, all []file, quick bool) []Managed {
 	return out
 }
 
+// keptSubagents drops a Codex subagent thread whose parent thread is not
+// listed: deleting a thread in Codex leaves its review, title and other
+// subagent rollouts behind, and each was a row of its own, titled by the
+// prompt Codex asked it (the guardian's "The following is the Codex agent
+// history whose request action you are assessing…", flandern). Their calls
+// are still counted by Usage.
+func keptSubagents(out []Managed) []Managed {
+	parents := make(map[string]string, len(out))
+	for _, m := range out {
+		parents[m.ID] = ""
+		if m.Role == codexRoleSubagent {
+			parents[m.ID] = m.ParentSession
+		}
+	}
+	gone := orphanSubagents(parents)
+	if len(gone) == 0 {
+		return out
+	}
+	return slices.DeleteFunc(out, func(m Managed) bool { return gone[m.ID] })
+}
+
+// orphanSubagents are the Codex subagent threads keptSubagents takes off
+// the list: parents holds every thread by id, with the thread it is a
+// subagent of ("" for none). One whose parent is not there, or is such a
+// thread itself, goes. The list and its tab's count both ask it, so the
+// count is the rows the tab shows (lurx98 on X: Codex 6, then 0 rows).
+func orphanSubagents(parents map[string]string) map[string]bool {
+	gone := map[string]bool{}
+	for {
+		dropped := false
+		for id, parent := range parents {
+			if gone[id] || parent == "" {
+				continue
+			}
+			if _, ok := parents[parent]; !ok || gone[parent] {
+				gone[id] = true
+				dropped = true
+			}
+		}
+		if !dropped {
+			return gone
+		}
+	}
+}
+
 // listed fills in what assemble leaves out of a session nothing was said
 // in, as ListAgent lists it and Find finds it: how to resume it, and
 // whether its conversation can be read.
 func listed(s *Session) {
 	if s.Resume == "" && !s.ReadOnly {
-		s.Resume = resumeCommand(s.WSL, s.Agent, s.ID, s.Cwd, s.Path)
+		s.Resume = resumeFor(s.WSL, s.Agent, s.ID, s.Cwd, s.Path)
 	}
 	if s.Carry == nil {
 		s.Carry = carries(*s)
@@ -360,6 +447,9 @@ type Trashed struct {
 	// Gateway: a session seen only through magpie's gateway, whose items
 	// are the conversation text magpie recorded of it (gateway_delete.go)
 	Gateway bool `json:"gateway,omitempty"`
+	// Forgot: a session of an agent that is gone, taken off the list
+	// (Forget); nothing of it was moved, Restore lists it again
+	Forgot bool `json:"forgot,omitempty"`
 	// CodexCatalog: a Codex thread's rows in the Codex app's catalog,
 	// taken out with it and put back on Restore (codex_catalog.go)
 	CodexCatalog []codexCatalogRow `json:"codex_catalog,omitempty"`
@@ -480,7 +570,7 @@ func Delete(agent, id string) (Trashed, error) {
 	}
 	for _, f := range fs {
 		delete(cache, f.path)
-		delete(ccUUIDMemo, f.path)
+		ccUUIDDrop(f.path)
 	}
 	saveCache()
 	wslForget(fs)
@@ -593,7 +683,7 @@ func sessionPaths(agent, id string, fs []file) []string {
 		}
 	}
 	if agent == "claude" {
-		dir := ClaudeDir()
+		dir := claudeDirOf(fs[0].path)
 		if fs[0].m().wsl != "" {
 			// the distro's own ~/.claude
 			if dir = wslHomeOf(fs[0].m().wsl); dir == "" {
@@ -847,4 +937,13 @@ func Restore(key string) (Trashed, error) {
 	os.RemoveAll(dir)
 	wslRelistNow(t.Items)
 	return t, nil
+}
+
+// claudeDirOf is the Claude Code folder a session file at path is kept in
+// (<dir>/projects/<project>/<id>.jsonl), ClaudeDir for one elsewhere.
+func claudeDirOf(path string) string {
+	if p := filepath.Dir(filepath.Dir(path)); filepath.Base(p) == "projects" {
+		return filepath.Dir(p)
+	}
+	return ClaudeDir()
 }

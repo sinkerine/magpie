@@ -322,7 +322,7 @@ func guardHeldBack() error {
 	if gsrv.lastErr == nil || !time.Now().Before(gsrv.retryAt) {
 		return nil
 	}
-	return fmt.Errorf("%w; it is tried again in %s, and until then a request it hasn't read is held back at once. To send requests masked by the rules alone, turn the model off in Settings → Privacy",
+	return fmt.Errorf("%w; it is tried again in %s, and until then a request it hasn't read is held back at once. To send requests masked by the rules alone, turn the model off in Settings › Privacy",
 		gsrv.lastErr, time.Until(gsrv.retryAt).Round(time.Second))
 }
 
@@ -344,7 +344,7 @@ func (guardModel) Find(ctx context.Context, texts []string) ([][]redact.Found, e
 }
 
 func (guardModel) Now() Status {
-	s := Status{Model: AstrLinkGuard, Supported: true, Installed: guardInstalled(), Size: guardSize(), Rosetta: translated()}
+	s := Status{Model: AstrLinkGuard, Supported: true, Installed: guardInstalled(), Size: guardSize(), Rosetta: translated(), Emulated: emulated()}
 	gdl.fill(&s)
 	gsrv.mu.Lock()
 	if gsrv.m != nil {

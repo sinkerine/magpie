@@ -113,7 +113,7 @@ type Record struct {
 	// Compaction is Codex's explicit native marker. Nil means no matching
 	// native Codex call established whether a gateway row compacted.
 	Compaction *bool `json:"compaction,omitempty"`
-	// FirstReasoning is the start of paced visible reasoning, absent for hidden reasoning.
+	// FirstReasoning: ms to the reply's first sign of reasoning, streamed or sealed (a reasoning delta, a reasoning item's or thinking block's start); 0 for none.
 	FirstReasoning int64 `json:"first_reasoning_ms,omitempty"`
 	// ReasoningHidden: the reply reasoned and its stream doesn't tell how
 	// much — sealed or summarised, or streamed with no reasoning count in
@@ -161,7 +161,12 @@ type Record struct {
 	RequestID string `json:"rid,omitempty"`
 	// ResponseID is the response object ID actually sent to the client.
 	ResponseID string `json:"response_id,omitempty"`
-	Endpoint   string `json:"ep,omitempty"`
+	// MessageID is the id the agent's own session file gives the call's
+	// message (Claude Code's msg_…), on a call read from such a file. Not
+	// persisted: it is read back with the file, and told by the request
+	// feed (FeedOriginals).
+	MessageID string `json:"-"`
+	Endpoint  string `json:"ep,omitempty"`
 	// Stop is why the upstream said its reply ended, in its own words
 	// (stop_reason, finish_reason …): "" when it said none, a stream that
 	// just stopped. Told apart by it, a reply that ended too soon is the
@@ -224,6 +229,15 @@ type Record struct {
 	// what ImageFilesSaved was saved on (matrix0487 on Discord). None in a
 	// row from before it was kept.
 	ImageFiles int `json:"image_files,omitempty"`
+	// UpParts is what UpBytes was made of, where the body was read to
+	// know (UpParts); nil where it wasn't: a socket's delta, a request
+	// whose images went by file, a row from before it was kept
+	// (theforeveriris on X: 8.6 GB up from plain-text projects).
+	UpParts *UpParts `json:"up_parts,omitempty"`
+	// Socket says the request went over the Responses WebSocket, its
+	// last try (provider.Socket, matrix0487 on Discord): UpBytes is then
+	// what the socket was sent, a delta on a kept socket.
+	Socket bool `json:"ws,omitempty"`
 	// Kind is what the agent made the call for when it isn't a turn of
 	// the conversation: a Codex subagent's (review, compact, guardian…)
 	Kind string `json:"kind,omitempty"`
@@ -256,6 +270,13 @@ type Record struct {
 	// has the request's attempts already, so it can pass the row over.
 	// Never persisted.
 	Watched bool `json:"-"`
+	// ClientIP is the address the request came to the gateway from, as the
+	// connection gave it (the gateway trusts no forwarding header, so behind
+	// a proxy it is the proxy's): a loopback address for this computer. It
+	// stays on this computer: sync (SharedCalls) and the gateway's
+	// /v1/magpie/usage/requests leave it out. "" for a row kept before it
+	// was recorded, a call a client reported, or magpie's own.
+	ClientIP string `json:"client_ip,omitempty"`
 	// Local is true only for verified loopback gateway requests. It is used
 	// for local-session deduplication, never persisted or exported.
 	Local bool `json:"-"`
@@ -596,6 +617,27 @@ type Totals struct {
 	UpBytes         int64 `json:"up_bytes,omitempty"`
 	DownBytes       int64 `json:"down_bytes,omitempty"`
 	ImageFilesSaved int64 `json:"image_files_saved,omitempty"`
+	// UpCalls is how many rows sent any bytes up, what UpBytes is spread
+	// over; UpMeasured the bytes of those whose parts were read
+	// (Record.UpParts), and UpSystem, UpTools and UpImages those parts
+	// summed: the conversation is UpMeasured less the three
+	UpCalls    int   `json:"up_calls,omitempty"`
+	UpMeasured int64 `json:"up_measured,omitempty"`
+	UpSystem   int64 `json:"up_system,omitempty"`
+	UpTools    int64 `json:"up_tools,omitempty"`
+	UpImages   int64 `json:"up_images,omitempty"`
+}
+
+// UpParts is a request's bytes up by what they were: the agent's own
+// prompt and instructions (system prompt, skills, memory), the tools'
+// definitions, and the images and documents it sent inline, each scaled
+// to the bytes that went up (Record.UpBytes). The rest is the
+// conversation: the messages, the tool calls and their results, which an
+// agent sends again whole on every request.
+type UpParts struct {
+	System int `json:"system,omitempty"`
+	Tools  int `json:"tools,omitempty"`
+	Images int `json:"images,omitempty"`
 }
 
 // addBytes adds r's bytes on the wire (Totals.UpBytes …).
@@ -603,6 +645,27 @@ func (t *Totals) addBytes(r *Record) {
 	t.UpBytes += int64(r.UpBytes)
 	t.DownBytes += int64(r.DownBytes)
 	t.ImageFilesSaved += int64(r.ImageFilesSaved)
+	if r.UpBytes > 0 {
+		t.UpCalls++
+		if u := r.UpParts; u != nil {
+			t.UpMeasured += int64(r.UpBytes)
+			t.UpSystem += int64(u.System)
+			t.UpTools += int64(u.Tools)
+			t.UpImages += int64(u.Images)
+		}
+	}
+}
+
+// plusBytes adds what addBytes counted of another sum.
+func (t *Totals) plusBytes(d *Totals) {
+	t.UpBytes += d.UpBytes
+	t.DownBytes += d.DownBytes
+	t.ImageFilesSaved += d.ImageFilesSaved
+	t.UpCalls += d.UpCalls
+	t.UpMeasured += d.UpMeasured
+	t.UpSystem += d.UpSystem
+	t.UpTools += d.UpTools
+	t.UpImages += d.UpImages
 }
 
 // Tokens is what went in and out, excluding cache traffic.
@@ -663,75 +726,91 @@ func DecodeWindow(out int, ms, ttft int64) int64 {
 	return w
 }
 
-// DecodeOf is what a reply's speed is told by: the tokens it was seen to
-// write and the ms it took (tony on Discord: gpt-6.1-sol read 163 tok/s,
-// with a 14 s first token). A reply that reasoned counts only its answer —
-// its output less the reasoning, from its first text — as most vendors
-// keep the reasoning out of the stream (OpenAI's is encrypted, its summary
-// sent when it's done; Claude's may come with no text): its tokens were
-// written before the first content, over time the window from it doesn't
-// hold, and counting them read a 2,000-token think and a 200-token answer
-// in 1.5 s as 1,467 tok/s. Its time goes to the wait before the answer.
-// With no answer text, paced visible reasoning can time all output from
-// firstReasoning. Missing evidence (including older records), hidden reasoning
-// and an unknown flow leave the speed untold. The
-// window is DecodeWindow's: 0 for a reply that tells none.
+// DecodeOf is what a reply's speed is told by: the tokens it wrote and the
+// ms it took. Its speed is all its output tokens, as its vendor's usage
+// counts them — reasoning and tool calls' arguments are tokens too — over
+// the time from its first output of any kind to its end (Archivemylife on
+// X): its first content (ttft) or, when it came first, its first sign of
+// reasoning (firstReasoning), streamed or sealed — a reasoning delta, a
+// Responses reasoning item's start, an Anthropic thinking block's start.
+// The wait before either, the vendor reading the prompt, is TTFT's, not
+// the speed's. Every protocol and vendor counts it so; only how its
+// reasoning is seen differs:
+//
+//   - a reply that reasoned and showed no sign of when (firstReasoning 0:
+//     a Chat vendor whose reasoning_tokens come with no reasoning delta, a
+//     Gemini thought not included, a record kept before the start was) had
+//     its reasoning written before its first content, over time its stream
+//     doesn't show, and counting it over the window from that content read
+//     a 2,000-token think and a 200-token answer in 1.5 s as 1,467 tok/s
+//     (tony on Discord). Such a reply counts its answer, its output less
+//     the reasoning, from its first text, and tells none with no text.
+//
+// The window is DecodeWindow's: 0 for a reply that tells none.
 //
 // A reply its vendor held back and let go in a burst at its end tells
 // none either (John on Discord: Kimi Code answering OpenCode read 1,367,
-// then 2,237 and 2,012 tok/s). The burst is told two ways, as the reply's
-// text came before it or with it:
+// then 2,237 and 2,012 tok/s). The burst is judged on what came after the
+// reasoning, its answer from its first text (or its first content, when it
+// had none), as reasoning sealed in the stream comes in no bytes:
 //
-//   - flow, when known (Record.Flow), is how long its content took to come
-//     from where its window starts. A window HeldShare times longer had
-//     its content come in a small part of it: the rest was a wait while
-//     the vendor wrote and held it. The time it took to come is not the
-//     time it took to write (a burst let go over 236 ms read 528 tokens at
-//     2,237 tok/s), and that time is not seen, so it tells no speed. A
-//     stream that came as it was written has a flow about its window.
-//   - a reply that reasoned is timed from its first text, its reasoning
-//     written before. When the answer would have been written over
-//     ThinkPace times faster than its reasoning came before it, from the
-//     first content to the first text, its first text came with the burst
-//     and the wait before it was the answer being written and held (22
-//     reasoning tokens over 10.5 s, then 528 answer tokens in 236 ms). A
-//     reasoning hidden from the stream (OpenAI's, Claude's omitted) comes
-//     before the first content and leaves this time short; one that
-//     streams comes at the pace its answer does.
+//   - flow, when known (Record.Flow), is how long the answer's content took
+//     to come. An answer window HeldShare times longer had its content come
+//     in a small part of it: the rest was a wait while the vendor wrote and
+//     held it. The time it took to come is not the time it took to write
+//     (a burst let go over 236 ms read 528 tokens at 2,237 tok/s), and that
+//     time is not seen, so it tells no speed. A stream that came as it was
+//     written has a flow about its window.
+//   - when the answer would have been written over ThinkPace times faster
+//     than the reasoning came before it, from the first content to the
+//     first text, its first text came with the burst and the wait before it
+//     was the answer being written and held (22 reasoning tokens over
+//     10.5 s, then 528 answer tokens in 236 ms).
 //   - a window under HeldWindowMs after a wait HeldShare times longer: the
 //     reply came whole in a moment after a long silence, and what it was
 //     written over is not seen (pluviophile714 on Discord: gpt-6.1-sol,
 //     392 tokens 0.25 s after an 8.2 s first token, read 1,539 tok/s where
 //     the vendor writes ~70). Its content can come spread over that moment
-//     (a relay replaying a held reply, OpenAI's answer let go after its
-//     hidden reasoning), so flow doesn't tell it. A stream as it is written
-//     takes a second or more to write a few hundred tokens; one that takes
-//     under a second is too short a sample to tell a speed by against such
-//     a wait, so a short answer after a long think tells none either.
+//     (a relay replaying a held reply), so flow doesn't tell it. A stream as
+//     it is written takes a second or more to write a few hundred tokens;
+//     one that takes under a second is too short a sample to tell a speed
+//     by against such a wait.
 func DecodeOf(out, reasoning int, ms, ttft, firstText, flow int64, firstReasoning ...int64) (tokens int, w int64) {
-	start := ttft
-	if reasoning > 0 {
-		if firstText > 0 {
-			out, start = out-reasoning, firstText
-		} else if len(firstReasoning) > 0 && firstReasoning[0] >= ttft && flow > 0 && reasoning <= out {
-			start = firstReasoning[0]
-		} else {
-			return 0, 0
-		}
-	}
 	if ttft <= 0 {
 		return 0, 0
+	}
+	var think int64
+	if len(firstReasoning) > 0 {
+		think = firstReasoning[0]
+	}
+	// from: where the answer the burst is judged on starts
+	start, from, answer := ttft, ttft, out-reasoning
+	if reasoning > 0 && firstText > 0 {
+		from = firstText
+	}
+	switch {
+	case reasoning > 0 && think <= 0:
+		// reasoned out of sight: the answer alone (above)
+		if firstText <= 0 {
+			return 0, 0
+		}
+		out, start = answer, firstText
+	case reasoning > out:
+		return 0, 0
+	case think > 0 && think < start:
+		start = think
 	}
 	if w = DecodeWindow(out, ms, start); w == 0 {
 		return 0, 0
 	}
-	if flow > 0 && flow*HeldShare < w {
+	tail := ms - from
+	if flow > 0 && flow*HeldShare < tail {
 		return 0, 0
 	}
 	if w < HeldWindowMs && start > HeldShare*w {
 		return 0, 0
 	}
-	if reasoning > 0 && firstText > 0 && int64(out)*(firstText-ttft) > ThinkPace*int64(reasoning)*w {
+	if reasoning > 0 && firstText > 0 && int64(answer)*(firstText-ttft) > ThinkPace*int64(reasoning)*tail {
 		return 0, 0
 	}
 	return out, w
@@ -750,7 +829,7 @@ const (
 
 // Decode is the record's DecodeOf.
 func (r Record) Decode() (tokens int, w int64) {
-	if r.ReasoningHidden && r.FirstText <= 0 {
+	if r.ReasoningHidden && r.FirstText <= 0 && r.FirstReasoning <= 0 {
 		return 0, 0
 	}
 	return DecodeOf(r.Output, r.Reasoning, r.Millis, r.TTFT, r.FirstText, r.Flow, r.FirstReasoning)
@@ -833,6 +912,26 @@ func (t Totals) HitRate() (float64, bool) {
 	return float64(t.CacheRead) / float64(p), true
 }
 
+// HitPct is a hit rate (0 to 1) as a percent, whole unless rounding would
+// say 100% or 0% of a prompt not all or none cached, then to one or two
+// decimals (ZhangXiaof48473 on X); the GUI's hitPct says it the same way.
+func HitPct(h float64) string {
+	s, v := "", 0.0
+	for d := 0; d <= 2; d++ {
+		s = strconv.FormatFloat(100*h, 'f', d, 64)
+		if v, _ = strconv.ParseFloat(s, 64); h <= 0 || h >= 1 || (v > 0 && v < 100) {
+			break
+		}
+	}
+	switch {
+	case h < 1 && v >= 100:
+		s = "99.99"
+	case h > 0 && v <= 0:
+		s = "0.01"
+	}
+	return s + "%"
+}
+
 func (t *Totals) add(r Record, price *catalog.Price) { t.addFrom(Row{Record: r}, price) }
 
 // addFrom is add for a ledger row, whose speed is told as Row.Decode tells
@@ -902,6 +1001,13 @@ func (t *Totals) count(r Record) {
 // failed row that no later try took over from.
 func (r Record) LostRequest() bool { return r.Failed() && !r.HandedOn }
 
+// FailedTry is whether a try of r's request failed: r failed (whether the
+// agent got the error or a later try took over), or r answered after a
+// try that failed first. What Usage's Failed filter keeps: Routing shows
+// those tries failed, and a request a fallback answered had none of its
+// own failures listed under Failed (maohy915 on X).
+func (r Record) FailedTry() bool { return r.Failed() || r.RetriedRequest() }
+
 // RetriedRequest is whether r ends a request that was answered after a try
 // that failed first (not one its agent canceled after a failed try).
 func (r Record) RetriedRequest() bool { return !r.HandedOn && r.Answered() && r.Tries > 1 }
@@ -924,6 +1030,10 @@ type Group struct {
 	Host string `json:"host,omitempty"`
 	// Agent is the agent a session is of (sessions only).
 	Agent string `json:"agent,omitempty"`
+	// Last is when the group's newest call in the period was made (agents
+	// only): the Usage page folds a small client idle for days into one
+	// "Other" row (WJaunita45604 on X: dozens of test clients).
+	Last time.Time `json:"last,omitzero"`
 	Totals
 	// Own is the share of these calls magpie made by itself (Record.ByMagpie):
 	// a routing classifier's, a web search's or an image description's,
@@ -1022,7 +1132,7 @@ type Summary struct {
 // Summarize caches the four periods over an indexed log snapshot. Callers
 // receive their own result slices, without retaining historical Records.
 func Summarize(p Period) Summary {
-	return indexedSummary(p, Clock())
+	return indexedSummary(p, localNow())
 }
 
 func summarize(p Period, now time.Time, recs []Record) Summary {

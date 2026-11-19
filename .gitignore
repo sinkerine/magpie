@@ -11,3 +11,7 @@
 
 # Local agent skills, including private service and deployment procedures.
 /.agents/skills/
+/internal/gui/assets.zip
+/.overlay/
+/internal/conptypair/amd64/
+/internal/conptypair/arm64/
