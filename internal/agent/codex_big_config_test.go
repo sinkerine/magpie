@@ -15,6 +15,9 @@ import (
 // nothing to change decodes only the few tables it reads, not the whole
 // file once for each of them: 21 MB a sync here before, about 5 MB after.
 func TestCodexSyncDecodesTheConfigOnce(t *testing.T) {
+	// This fixture needs no installed agent binaries. Keep command discovery
+	// over the host's PATH out of the Codex config allocation budget.
+	t.Setenv("PATH", t.TempDir())
 	var b strings.Builder
 	b.WriteString("model = \"gpt-5.5\"\n\n")
 	for i := range 10000 {
