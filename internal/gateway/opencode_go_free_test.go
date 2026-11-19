@@ -168,7 +168,8 @@ func TestOpenCodeGoOwnFreeModelGetsNothingOfOpenCodes(t *testing.T) {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 	a = asked()
-	if len(a) != 3 || !strings.Contains(a[2].body, "Prefer /tmp/opencode") || !strings.Contains(a[2].body, provider.OpenCodeStub) {
+	if len(a) != 3 || strings.Contains(a[2].url, "/inference/go/") ||
+		!strings.Contains(a[2].body, `\u003cenv\u003e`) || !strings.Contains(a[2].body, provider.OpenCodeStub) {
 		t.Fatalf("Zen's free model at Zen: %+v", a)
 	}
 }

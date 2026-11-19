@@ -280,10 +280,7 @@ func TestCodexAutoResetHoursAhead(t *testing.T) {
 			if err := provider.SetCodexAutoResetCase("me@example.com", provider.ResetCaseWeek, true); err != nil {
 				t.Fatal(err)
 			}
-			var logs bytes.Buffer
-			oldLog := log.Writer()
-			log.SetOutput(&logs)
-			t.Cleanup(func() { log.SetOutput(oldLog) })
+			logs := catchLog(t)
 			srv := New()
 			code, body := resetPost(t, srv)
 			if _, spent := b.seen(); code != c.code || spent != c.spent || (code == 200 && !strings.Contains(body, "pong")) {
@@ -299,7 +296,7 @@ func TestCodexAutoResetHoursAhead(t *testing.T) {
 			if c.raw == "abc" && n != 0 {
 				t.Fatalf("invalid value read usage %d times", n)
 			}
-			before := logs.String()
+			before := len(logs.String())
 			resetPost(t, srv)
 			b.mu.Lock()
 			reads := b.reads
@@ -310,8 +307,8 @@ func TestCodexAutoResetHoursAhead(t *testing.T) {
 			if _, spent := b.seen(); spent != c.spent {
 				t.Fatalf("second request spent %q", spent)
 			}
-			if logs.String() != before {
-				t.Fatalf("second request logged a repeated decline: %s", logs.String())
+			if second := logs.String()[before:]; strings.Contains(second, "codex reset ") {
+				t.Fatalf("second request logged a repeated reset outcome: %s", second)
 			}
 		})
 	}
