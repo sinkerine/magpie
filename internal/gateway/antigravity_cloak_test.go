@@ -35,6 +35,7 @@ var googleTurnsAway = []string{
 	"you are opencode",
 	"you are a coding agent running in the codex cli",
 	"a coding assistant running inside pi",
+	agPiExpertIdentity,
 }
 
 // piDefaultSystem is pi 1.5.0's default system prompt as it builds it
@@ -206,6 +207,66 @@ func TestAntigravityCloakRewordsEveryLineItTurnsAway(t *testing.T) {
 		if got := antigravityCloak(system); got != system {
 			t.Errorf("%q went as %q", system, got)
 		}
+	}
+}
+
+func TestAntigravityPiIdentity(t *testing.T) {
+	t.Cleanup(provider.AntigravityBuiltinForTest())
+	const identity = "You are an expert coding assistant operating inside pi, a coding agent harness."
+	const neutral = "You are an expert coding assistant operating inside a coding agent harness."
+	var sent string
+	s, _ := antigravityGroupFor(t, []string{"u@example.com"}, "gemini-3-flash", fakeGoogle(&sent))
+	for _, system := range []string{identity, strings.ToUpper(identity), "Before.\n" + identity + "\nAfter."} {
+		want := strings.ReplaceAll(system, identity, neutral)
+		if system == strings.ToUpper(identity) {
+			want = neutral
+		}
+		if code, out := hermesTurn(s, system); code != 200 || !strings.Contains(out, "from google") {
+			t.Fatalf("Pi: %d %s", code, out)
+		}
+		if sent != want {
+			t.Fatalf("Pi's instructions went as %q, want %q", sent, want)
+		}
+	}
+	body := `{"model":"antigravity/gemini-3-flash","stream":false,"instructions":` + quote(identity) + `,"input":"hi"}`
+	if code, out := codexAGPost(s, body); code != 200 || !strings.Contains(out, "from google") || sent != neutral {
+		t.Fatalf("Pi over Responses: sent %q, %d %s", sent, code, out)
+	}
+	p, err := provider.Find("antigravity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.PromptAsWritten = true
+	if err := provider.Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	code, out := hermesTurn(s, identity)
+	if sent != identity || code != http.StatusBadRequest || !strings.Contains(out, "Pi's identity sentence") {
+		t.Fatalf("Pi, as written: sent %q, %d %s", sent, code, out)
+	}
+}
+
+func TestPiIdentityCompatibilityScope(t *testing.T) {
+	const identity = "You are an expert coding assistant operating inside pi, a coding agent harness."
+	r := &Request{System: identity, Messages: []Message{{Role: "user", Parts: []Part{{Kind: Text, Text: identity}}}}}
+	for _, p := range []provider.Provider{
+		{ID: "gemini-cli", Account: &provider.Account{Agent: "gemini"}},
+		{ID: "antigravity", Account: &provider.Account{Agent: "antigravity"}, PromptAsWritten: true},
+	} {
+		if b := string(codeAssistBody(p, r, "gemini-3-flash", nil)); strings.Count(b, identity) != 2 {
+			t.Fatalf("%s changed instructions or message: %s", p.ID, b)
+		}
+	}
+	p := provider.Provider{ID: "antigravity", Account: &provider.Account{Agent: "antigravity"}}
+	if b := string(codeAssistBody(p, r, "gemini-3-flash", nil)); strings.Count(b, identity) != 1 {
+		t.Fatalf("Pi's message changed along with its instructions: %s", b)
+	}
+	if r.System != identity {
+		t.Fatal("the caller's instructions changed")
+	}
+	const other = "You are operating inside pi. You are a coding agent harness."
+	if got := antigravityCloak(other); got != other {
+		t.Fatalf("unrelated instructions changed: %q", got)
 	}
 }
 

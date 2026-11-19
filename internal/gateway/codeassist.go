@@ -120,7 +120,10 @@ var agTurnedAway = []string{
 	"you are opencode",
 	"you are a coding agent running in the codex cli",
 	"a coding assistant running inside pi",
+	agPiExpertIdentity,
 }
+
+const agPiExpertIdentity = "you are an expert coding assistant operating inside pi, a coding agent harness."
 
 // agRFCLine is the line oh-my-pi (omp) starts its system prompt with, and
 // its advisor's and live mode's (omp 18.20.0), which Antigravity turns away
@@ -144,7 +147,8 @@ const agRFCLine = "rfc 2119 keywords: must, required, should, recommended, may, 
 //     "You're …" (5 of 5 each; Hermes' earlier persona with "built by" as
 //     well, 5 of 5);
 //   - pi's "running inside pi" as "running within pi" (5 of 5 on both
-//     models).
+//     models), and its alternate expert coding assistant sentence without
+//     the redundant harness name.
 var agSaidAs = []func(string) string{
 	func(string) string { return "" },
 	func(m string) string { return agSDKSaidAs.ReplaceAllString(m, "${1}the${2}${3} by Anthropic") },
@@ -156,6 +160,9 @@ var agSaidAs = []func(string) string{
 	agYoure,
 	agYoure,
 	func(m string) string { return agInside.ReplaceAllString(m, "within") },
+	func(string) string {
+		return "You are an expert coding assistant operating inside a coding agent harness."
+	},
 }
 
 // agYoure is m, which starts "You are", starting "You're" instead.
@@ -453,6 +460,9 @@ func antigravityHint(system string) string {
 	}
 	if agSays(system, "you are opencode") {
 		return antigravityOpenCodeHint
+	}
+	if agSays(system, agPiExpertIdentity) {
+		return "Antigravity answers this 429 to Pi's identity sentence whatever quota is left; allow magpie's prompt compatibility handling (prompt=default), or use another provider for these chats"
 	}
 	if agSays(system, "a coding assistant running inside pi") {
 		return antigravityPiHint
